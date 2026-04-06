@@ -1114,7 +1114,7 @@ class AnnotationEditor:
         tk.Label(self.step_props_frame, text="STEP TOOL", font=("Segoe UI Bold", 8), 
                  fg=Theme.PRIMARY, bg=Theme.SURFACE).pack(side='left', padx=(0, 20))
 
-        tk.Label(self.step_props_frame, text="Shape", font=Theme.FONT_LABEL, 
+        tk.Label(self.step_props_frame, text="Shape", font=Theme.FONT_LABEL,
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
         self.step_shape_var = tk.StringVar(value="teardrop")
         shape_combo = ttk.Combobox(self.step_props_frame, textvariable=self.step_shape_var,
@@ -1123,7 +1123,18 @@ class AnnotationEditor:
         shape_combo.pack(side='left', padx=(0, 20))
         shape_combo.bind('<<ComboboxSelected>>', lambda e: self.update_step_shape())
 
-        ModernButton(self.step_props_frame, text="↺ RESET", variant="secondary", 
+        tk.Label(self.step_props_frame, text="Size", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+        self.step_size_var = tk.IntVar(value=self.step_size)
+        step_size_spin = ttk.Spinbox(self.step_props_frame, from_=16, to=120,
+                                     textvariable=self.step_size_var, width=5,
+                                     command=self.update_step_size)
+        step_size_spin.pack(side='left', padx=(0, 20))
+        # Also commit on Enter / focus-out so typed values are picked up
+        step_size_spin.bind('<Return>', lambda e: self.update_step_size())
+        step_size_spin.bind('<FocusOut>', lambda e: self.update_step_size())
+
+        ModernButton(self.step_props_frame, text="↺ RESET", variant="secondary",
                      command=self.reset_step_counter, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
 
         # Canvas frame (The "Sunken" Void)
@@ -1592,142 +1603,160 @@ class AnnotationEditor:
         # Save state for undo
         self.history.append(self.image.copy())
 
-        # Create shadow layer for professional look
+        # Snagit-style soft black drop shadow params (image coords).
         shadow_offset_x = 2
-        shadow_offset_y = 3
-        shadow_blur_radius = 5
-        
-        shadow_layer = Image.new('RGBA', self.image.size, (0, 0, 0, 0))
-        shadow_draw = ImageDraw.Draw(shadow_layer)
-        
-        # Calculate dimensions based on shape
+        shadow_offset_y = 4
+        shadow_blur_radius = 8
+        shadow_alpha = 140
+
+        # Marker box dimensions (in image coords)
         if self.step_shape == 'rounded_rect':
             rect_width = self.step_size * 1.5
             rect_height = self.step_size * 1.2
-        else:
+        elif self.step_shape == 'teardrop':
+            rect_width = self.step_size * 1.4
+            rect_height = self.step_size
+        else:  # circle, square
             rect_width = self.step_size
             rect_height = self.step_size
 
-        # Draw shadow shape
-        if self.step_shape == 'circle':
-            shadow_draw.ellipse(
-                [x_pos + shadow_offset_x, y_pos + shadow_offset_y, 
-                 x_pos + rect_width + shadow_offset_x, y_pos + rect_height + shadow_offset_y],
-                fill=(0, 0, 0, 100)
-            )
-        elif self.step_shape == 'square':
-            shadow_draw.rounded_rectangle(
-                [x_pos + shadow_offset_x, y_pos + shadow_offset_y, 
-                 x_pos + rect_width + shadow_offset_x, y_pos + rect_height + shadow_offset_y],
-                radius=6,
-                fill=(0, 0, 0, 100)
-            )
-        elif self.step_shape == 'rounded_rect':
-            shadow_draw.rounded_rectangle(
-                [x_pos + shadow_offset_x, y_pos + shadow_offset_y, 
-                 x_pos + rect_width + shadow_offset_x, y_pos + rect_height + shadow_offset_y],
-                radius=rect_height // 2,
-                fill=(0, 0, 0, 100)
-            )
-        elif self.step_shape == 'teardrop':
-            # Sideways teardrop (Point Right) - Normalized to 140x100
-            s = self.step_size / 100.0
-            
-            def get_poly_pts(off_x=0, off_y=0):
-                pts = []
-                # 1. Top-Right Curve (Top of Circle to Point)
-                # (50, 10) to (135, 50) with control (100, 10)
-                p0, p1, p2, p3 = (50, 10), (100, 10), (135, 50), (135, 50)
-                for i in range(11):
-                    t = i / 10.0
-                    px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
-                    py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
-                    pts.append((x_pos + px * s + off_x, y_pos + py * s + off_y))
-                
-                # 2. Bottom-Right Curve (Point to Bottom of Circle)
-                # (135, 50) to (50, 90) with control (100, 90)
-                p0, p1, p2, p3 = (135, 50), (135, 50), (100, 90), (50, 90)
-                for i in range(1, 11):
-                    t = i / 10.0
-                    px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
-                    py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
-                    pts.append((x_pos + px * s + off_x, y_pos + py * s + off_y))
-
-                # 3. Left Arc (The Circle back)
-                # From 90 deg (PI/2) to 270 deg (3PI/2) counter-clockwise
-                for i in range(1, 21):
-                    angle = math.pi/2 + (i / 20.0) * math.pi
-                    px = 50 + 40 * math.cos(angle)
-                    py = 50 + 40 * math.sin(angle)
-                    pts.append((x_pos + px * s + off_x, y_pos + py * s + off_y))
-                return pts
-
-            shadow_draw.polygon(get_poly_pts(shadow_offset_x, shadow_offset_y), fill=(0, 0, 0, 100))
-            rect_width = self.step_size * 1.4
-            rect_height = self.step_size
-        
-        # Apply Gaussian blur to shadow
-        from PIL import ImageFilter
-        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_radius))
-        
-        # Composite shadow onto main image
-        self.image = Image.alpha_composite(self.image.convert('RGBA'), shadow_layer).convert('RGB')
-        
-        # Draw the actual shape on another layer for antialiasing via compositing
-        shape_layer = Image.new('RGBA', self.image.size, (0, 0, 0, 0))
-        shape_draw = ImageDraw.Draw(shape_layer)
-        
-        # Prepare colors
+        # Prepare fill colour (RGBA tuple)
         fill_color = self.current_color
         if isinstance(fill_color, str) and fill_color.startswith('#'):
             r = int(fill_color[1:3], 16)
             g = int(fill_color[3:5], 16)
             b = int(fill_color[5:7], 16)
             fill_color = (r, g, b, 255)
-        border_color = (255, 255, 255, 255) # White border
-        
-        # Draw main shape with border
-        if self.step_shape == 'circle':
-            shape_draw.ellipse([x_pos-1, y_pos-1, x_pos + rect_width+1, y_pos + rect_height+1], fill=border_color)
-            shape_draw.ellipse([x_pos+1, y_pos+1, x_pos + rect_width-1, y_pos + rect_height-1], fill=fill_color)
-        elif self.step_shape == 'square':
-            shape_draw.rounded_rectangle([x_pos-1, y_pos-1, x_pos + rect_width+1, y_pos + rect_height+1], radius=7, fill=border_color)
-            shape_draw.rounded_rectangle([x_pos+1, y_pos+1, x_pos + rect_width-1, y_pos + rect_height-1], radius=5, fill=fill_color)
-        elif self.step_shape == 'rounded_rect':
-            shape_draw.rounded_rectangle([x_pos-1, y_pos-1, x_pos + rect_width+1, y_pos + rect_height+1], radius=(rect_height+2)//2, fill=border_color)
-            shape_draw.rounded_rectangle([x_pos+1, y_pos+1, x_pos + rect_width-1, y_pos + rect_height-1], radius=(rect_height-2)//2, fill=fill_color)
-        elif self.step_shape == 'teardrop':
-            # Create points for white border (slightly offset/expanded)
-            # Standard PIL doesn't have an easy "expand polygon" so we draw twice
-            # with slight scale offsets if needed, but simple draw works for most cases.
-            shape_draw.polygon(get_poly_pts(), fill=border_color)
-            
-            # Re-calculate slightly smaller for fill
-            s_fill = (self.step_size - 4) / 100.0
-            def get_fill_pts():
-                pts = []
-                # Scale from center of mass (roughly 50, 90)
-                cx, cy = 50, 90
-                for i in range(11): # Right side
-                    t = i / 10.0
-                    px = (1-t)**3 * 50 + 3*(1-t)**2*t * 50 + 3*(1-t)*t**2 * 90 + t**3 * 90
-                    py = (1-t)**3 * 5 + 3*(1-t)**2*t * 5 + 3*(1-t)*t**2 * 60 + t**3 * 90
-                    pts.append((x_pos + (px-cx)*s_fill + cx*s + 2, y_pos + (py-cy)*s_fill + cy*s + 2))
-                for i in range(1, 21): # Arc
-                    angle = (i / 20.0) * math.pi
-                    px = 50 + 36 * math.cos(angle)
-                    py = 90 + 36 * math.sin(angle)
-                    pts.append((x_pos + px * s, y_pos + py * s))
-                # (Simple fill points sufficient for now)
-                return pts
-            
-            # For simplicity and precision, draw the same path with 1px width for border
-            # but Polygon fill is better. We'll just use slightly thicker white border.
-            shape_draw.polygon(get_poly_pts(), fill=fill_color, outline=border_color, width=2)
 
-        # Composite shape layer
-        self.image = Image.alpha_composite(self.image.convert('RGBA'), shape_layer).convert('RGB')
+        # Pick a number colour with enough contrast against the marker fill.
+        # ITU-R BT.601 perceived luminance — threshold 150/255 marks "light" colours
+        # (yellows, light greens, white, etc.) where white text would wash out.
+        fill_luma = 0.299 * fill_color[0] + 0.587 * fill_color[1] + 0.114 * fill_color[2]
+        text_color = 'black' if fill_luma > 150 else 'white'
+
+        # Teardrop polygon helper, parameterised so it can be reused for the
+        # supersampled PIL render and the live tk-canvas preview at different
+        # scales / origins.
+        def get_poly_pts(origin_x, origin_y, scale, off_x=0, off_y=0):
+            """Teardrop points in pixel coords, centred on a 100x100 normalized
+            space. (50,50) maps to the centre of the circular head."""
+            pts = []
+            # 1. Top-right curve (top of circle → point) — extra samples for smoothness
+            p0, p1, p2, p3 = (50, 10), (100, 10), (135, 50), (135, 50)
+            for i in range(21):
+                t = i / 20.0
+                px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
+                py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
+                pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
+            # 2. Bottom-right curve (point → bottom of circle)
+            p0, p1, p2, p3 = (135, 50), (135, 50), (100, 90), (50, 90)
+            for i in range(1, 21):
+                t = i / 20.0
+                px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
+                py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
+                pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
+            # 3. Left semicircle back to start
+            for i in range(1, 41):
+                angle = math.pi/2 + (i / 40.0) * math.pi
+                px = 50 + 40 * math.cos(angle)
+                py = 50 + 40 * math.sin(angle)
+                pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
+            return pts
+
+        # ── Render shadow + shape on a 4× supersampled tile, then LANCZOS-downsample.
+        # PIL's polygon/ellipse/rounded_rectangle have weak (or no) anti-aliasing
+        # at small sizes; rendering at 4× and resampling gives clean smooth edges.
+        SS = 4
+        pad = 26  # slack for shadow blur (~3*sigma) + offset
+
+        img_w, img_h = self.image.size
+        left   = max(0, int(x_pos - pad))
+        top    = max(0, int(y_pos - pad))
+        right  = min(img_w, int(x_pos + rect_width + shadow_offset_x + pad) + 1)
+        bottom = min(img_h, int(y_pos + rect_height + shadow_offset_y + pad) + 1)
+        tile_w = right - left
+        tile_h = bottom - top
+
+        if tile_w > 0 and tile_h > 0:
+            ss_size = (tile_w * SS, tile_h * SS)
+            # Marker top-left in tile-local pixel coords (image space)
+            mx_img = x_pos - left
+            my_img = y_pos - top
+            mx = mx_img * SS
+            my = my_img * SS
+            sox = shadow_offset_x * SS
+            soy = shadow_offset_y * SS
+
+            # Shadow layer (drawn at 4× then blurred at 4× radius for crisp falloff)
+            shadow_layer = Image.new('RGBA', ss_size, (0, 0, 0, 0))
+            shadow_draw = ImageDraw.Draw(shadow_layer)
+
+            shape_layer = Image.new('RGBA', ss_size, (0, 0, 0, 0))
+            shape_draw = ImageDraw.Draw(shape_layer)
+
+            ss_w = rect_width * SS
+            ss_h = rect_height * SS
+            shadow_rgba = (0, 0, 0, shadow_alpha)
+
+            if self.step_shape == 'circle':
+                shadow_draw.ellipse(
+                    [mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy],
+                    fill=shadow_rgba,
+                )
+                shape_draw.ellipse(
+                    [mx, my, mx + ss_w, my + ss_h],
+                    fill=fill_color,
+                )
+            elif self.step_shape == 'square':
+                shadow_draw.rounded_rectangle(
+                    [mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy],
+                    radius=6 * SS,
+                    fill=shadow_rgba,
+                )
+                shape_draw.rounded_rectangle(
+                    [mx, my, mx + ss_w, my + ss_h],
+                    radius=6 * SS,
+                    fill=fill_color,
+                )
+            elif self.step_shape == 'rounded_rect':
+                radius_ss = (rect_height // 2) * SS
+                shadow_draw.rounded_rectangle(
+                    [mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy],
+                    radius=radius_ss,
+                    fill=shadow_rgba,
+                )
+                shape_draw.rounded_rectangle(
+                    [mx, my, mx + ss_w, my + ss_h],
+                    radius=radius_ss,
+                    fill=fill_color,
+                )
+            elif self.step_shape == 'teardrop':
+                ss_scale = (self.step_size * SS) / 100.0
+                shadow_pts = get_poly_pts(mx, my, ss_scale, sox, soy)
+                shape_pts = get_poly_pts(mx, my, ss_scale)
+                shadow_draw.polygon(shadow_pts, fill=shadow_rgba)
+                shape_draw.polygon(shape_pts, fill=fill_color)
+
+            # Blur shadow at 4× radius so the falloff matches the original look
+            from PIL import ImageFilter
+            shadow_layer = shadow_layer.filter(
+                ImageFilter.GaussianBlur(radius=shadow_blur_radius * SS)
+            )
+
+            # Combine shadow + shape on the supersampled tile
+            tile = Image.alpha_composite(shadow_layer, shape_layer)
+            # Downsample to image resolution with high-quality resampling
+            tile = tile.resize((tile_w, tile_h), Image.LANCZOS)
+
+            # Composite tile onto main image
+            base = self.image.convert('RGBA')
+            base.alpha_composite(tile, dest=(left, top))
+            self.image = base.convert('RGB')
+
         draw = ImageDraw.Draw(self.image)
+
+        # Image-coord polygon points for the canvas preview path below
+        s = self.step_size / 100.0
 
         # Draw number with bold font
         try:
@@ -1744,62 +1773,65 @@ class AnnotationEditor:
         except:
             font = ImageFont.load_default()
 
-        bbox = draw.textbbox((0, 0), str(step_num), font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        
+        # Compute the visual center the number should sit on.
+        # For teardrop, the circular head is centred at (50,50) in the normalized
+        # 140x100 space, which maps back to the original click point (x, y).
+        # For other shapes, use the rect centre.
         if self.step_shape == 'teardrop':
-            # Center in the circular part on the left (x=50 in 140x100)
-            text_x = x_pos + (self.step_size // 2) - (text_w // 2)
-            text_y = y_pos + (self.step_size // 2) - (text_h // 2)
+            text_cx = x
+            text_cy = y
         else:
-            text_x = x_pos + (rect_width - text_w) // 2
-            text_y = y_pos + (rect_height - text_h) // 2 - 1
+            text_cx = x_pos + rect_width / 2
+            text_cy = y_pos + rect_height / 2
 
-        draw.text((text_x, text_y), str(step_num), fill='white', font=font)
+        # anchor="mm" positions the glyph's geometric centre at (text_cx, text_cy),
+        # which is what we want — using textbbox + manual offset undercounts the
+        # font's ascent and pushes the digit toward the bottom of the marker.
+        draw.text((text_cx, text_cy), str(step_num), fill=text_color, font=font, anchor="mm")
 
         # Create canvas elements (preview)
         shadow_id = None
         bg_id = None
         text_id = None
         
-        # Canvas elements use simpler shapes for performance
+        # Canvas elements use simpler shapes for performance.
+        # Tk canvas can't render a true blurred drop shadow, so we approximate
+        # the Snagit look with a soft offset shadow disc and a borderless fill.
         if self.step_shape == 'circle':
             shadow_id = self.canvas.create_oval(
                 x_pos + shadow_offset_x, y_pos + shadow_offset_y,
                 x_pos + rect_width + shadow_offset_x, y_pos + rect_height + shadow_offset_y,
-                fill='#D0D0D0', outline=''
+                fill='#000000', outline=''
             )
             bg_id = self.canvas.create_oval(
                 x_pos, y_pos, x_pos + rect_width, y_pos + rect_height,
-                fill=self.current_color, outline='white', width=2
+                fill=self.current_color, outline=''
             )
         elif self.step_shape == 'square' or self.step_shape == 'rounded_rect':
             shadow_id = self.canvas.create_rectangle(
                 x_pos + shadow_offset_x, y_pos + shadow_offset_y,
                 x_pos + rect_width + shadow_offset_x, y_pos + rect_height + shadow_offset_y,
-                fill='#D0D0D0', outline=''
+                fill='#000000', outline=''
             )
             bg_id = self.canvas.create_rectangle(
                 x_pos, y_pos, x_pos + rect_width, y_pos + rect_height,
-                fill=self.current_color, outline='white', width=2
+                fill=self.current_color, outline=''
             )
         elif self.step_shape == 'teardrop':
-            # Use polygon for teardrop preview too
             shadow_id = self.canvas.create_polygon(
-                get_poly_pts(shadow_offset_x, shadow_offset_y),
-                fill='#D0D0D0', outline=''
+                get_poly_pts(x_pos, y_pos, s, shadow_offset_x, shadow_offset_y),
+                fill='#000000', outline=''
             )
             bg_id = self.canvas.create_polygon(
-                get_poly_pts(),
-                fill=self.current_color, outline='white', width=2
+                get_poly_pts(x_pos, y_pos, s),
+                fill=self.current_color, outline=''
             )
 
         text_id = self.canvas.create_text(
-            text_x + text_w // 2,
-            text_y + text_h // 2,
+            text_cx,
+            text_cy,
             text=str(step_num),
-            fill='white',
+            fill=text_color,
             font=("Arial", self.step_font_size, "bold")
         )
 
@@ -1829,12 +1861,21 @@ class AnnotationEditor:
         self.status_var.set(f"Step shape: {self.step_shape}")
 
     def update_step_size(self):
-        """Update step size from spinner."""
+        """Update step size from spinner. Scales font proportionally so the
+        number stays balanced inside the marker at any size."""
         try:
-            self.step_size = int(self.step_size_var.get())
-            self.status_var.set(f"Step size: {self.step_size}")
-        except:
-            self.step_size = 30
+            new_size = int(self.step_size_var.get())
+        except (tk.TclError, ValueError):
+            new_size = 30
+        # Clamp to the spinbox range
+        new_size = max(16, min(120, new_size))
+        self.step_size = new_size
+        # Match the original 30→14 ratio (~0.47) so the digit stays well-fit
+        self.step_font_size = max(8, int(round(new_size * 0.47)))
+        # Reflect any clamping back into the var
+        if self.step_size_var.get() != new_size:
+            self.step_size_var.set(new_size)
+        self.status_var.set(f"Step size: {self.step_size}")
 
     def reset_step_counter(self):
         """Reset the step counter to 0."""

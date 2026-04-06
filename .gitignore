@@ -1,0 +1,27 @@
+# PyInstaller build artifacts
+build/
+dist/
+dist_v*/
+library/
+save/
+*.spec
+__pycache__/
+*.pyc
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# App-generated
+settings.ini
+2*-*-*_*.png
+
+# Tooling
+.claude/
+.qwen/

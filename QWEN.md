@@ -4,32 +4,38 @@
 
 ScreenSnap is a lightweight, portable screenshot and annotation utility built exclusively for **Windows 10/11**. It runs directly from Command Prompt with no installation wizard, auto-resolves its own Python dependencies on first launch, and is designed to be dropped into any project folder, added to the Windows PATH, or registered as a reusable shell skill.
 
-**Version:** 1.1 (Draft)
-**Status:** Not yet implemented — PRD only.
+**Version:** 1.2
+**Status:** Active development — Print Screen integration added.
 
 ## Key Features
 
 - **Full screen** and **region capture** via CLI or GUI launcher
 - **Annotation editor** with rectangle, line, circle/ellipse, crop tools
+- **Step tool** with teardrop, circle, square, and rounded rectangle shapes
+- **Rotated teardrop shapes** - only the shape rotates, text stays upright
 - **Color palette** (8 presets) and **stroke width control** (1–30 px)
 - **Unlimited undo** (Ctrl+Z)
 - **Save & Copy Path** — saves file and writes absolute Windows path to clipboard
 - **Headless mode** via `--save <path>` CLI flag
+- **Print Screen integration** - set as default PrtScn handler
 - Fully **portable** — single folder, no registry writes, no AppData entries
 
 ## Planned Folder Structure
 
 ```
 screensnap/
-  screensnap.py       # all application logic, single file
-  screensnap.bat      # Windows CMD entry point (Python)
-  screensnap-exe.bat  # Windows CMD entry point (Standalone .exe)
-  ScreenSnap.exe      # Standalone executable (~35 MB, in dist/ folder)
-  build-exe.bat       # Build script to create ScreenSnap.exe
+  screensnap.py                       # all application logic, single file
+  screensnap.bat                      # Windows CMD entry point (Python)
+  screensnap-exe.bat                  # Windows CMD entry point (Standalone .exe)
+  ScreenSnap.exe                      # Standalone executable (~35 MB, in dist/ folder)
+  screensnap-printscreen-monitor.py   # Background Print Screen key monitor
+  build-exe.bat                       # Build script to create ScreenSnap.exe
+  install-printscreen-monitor.bat     # Set up Print Screen interception
+  stop-printscreen-monitor.bat        # Stop Print Screen monitor
   README.md
 ```
 
-## CLI Interface (Planned)
+## CLI Interface
 
 ```
 screensnap                            # opens launcher window
@@ -38,7 +44,9 @@ screensnap region                     # opens region selector, opens editor
 screensnap full --save C:\output.png  # headless fullscreen save, no GUI
 ```
 
-## Keyboard Shortcuts (Planned)
+## Keyboard Shortcuts
+
+### Editor Shortcuts
 
 | Key | Action |
 |---|---|
@@ -50,6 +58,12 @@ screensnap full --save C:\output.png  # headless fullscreen save, no GUI
 | `Ctrl+S` | Save |
 | `ESC` | Cancel region selection |
 
+### System-Wide (via Background Monitor)
+
+| Key | Action |
+|---|---|
+| `Print Screen` | Launch ScreenSnap with region capture |
+
 ## Dependencies (Auto-installed on first run)
 
 | Package | Purpose |
@@ -57,6 +71,8 @@ screensnap full --save C:\output.png  # headless fullscreen save, no GUI
 | `Pillow` | Screen capture, image compositing, annotation rendering |
 | `pyperclip` | Clipboard write for Save & Copy Path |
 | `tkinter` | GUI framework — bundled with standard Python for Windows |
+| `keyboard` | Global keyboard hook for Print Screen monitoring |
+| `pystray` | System tray icon for Print Screen monitor |
 
 ## System Requirements
 
@@ -71,7 +87,7 @@ screensnap full --save C:\output.png  # headless fullscreen save, no GUI
 - The entire application logic lives in a **single Python file** (`screensnap.py`)
 - The `.bat` file is the sole Windows entry point
 - No installer, no registry writes, no files outside the tool folder
-- Out of scope for v1: arrow tool, text overlay, system tray hotkey, auto-save folder, multi-monitor selection
+- Out of scope for v1: arrow tool, text overlay, auto-save folder, multi-monitor selection
 
 ## Building and Running
 
@@ -97,6 +113,17 @@ screensnap.bat full --save C:\output.png  # headless save
 ```cmd
 build-exe.bat               # Rebuild ScreenSnap.exe using PyInstaller
 ```
+
+### Setting as Default Print Screen Handler
+```cmd
+# Install and start the background monitor
+install-printscreen-monitor.bat
+
+# Stop the monitor (if needed)
+stop-printscreen-monitor.bat
+```
+
+For detailed setup instructions, see [`PRINTSCREEN-SETUP.md`](./PRINTSCREEN-SETUP.md)
 
 ## Source
 

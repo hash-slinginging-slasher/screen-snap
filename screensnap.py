@@ -53,6 +53,11 @@ except Exception:
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import urllib.request
+import urllib.parse
+import json
+import base64
+import io
 
 
 import configparser
@@ -266,7 +271,9 @@ class SettingsManager:
             'default_save_path': '',
             'auto_save': 'false',
             'auto_copy_path': 'true',
-            'image_format': 'png'
+            'image_format': 'png',
+            'imbb_api_key': '',
+            'printscreen_monitor': 'false'
         }
 
         # Ensure config directory exists
@@ -292,6 +299,7 @@ class SettingsManager:
         # Convert types
         settings['auto_save'] = settings['auto_save'].lower() == 'true'
         settings['auto_copy_path'] = settings['auto_copy_path'].lower() == 'true'
+        settings['printscreen_monitor'] = settings['printscreen_monitor'].lower() == 'true'
 
         return settings
 
@@ -307,7 +315,9 @@ class SettingsManager:
             'default_save_path': settings.get('default_save_path', ''),
             'auto_save': str(settings.get('auto_save', False)).lower(),
             'auto_copy_path': str(settings.get('auto_copy_path', True)).lower(),
-            'image_format': settings.get('image_format', 'png')
+            'image_format': settings.get('image_format', 'png'),
+            'imbb_api_key': settings.get('imbb_api_key', ''),
+            'printscreen_monitor': str(settings.get('printscreen_monitor', False)).lower()
         }
 
         try:
@@ -371,6 +381,54 @@ class LibraryManager:
         return files
 
 
+def upload_to_imgbb(image: Image.Image, api_key: str, auto_delete_seconds: int = 86400):
+    """Upload an image to ImgBB anonymously.
+    
+    Args:
+        image: PIL Image to upload
+        api_key: ImgBB API key (from imgbb.com/api)
+        auto_delete_seconds: Auto-delete after this many seconds (default: 86400 = 1 day)
+    
+    Returns:
+        dict with 'url' (direct link), 'delete_url', or None on failure with 'error' key
+    """
+    if not api_key:
+        return {'error': 'No ImgBB API key configured. Add your key in Settings.'}
+    
+    try:
+        # Convert image to base64 PNG
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+        image_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        # Build POST request
+        url = f"https://api.imgbb.com/1/upload?key={api_key}"
+        data = urllib.parse.urlencode({
+            'image': image_b64,
+            'auto-delete': str(auto_delete_seconds)
+        }).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=data, method='POST')
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode('utf-8'))
+        
+        if result.get('success'):
+            return {
+                'url': result['data']['url'],
+                'delete_url': result['data'].get('delete_url', ''),
+                'direct_url': result['data'].get('image', {}).get('url', ''),
+            }
+        else:
+            error_msg = result.get('error', {}).get('message', 'Unknown ImgBB error')
+            return {'error': f'ImgBB upload failed: {error_msg}'}
+    
+    except urllib.error.URLError as e:
+        return {'error': f'Network error: {e.reason}'}
+    except Exception as e:
+        return {'error': f'Upload failed: {e}'}
+
+
 class LauncherWindow:
     """Initial launcher window with Full Screen and Region buttons."""
 
@@ -385,6 +443,9 @@ class LauncherWindow:
 
         # Load settings
         self.settings = SettingsManager.load()
+
+        # Auto-start Print Screen monitor if enabled in settings
+        self._auto_start_printscreen_monitor()
 
         # Center window
         self.center_window()
@@ -514,10 +575,48 @@ class LauncherWindow:
             self.execute_full_capture()
         elif self.mode == 'region':
             self.execute_region_capture()
-    
+
+    def _auto_start_printscreen_monitor(self):
+        """Auto-start the Print Screen monitor if enabled in settings."""
+        if not self.settings.get('printscreen_monitor', False):
+            return
+        
+        # Check if already running
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['wmic', 'process', 'where', "name='python.exe' and commandline like '%screensnap-printscreen-monitor%'",
+                 'get', 'ProcessId', '/format:list'],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.stdout.strip() and any(c.isdigit() for c in result.stdout):
+                print("Print Screen monitor is already running")
+                return
+        except:
+            pass
+        
+        # Start the monitor
+        try:
+            import subprocess
+            import sys
+            from pathlib import Path
+            
+            script_dir = Path(__file__).parent
+            monitor_script = script_dir / "screensnap-printscreen-monitor.py"
+            
+            if monitor_script.exists():
+                print("Auto-starting Print Screen monitor...")
+                subprocess.Popen(
+                    [sys.executable, str(monitor_script)],
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+        except Exception as e:
+            print(f"Failed to auto-start Print Screen monitor: {e}")
+
     def open_settings(self):
         """Open settings dialog."""
-        self.root.wait_window(SettingsDialog(self.root, self.settings))
+        dialog = SettingsDialog(self.root, self.settings)
+        self.root.wait_window(dialog.dialog)
         # Reload settings after dialog closes
         self.settings = SettingsManager.load()
         # Restart launcher with updated settings
@@ -774,28 +873,51 @@ class SettingsDialog:
     def __init__(self, parent, settings):
         self.settings = settings.copy()
         self.result = False
-        
+
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("System Settings")
-        self.dialog.geometry("500x520")
+        self.dialog.geometry("500x800")
         self.dialog.resizable(False, False)
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.config(bg=Theme.BACKGROUND)
-        
+
         # Center dialog
         self.dialog.update_idletasks()
-        w, h = 500, 520
+        w, h = 500, 800
         x = (self.dialog.winfo_screenwidth() // 2) - (w // 2)
         y = (self.dialog.winfo_screenheight() // 2) - (h // 2)
         self.dialog.geometry(f"{w}x{h}+{x}+{y}")
-        
-        # Main container
-        main_frame = tk.Frame(self.dialog, bg=Theme.BACKGROUND, padx=30, pady=30)
-        main_frame.pack(fill='both', expand=True)
-        
+
+        # Scrollable main container
+        self.canvas = tk.Canvas(self.dialog, bg=Theme.BACKGROUND, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.dialog, orient='vertical', command=self.canvas.yview)
+        scrollable_frame = tk.Frame(self.canvas, bg=Theme.BACKGROUND, padx=30, pady=30)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Mouse wheel scrolling
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # Unbind mousewheel when dialog closes
+        def _on_close():
+            self.canvas.unbind_all("<MouseWheel>")
+            self.dialog.destroy()
+        self.dialog.protocol("WM_DELETE_WINDOW", _on_close)
+
+        self.canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
         # Header
-        tk.Label(main_frame, text="SETTINGS", font=("Segoe UI Bold", 10), 
+        tk.Label(scrollable_frame, text="SETTINGS", font=("Segoe UI Bold", 10),
                  fg=Theme.PRIMARY, bg=Theme.BACKGROUND).pack(anchor='w', pady=(0, 25))
         
         # Sections
@@ -807,7 +929,7 @@ class SettingsDialog:
             return f
 
         # 1. Capture Section
-        capture_f = create_section(main_frame, "Capture & Save")
+        capture_f = create_section(scrollable_frame, "Capture & Save")
         
         self.auto_save_var = tk.BooleanVar(value=settings.get('auto_save', False))
         tk.Checkbutton(capture_f, text="Enable auto-save after capture", variable=self.auto_save_var,
@@ -822,7 +944,7 @@ class SettingsDialog:
                        activeforeground=Theme.ON_SURFACE).pack(anchor='w')
 
         # 2. Path Section
-        path_f = create_section(main_frame, "Storage Location")
+        path_f = create_section(scrollable_frame, "Storage Location")
         self.path_var = tk.StringVar(value=settings.get('default_save_path', ''))
         path_entry_f = tk.Frame(path_f, bg=Theme.SURFACE_LOW, padx=2, pady=2)
         path_entry_f.pack(fill='x', pady=(0, 10))
@@ -835,7 +957,7 @@ class SettingsDialog:
                      command=self.browse_path, font=("Segoe UI Bold", 8)).pack(anchor='e')
 
         # 3. Format Section
-        format_f = create_section(main_frame, "Image Format")
+        format_f = create_section(scrollable_frame, "Image Format")
         self.format_var = tk.StringVar(value=settings.get('image_format', 'png'))
         format_opts = tk.Frame(format_f, bg=Theme.SURFACE)
         format_opts.pack(anchor='w')
@@ -846,11 +968,53 @@ class SettingsDialog:
                            selectcolor=Theme.BACKGROUND, activebackground=Theme.SURFACE,
                            indicatoron=True).pack(side='left', padx=(0, 20))
 
+        # 4. ImgBB Sharing Section
+        share_f = create_section(scrollable_frame, "ImgBB Sharing")
+        tk.Label(share_f, text="Get a free API key at", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(anchor='w')
+        link_label = tk.Label(share_f, text="imgbb.com/api", font=("Segoe UI Bold", 9),
+                              fg=Theme.PRIMARY, bg=Theme.SURFACE, cursor="hand2")
+        link_label.pack(anchor='w')
+        link_label.bind("<Button-1>", lambda e: os.startfile("https://imgbb.com/api"))
+
+        self.imbb_key_var = tk.StringVar(value=settings.get('imbb_api_key', ''))
+        key_entry_f = tk.Frame(share_f, bg=Theme.SURFACE_LOW, padx=2, pady=2)
+        key_entry_f.pack(fill='x', pady=(10, 0))
+
+        tk.Entry(key_entry_f, textvariable=self.imbb_key_var, font=("Consolas", 9),
+                 bg=Theme.SURFACE_LOW, fg=Theme.ON_SURFACE, insertbackground=Theme.PRIMARY,
+                 relief='flat', borderwidth=8, show='●').pack(side='left', fill='x', expand=True)
+
+        # 5. Print Screen Integration Section
+        printscreen_f = create_section(scrollable_frame, "Print Screen Integration")
+        tk.Label(printscreen_f, text="Use Print Screen (PrtScn) key to launch ScreenSnap",
+                 font=Theme.FONT_LABEL, fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(anchor='w', pady=(0, 10))
+
+        self.printscreen_var = tk.BooleanVar(value=settings.get('printscreen_monitor', False))
+        tk.Checkbutton(printscreen_f, text="Enable Print Screen key monitoring",
+                       variable=self.printscreen_var, font=Theme.FONT_LABEL, bg=Theme.SURFACE,
+                       fg=Theme.ON_SURFACE, selectcolor=Theme.BACKGROUND, activebackground=Theme.SURFACE,
+                       activeforeground=Theme.ON_SURFACE).pack(anchor='w', pady=(0, 10))
+
+        # Status indicator
+        status_frame = tk.Frame(printscreen_f, bg=Theme.SURFACE)
+        status_frame.pack(anchor='w', pady=(5, 0))
+        
+        self.printscreen_status_label = tk.Label(status_frame, text="", font=("Segoe UI", 8),
+                                                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE)
+        self.printscreen_status_label.pack(side='left')
+        
+        # Check if monitor is currently running
+        self._check_monitor_status()
+
+        tk.Label(printscreen_f, text="Requires: keyboard, pystray packages (auto-installed)",
+                 font=("Segoe UI", 7), fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(anchor='w', pady=(10, 0))
+
         # Bottom Buttons
-        btn_f = tk.Frame(main_frame, bg=Theme.BACKGROUND)
+        btn_f = tk.Frame(scrollable_frame, bg=Theme.BACKGROUND)
         btn_f.pack(side='bottom', fill='x', pady=(10, 0))
         
-        ModernButton(btn_f, text="CANCEL", variant="secondary", command=self.dialog.destroy, width=12).pack(side='right', padx=5)
+        ModernButton(btn_f, text="CANCEL", variant="secondary", command=_on_close, width=12).pack(side='right', padx=5)
         ModernButton(btn_f, text="✓ SAVE CHANGES", variant="primary", command=self.save_settings, width=18).pack(side='right', padx=5)
     
     def browse_path(self):
@@ -858,14 +1022,131 @@ class SettingsDialog:
         folder = filedialog.askdirectory(title="Select Default Save Folder")
         if folder:
             self.path_var.set(folder)
-    
+
+    def _check_monitor_status(self):
+        """Check if the Print Screen monitor is currently running."""
+        try:
+            import subprocess
+            import re
+            
+            # Use wmic to find monitor processes
+            result = subprocess.run(
+                ['wmic', 'process', 'where', "name='python.exe' and commandline like '%screensnap-printscreen-monitor%'",
+                 'get', 'ProcessId'],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            # Look for any PID numbers in the output
+            pids = re.findall(r'\d{2,}', result.stdout)
+            
+            if pids:
+                self.printscreen_status_label.config(text="● Monitor is running", fg="#4CAF50")
+            else:
+                self.printscreen_status_label.config(text="○ Monitor is not running", fg="#9E9E9E")
+        except Exception as e:
+            self.printscreen_status_label.config(text="○ Monitor status unknown", fg="#9E9E9E")
+
+    def _install_monitor_dependencies(self):
+        """Install required packages for Print Screen monitoring."""
+        try:
+            import subprocess
+            import sys
+            
+            # Check if already installed
+            try:
+                import keyboard
+                import pystray
+                return True
+            except ImportError:
+                pass
+            
+            # Install missing dependencies
+            self.printscreen_status_label.config(text="Installing dependencies...", fg="#FF9800")
+            self.dialog.update()
+            
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', 'keyboard', 'pystray'],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            self.printscreen_status_label.config(text="✓ Dependencies installed", fg="#4CAF50")
+            self.dialog.update()
+            return True
+        except Exception as e:
+            self.printscreen_status_label.config(text=f"✗ Install failed: {str(e)}", fg="#F44336")
+            self.dialog.update()
+            return False
+
+    def _toggle_monitor_process(self, enable):
+        """Start or stop the monitor process based on setting."""
+        try:
+            import subprocess
+            import sys
+            from pathlib import Path
+            
+            script_dir = Path(__file__).parent
+            monitor_script = script_dir / "screensnap-printscreen-monitor.py"
+            
+            if not monitor_script.exists():
+                self.printscreen_status_label.config(text="✗ Monitor script not found", fg="#F44336")
+                return False
+            
+            if enable:
+                # Install dependencies first
+                if not self._install_monitor_dependencies():
+                    return False
+                
+                # Start the monitor
+                self.printscreen_status_label.config(text="Starting monitor...", fg="#FF9800")
+                self.dialog.update()
+                
+                subprocess.Popen(
+                    [sys.executable, str(monitor_script)],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                )
+                
+                import time
+                time.sleep(1)  # Give it time to start
+                self._check_monitor_status()
+                return True
+            else:
+                # Stop the monitor
+                self.printscreen_status_label.config(text="Stopping monitor...", fg="#FF9800")
+                self.dialog.update()
+                
+                # Find and kill monitor processes
+                result = subprocess.run(
+                    ['wmic', 'process', 'where', "name='python.exe' and commandline like '%screensnap-printscreen-monitor%'",
+                     'get', 'ProcessId'],
+                    capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                
+                import re
+                pids = re.findall(r'\d+', result.stdout)
+                for pid in pids:
+                    subprocess.run(
+                        ['taskkill', '/F', '/PID', pid],
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                
+                import time
+                time.sleep(0.5)
+                self._check_monitor_status()
+                return True
+        except Exception as e:
+            self.printscreen_status_label.config(text=f"✗ Error: {str(e)}", fg="#F44336")
+            self.dialog.update()
+            return False
+
     def save_settings(self):
         """Save settings and close dialog."""
         self.settings['auto_save'] = self.auto_save_var.get()
         self.settings['default_save_path'] = self.path_var.get()
         self.settings['auto_copy_path'] = self.auto_copy_var.get()
         self.settings['image_format'] = self.format_var.get()
-        
+        self.settings['imbb_api_key'] = self.imbb_key_var.get()
+        self.settings['printscreen_monitor'] = self.printscreen_var.get()
+
         # Validate path if auto-save is enabled
         if self.settings['auto_save'] and not self.settings['default_save_path']:
             messagebox.showwarning(
@@ -873,10 +1154,21 @@ class SettingsDialog:
                 "Please select a default folder when auto-save is enabled."
             )
             return
+
+        # Handle Print Screen monitor state change
+        old_printscreen = self.settings.get('printscreen_monitor', False)
+        new_printscreen = self.printscreen_var.get()
         
+        if old_printscreen != new_printscreen:
+            # State changed - start or stop the monitor
+            if not self._toggle_monitor_process(new_printscreen):
+                # If failed to toggle, don't save the change
+                return
+
         # Save to file
         SettingsManager.save(self.settings)
         self.result = True
+        self.canvas.unbind_all("<MouseWheel>")
         self.dialog.destroy()
 
 
@@ -1047,8 +1339,9 @@ class AnnotationEditor:
         self.step_counter = 0
         self.step_elements = []
         self.step_shape = 'teardrop'  # Default to SVG teardrop
-        self.step_size = 30
-        self.step_font_size = 14
+        self.step_size = 50
+        self.step_font_size = 24
+        self.step_rotation = 0  # Rotation in degrees (0 = pointing right)
         self.selected_step_id = None
         self.dragging_step = False
         self.drag_step_offset_x = 0
@@ -1059,7 +1352,7 @@ class AnnotationEditor:
         _clear_root(master)
         self.root = tk.Toplevel(master)
         self.root.title("ScreenSnap - Annotation Editor")
-        self.root.geometry("1400x850")
+        self.root.geometry("1600x850")
         self.root.config(bg=Theme.BACKGROUND)
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._closed = False
@@ -1130,9 +1423,18 @@ class AnnotationEditor:
                                      textvariable=self.step_size_var, width=5,
                                      command=self.update_step_size)
         step_size_spin.pack(side='left', padx=(0, 20))
-        # Also commit on Enter / focus-out so typed values are picked up
         step_size_spin.bind('<Return>', lambda e: self.update_step_size())
         step_size_spin.bind('<FocusOut>', lambda e: self.update_step_size())
+
+        tk.Label(self.step_props_frame, text="Rotate", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+        self.step_rotation_var = tk.IntVar(value=0)
+        rotation_spin = ttk.Spinbox(self.step_props_frame, from_=0, to=360, increment=15,
+                                    textvariable=self.step_rotation_var, width=5,
+                                    command=self.update_step_rotation)
+        rotation_spin.pack(side='left', padx=(0, 20))
+        rotation_spin.bind('<Return>', lambda e: self.update_step_rotation())
+        rotation_spin.bind('<FocusOut>', lambda e: self.update_step_rotation())
 
         ModernButton(self.step_props_frame, text="↺ RESET", variant="secondary",
                      command=self.reset_step_counter, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
@@ -1167,9 +1469,11 @@ class AnnotationEditor:
         self.canvas.bind('<B1-Motion>', self.on_canvas_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_canvas_release)
         self.canvas.bind('<Double-Button-1>', self.on_canvas_double_click)
+        self.canvas.bind('<Motion>', self.on_canvas_motion)
         self.root.bind('<Control-z>', self.undo)
         self.root.bind('<Control-s>', self.save)
         self.root.bind('<Escape>', self.deselect_all)
+        self.root.bind('<Delete>', self.delete_selected_step)
 
         # Tools shortcuts
         for k, t in [('r','rectangle'), ('l','line'), ('c','circle'), ('x','crop'), ('t','text'), ('p','step')]:
@@ -1244,6 +1548,7 @@ class AnnotationEditor:
         ModernButton(actions_frame, text="🏠 LAUNCHER", variant="secondary", command=self.back_to_launcher).pack(side='right', padx=5)
         ModernButton(actions_frame, text="✂️ REGION", variant="primary", command=self.capture_new_region).pack(side='right', padx=5)
         ModernButton(actions_frame, text="💾 SAVE & COPY", variant="success", command=self.save_and_copy).pack(side='right', padx=5)
+        ModernButton(actions_frame, text="🔗 SHARE", variant="primary", command=self.share_to_imgbb).pack(side='right', padx=5)
 
         return toolbar
     def capture_new_full(self):
@@ -1481,13 +1786,17 @@ class AnnotationEditor:
                 break
     
     def deselect_all(self, event=None):
-        """Deselect all text elements."""
+        """Deselect all text and step elements."""
         self.selected_text_id = None
-        # Remove all selection cursors
+        self.selected_step_id = None
+        # Remove all selection visuals (text cursors + step borders)
         self.canvas.delete('selection')
         for elem in self.text_elements:
             if 'cursor_id' in elem:
                 del elem['cursor_id']
+        for elem in self.step_elements:
+            if 'selection_id' in elem:
+                del elem['selection_id']
     
     def delete_selected_text(self, event=None):
         """Delete the selected text element."""
@@ -1589,73 +1898,63 @@ class AnnotationEditor:
 
         return None
 
-    def add_step_element(self, x, y):
-        """Add a numbered step marker at the given position."""
-        # Increment step counter
-        self.step_counter += 1
-        step_num = self.step_counter
+    def _render_step_image(self, elem):
+        """Render a step element to a PIL Image with 4x supersampling.
+        Returns (PhotoImage, width, height) for canvas display."""
+        from PIL import ImageFilter
 
-        # Calculate position (center the step on the click)
-        half_size = self.step_size // 2
-        x_pos = x - half_size
-        y_pos = y - half_size
+        step_size = elem['size']
+        shape = elem['shape']
+        fill_color = elem['color']
+        text_color = elem.get('text_color', 'white')
+        step_num = elem['number']
+        font_size = max(8, int(round(step_size * 0.47)))
 
-        # Save state for undo
-        self.history.append(self.image.copy())
+        # Dimensions
+        if shape == 'rounded_rect':
+            rect_w = step_size * 1.5
+            rect_h = step_size * 1.2
+        elif shape == 'teardrop':
+            rect_w = step_size * 1.4
+            rect_h = step_size
+        else:
+            rect_w = step_size
+            rect_h = step_size
 
-        # Snagit-style soft black drop shadow params (image coords).
-        shadow_offset_x = 2
-        shadow_offset_y = 4
-        shadow_blur_radius = 8
-        shadow_alpha = 140
-
-        # Marker box dimensions (in image coords)
-        if self.step_shape == 'rounded_rect':
-            rect_width = self.step_size * 1.5
-            rect_height = self.step_size * 1.2
-        elif self.step_shape == 'teardrop':
-            rect_width = self.step_size * 1.4
-            rect_height = self.step_size
-        else:  # circle, square
-            rect_width = self.step_size
-            rect_height = self.step_size
-
-        # Prepare fill colour (RGBA tuple)
-        fill_color = self.current_color
+        # Parse fill color
         if isinstance(fill_color, str) and fill_color.startswith('#'):
             r = int(fill_color[1:3], 16)
             g = int(fill_color[3:5], 16)
             b = int(fill_color[5:7], 16)
             fill_color = (r, g, b, 255)
 
-        # Pick a number colour with enough contrast against the marker fill.
-        # ITU-R BT.601 perceived luminance — threshold 150/255 marks "light" colours
-        # (yellows, light greens, white, etc.) where white text would wash out.
-        fill_luma = 0.299 * fill_color[0] + 0.587 * fill_color[1] + 0.114 * fill_color[2]
-        text_color = 'black' if fill_luma > 150 else 'white'
+        # Supersampling
+        SS = 4
+        pad = 10
+        sw = int(rect_w) + pad * 2
+        sh = int(rect_h) + pad * 2
+        ss_w, ss_h = sw * SS, sh * SS
 
-        # Teardrop polygon helper, parameterised so it can be reused for the
-        # supersampled PIL render and the live tk-canvas preview at different
-        # scales / origins.
+        shadow_offset_x = 2 * SS
+        shadow_offset_y = 4 * SS
+        shadow_blur_radius = 8 * SS
+        shadow_alpha = 140
+
+        # Teardrop polygon helper
         def get_poly_pts(origin_x, origin_y, scale, off_x=0, off_y=0):
-            """Teardrop points in pixel coords, centred on a 100x100 normalized
-            space. (50,50) maps to the centre of the circular head."""
             pts = []
-            # 1. Top-right curve (top of circle → point) — extra samples for smoothness
             p0, p1, p2, p3 = (50, 10), (100, 10), (135, 50), (135, 50)
             for i in range(21):
                 t = i / 20.0
                 px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
                 py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
                 pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
-            # 2. Bottom-right curve (point → bottom of circle)
             p0, p1, p2, p3 = (135, 50), (135, 50), (100, 90), (50, 90)
             for i in range(1, 21):
                 t = i / 20.0
                 px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
                 py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
                 pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
-            # 3. Left semicircle back to start
             for i in range(1, 41):
                 angle = math.pi/2 + (i / 40.0) * math.pi
                 px = 50 + 40 * math.cos(angle)
@@ -1663,180 +1962,115 @@ class AnnotationEditor:
                 pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
             return pts
 
-        # ── Render shadow + shape on a 4× supersampled tile, then LANCZOS-downsample.
-        # PIL's polygon/ellipse/rounded_rectangle have weak (or no) anti-aliasing
-        # at small sizes; rendering at 4× and resampling gives clean smooth edges.
-        SS = 4
-        pad = 26  # slack for shadow blur (~3*sigma) + offset
+        # Center the shape in the supersampled tile
+        mx = pad * SS
+        my = pad * SS
+        ss_scale = (step_size * SS) / 100.0
 
-        img_w, img_h = self.image.size
-        left   = max(0, int(x_pos - pad))
-        top    = max(0, int(y_pos - pad))
-        right  = min(img_w, int(x_pos + rect_width + shadow_offset_x + pad) + 1)
-        bottom = min(img_h, int(y_pos + rect_height + shadow_offset_y + pad) + 1)
-        tile_w = right - left
-        tile_h = bottom - top
+        shadow_layer = Image.new('RGBA', (ss_w, ss_h), (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow_layer)
+        shape_layer = Image.new('RGBA', (ss_w, ss_h), (0, 0, 0, 0))
+        shape_draw = ImageDraw.Draw(shape_layer)
+        shadow_rgba = (0, 0, 0, shadow_alpha)
 
-        if tile_w > 0 and tile_h > 0:
-            ss_size = (tile_w * SS, tile_h * SS)
-            # Marker top-left in tile-local pixel coords (image space)
-            mx_img = x_pos - left
-            my_img = y_pos - top
-            mx = mx_img * SS
-            my = my_img * SS
-            sox = shadow_offset_x * SS
-            soy = shadow_offset_y * SS
+        if shape == 'circle':
+            shadow_draw.ellipse([mx + shadow_offset_x, my + shadow_offset_y,
+                                 mx + step_size * SS + shadow_offset_x, my + step_size * SS + shadow_offset_y],
+                                fill=shadow_rgba)
+            shape_draw.ellipse([mx, my, mx + step_size * SS, my + step_size * SS], fill=fill_color)
+        elif shape == 'square':
+            shadow_draw.rounded_rectangle([mx + shadow_offset_x, my + shadow_offset_y,
+                                           mx + step_size * SS + shadow_offset_x, my + step_size * SS + shadow_offset_y],
+                                          radius=6 * SS, fill=shadow_rgba)
+            shape_draw.rounded_rectangle([mx, my, mx + step_size * SS, my + step_size * SS],
+                                         radius=6 * SS, fill=fill_color)
+        elif shape == 'rounded_rect':
+            radius_ss = (int(rect_h) // 2) * SS
+            shadow_draw.rounded_rectangle([mx + shadow_offset_x, my + shadow_offset_y,
+                                           mx + int(rect_w) * SS + shadow_offset_x, my + int(rect_h) * SS + shadow_offset_y],
+                                          radius=radius_ss, fill=shadow_rgba)
+            shape_draw.rounded_rectangle([mx, my, mx + int(rect_w) * SS, my + int(rect_h) * SS],
+                                         radius=radius_ss, fill=fill_color)
+        elif shape == 'teardrop':
+            shadow_draw.polygon(get_poly_pts(mx, my, ss_scale, shadow_offset_x, shadow_offset_y), fill=shadow_rgba)
+            shape_draw.polygon(get_poly_pts(mx, my, ss_scale), fill=fill_color)
 
-            # Shadow layer (drawn at 4× then blurred at 4× radius for crisp falloff)
-            shadow_layer = Image.new('RGBA', ss_size, (0, 0, 0, 0))
-            shadow_draw = ImageDraw.Draw(shadow_layer)
-
-            shape_layer = Image.new('RGBA', ss_size, (0, 0, 0, 0))
-            shape_draw = ImageDraw.Draw(shape_layer)
-
-            ss_w = rect_width * SS
-            ss_h = rect_height * SS
-            shadow_rgba = (0, 0, 0, shadow_alpha)
-
-            if self.step_shape == 'circle':
-                shadow_draw.ellipse(
-                    [mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy],
-                    fill=shadow_rgba,
-                )
-                shape_draw.ellipse(
-                    [mx, my, mx + ss_w, my + ss_h],
-                    fill=fill_color,
-                )
-            elif self.step_shape == 'square':
-                shadow_draw.rounded_rectangle(
-                    [mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy],
-                    radius=6 * SS,
-                    fill=shadow_rgba,
-                )
-                shape_draw.rounded_rectangle(
-                    [mx, my, mx + ss_w, my + ss_h],
-                    radius=6 * SS,
-                    fill=fill_color,
-                )
-            elif self.step_shape == 'rounded_rect':
-                radius_ss = (rect_height // 2) * SS
-                shadow_draw.rounded_rectangle(
-                    [mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy],
-                    radius=radius_ss,
-                    fill=shadow_rgba,
-                )
-                shape_draw.rounded_rectangle(
-                    [mx, my, mx + ss_w, my + ss_h],
-                    radius=radius_ss,
-                    fill=fill_color,
-                )
-            elif self.step_shape == 'teardrop':
-                ss_scale = (self.step_size * SS) / 100.0
-                shadow_pts = get_poly_pts(mx, my, ss_scale, sox, soy)
-                shape_pts = get_poly_pts(mx, my, ss_scale)
-                shadow_draw.polygon(shadow_pts, fill=shadow_rgba)
-                shape_draw.polygon(shape_pts, fill=fill_color)
-
-            # Blur shadow at 4× radius so the falloff matches the original look
-            from PIL import ImageFilter
-            shadow_layer = shadow_layer.filter(
-                ImageFilter.GaussianBlur(radius=shadow_blur_radius * SS)
-            )
-
-            # Combine shadow + shape on the supersampled tile
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_radius))
+        
+        # Apply rotation to shape only (not the number) - only for teardrop
+        rotation = elem.get('rotation', 0)
+        if rotation and rotation % 360 != 0 and shape == 'teardrop':
+            # Rotate only the shape layer
+            shape_layer = shape_layer.rotate(-rotation, resample=Image.BICUBIC, expand=True, center=(ss_w/2, ss_h/2))
+            # Adjust shadow to match expanded shape
+            new_ss_w = shape_layer.width
+            new_ss_h = shape_layer.height
+            shadow_layer_expanded = Image.new('RGBA', (new_ss_w, new_ss_h), (0, 0, 0, 0))
+            offset_x = (new_ss_w - ss_w) // 2
+            offset_y = (new_ss_h - ss_h) // 2
+            shadow_layer_expanded.paste(shadow_layer, (offset_x, offset_y))
+            tile = Image.alpha_composite(shadow_layer_expanded, shape_layer)
+        else:
             tile = Image.alpha_composite(shadow_layer, shape_layer)
-            # Downsample to image resolution with high-quality resampling
-            tile = tile.resize((tile_w, tile_h), Image.LANCZOS)
+        
+        tile = tile.resize((sw, sh), Image.LANCZOS)
 
-            # Composite tile onto main image
-            base = self.image.convert('RGBA')
-            base.alpha_composite(tile, dest=(left, top))
-            self.image = base.convert('RGB')
-
-        draw = ImageDraw.Draw(self.image)
-
-        # Image-coord polygon points for the canvas preview path below
-        s = self.step_size / 100.0
-
-        # Draw number with bold font
+        # Draw number on top (never rotated)
         try:
             from PIL import ImageFont
             font = None
-            bold_fonts = ["segoeuib.ttf", "arialbd.ttf", "Verdana_Bold.ttf"]
-            for f in bold_fonts:
+            for f in ["segoeuib.ttf", "arialbd.ttf", "Verdana_Bold.ttf"]:
                 try:
-                    font = ImageFont.truetype(f, self.step_font_size)
+                    font = ImageFont.truetype(f, font_size)
                     break
                 except: continue
             if not font:
-                font = ImageFont.truetype("arial.ttf", self.step_font_size)
+                font = ImageFont.truetype("arial.ttf", font_size)
         except:
             font = ImageFont.load_default()
 
-        # Compute the visual center the number should sit on.
-        # For teardrop, the circular head is centred at (50,50) in the normalized
-        # 140x100 space, which maps back to the original click point (x, y).
-        # For other shapes, use the rect centre.
-        if self.step_shape == 'teardrop':
-            text_cx = x
-            text_cy = y
-        else:
-            text_cx = x_pos + rect_width / 2
-            text_cy = y_pos + rect_height / 2
+        draw = ImageDraw.Draw(tile)
+        tcx = tile.width / 2
+        tcy = tile.height / 2
+        draw.text((tcx, tcy), str(step_num), fill=text_color, font=font, anchor="mm")
 
-        # anchor="mm" positions the glyph's geometric centre at (text_cx, text_cy),
-        # which is what we want — using textbbox + manual offset undercounts the
-        # font's ascent and pushes the digit toward the bottom of the marker.
-        draw.text((text_cx, text_cy), str(step_num), fill=text_color, font=font, anchor="mm")
+        # Convert to PhotoImage
+        photo = ImageTk.PhotoImage(tile)
+        return photo, tile.width, tile.height
 
-        # Create canvas elements (preview)
-        shadow_id = None
-        bg_id = None
-        text_id = None
-        
-        # Canvas elements use simpler shapes for performance.
-        # Tk canvas can't render a true blurred drop shadow, so we approximate
-        # the Snagit look with a soft offset shadow disc and a borderless fill.
-        if self.step_shape == 'circle':
-            shadow_id = self.canvas.create_oval(
-                x_pos + shadow_offset_x, y_pos + shadow_offset_y,
-                x_pos + rect_width + shadow_offset_x, y_pos + rect_height + shadow_offset_y,
-                fill='#000000', outline=''
-            )
-            bg_id = self.canvas.create_oval(
-                x_pos, y_pos, x_pos + rect_width, y_pos + rect_height,
-                fill=self.current_color, outline=''
-            )
-        elif self.step_shape == 'square' or self.step_shape == 'rounded_rect':
-            shadow_id = self.canvas.create_rectangle(
-                x_pos + shadow_offset_x, y_pos + shadow_offset_y,
-                x_pos + rect_width + shadow_offset_x, y_pos + rect_height + shadow_offset_y,
-                fill='#000000', outline=''
-            )
-            bg_id = self.canvas.create_rectangle(
-                x_pos, y_pos, x_pos + rect_width, y_pos + rect_height,
-                fill=self.current_color, outline=''
-            )
+    def add_step_element(self, x, y):
+        """Add a numbered step marker at the given position (canvas-only until save)."""
+        self.step_counter += 1
+        step_num = self.step_counter
+
+        half_size = self.step_size // 2
+        x_pos = x - half_size
+        y_pos = y - half_size
+
+        # Marker dimensions
+        if self.step_shape == 'rounded_rect':
+            rect_width = self.step_size * 1.5
+            rect_height = self.step_size * 1.2
         elif self.step_shape == 'teardrop':
-            shadow_id = self.canvas.create_polygon(
-                get_poly_pts(x_pos, y_pos, s, shadow_offset_x, shadow_offset_y),
-                fill='#000000', outline=''
-            )
-            bg_id = self.canvas.create_polygon(
-                get_poly_pts(x_pos, y_pos, s),
-                fill=self.current_color, outline=''
-            )
+            rect_width = self.step_size * 1.4
+            rect_height = self.step_size
+        else:
+            rect_width = self.step_size
+            rect_height = self.step_size
 
-        text_id = self.canvas.create_text(
-            text_cx,
-            text_cy,
-            text=str(step_num),
-            fill=text_color,
-            font=("Arial", self.step_font_size, "bold")
-        )
+        # Fill colour
+        fill_color = self.current_color
+        if isinstance(fill_color, str) and fill_color.startswith('#'):
+            r = int(fill_color[1:3], 16)
+            g = int(fill_color[3:5], 16)
+            b = int(fill_color[5:7], 16)
+            fill_color = (r, g, b, 255)
 
-        # Store step element
-        step_elem = {
+        fill_luma = 0.299 * fill_color[0] + 0.587 * fill_color[1] + 0.114 * fill_color[2]
+        text_color = 'black' if fill_luma > 150 else 'white'
+
+        # Build element data
+        elem = {
             'id': step_num,
             'number': step_num,
             'x': x_pos,
@@ -1846,36 +2080,106 @@ class AnnotationEditor:
             'height': rect_height,
             'shape': self.step_shape,
             'color': self.current_color,
-            'shadow_id': shadow_id,
-            'bg_id': bg_id,
-            'text_id': text_id
+            'text_color': text_color,
+            'rotation': self.step_rotation,
         }
-        self.step_elements.append(step_elem)
 
+        # Render to supersampled image
+        photo, img_w, img_h = self._render_step_image(elem)
+
+        # Store photo reference to prevent GC
+        elem['photo'] = photo
+
+        # Display on canvas as image (smooth, anti-aliased)
+        img_id = self.canvas.create_image(x_pos, y_pos, image=photo, anchor='nw')
+        elem['img_id'] = img_id
+
+        self.step_elements.append(elem)
         self.status_var.set(f"Step {step_num} added")
-        self.refresh_display()
 
     def update_step_shape(self):
-        """Update step shape from dropdown."""
+        """Update step shape from dropdown. Also updates selected step if any."""
         self.step_shape = self.step_shape_var.get()
+        if self.selected_step_id is not None:
+            for elem in self.step_elements:
+                if elem['id'] == self.selected_step_id:
+                    elem['shape'] = self.step_shape
+                    if elem['shape'] == 'rounded_rect':
+                        elem['width'] = elem['size'] * 1.5
+                        elem['height'] = elem['size'] * 1.2
+                    elif elem['shape'] == 'teardrop':
+                        elem['width'] = elem['size'] * 1.4
+                        elem['height'] = elem['size']
+                    else:
+                        elem['width'] = elem['size']
+                        elem['height'] = elem['size']
+                    self._rebuild_step_canvas(elem)
+                    break
         self.status_var.set(f"Step shape: {self.step_shape}")
 
     def update_step_size(self):
-        """Update step size from spinner. Scales font proportionally so the
-        number stays balanced inside the marker at any size."""
+        """Update step size from spinner. Also updates selected step if any."""
         try:
             new_size = int(self.step_size_var.get())
         except (tk.TclError, ValueError):
             new_size = 30
-        # Clamp to the spinbox range
         new_size = max(16, min(120, new_size))
         self.step_size = new_size
-        # Match the original 30→14 ratio (~0.47) so the digit stays well-fit
         self.step_font_size = max(8, int(round(new_size * 0.47)))
-        # Reflect any clamping back into the var
         if self.step_size_var.get() != new_size:
             self.step_size_var.set(new_size)
-        self.status_var.set(f"Step size: {self.step_size}")
+        if self.selected_step_id is not None:
+            for elem in self.step_elements:
+                if elem['id'] == self.selected_step_id:
+                    elem['size'] = new_size
+                    if elem['shape'] == 'rounded_rect':
+                        elem['width'] = new_size * 1.5
+                        elem['height'] = new_size * 1.2
+                    elif elem['shape'] == 'teardrop':
+                        elem['width'] = new_size * 1.4
+                        elem['height'] = new_size
+                    else:
+                        elem['width'] = new_size
+                        elem['height'] = new_size
+                    self._rebuild_step_canvas(elem)
+                    break
+        self.status_var.set(f"Step size: {new_size}")
+
+    def update_step_rotation(self):
+        """Update step rotation from spinner. Also updates selected step if any."""
+        try:
+            new_rot = int(self.step_rotation_var.get())
+        except (tk.TclError, ValueError):
+            new_rot = 0
+        new_rot = new_rot % 360
+        self.step_rotation = new_rot
+        if self.step_rotation_var.get() != new_rot:
+            self.step_rotation_var.set(new_rot)
+        if self.selected_step_id is not None:
+            for elem in self.step_elements:
+                if elem['id'] == self.selected_step_id:
+                    elem['rotation'] = new_rot
+                    self._rebuild_step_canvas(elem)
+                    break
+        self.status_var.set(f"Step rotation: {new_rot}°")
+
+    def _rebuild_step_canvas(self, elem):
+        """Rebuild canvas image for a step after shape/size change."""
+        if 'img_id' in elem:
+            self.canvas.delete(elem['img_id'])
+        if 'selection_id' in elem:
+            self.canvas.delete(elem['selection_id'])
+
+        photo, img_w, img_h = self._render_step_image(elem)
+        elem['photo'] = photo
+        elem['img_id'] = self.canvas.create_image(elem['x'], elem['y'], image=photo, anchor='nw')
+
+        # Redraw selection border
+        pad = 4
+        elem['selection_id'] = self.canvas.create_rectangle(
+            elem['x'] - pad, elem['y'] - pad,
+            elem['x'] + elem['width'] + pad, elem['y'] + elem['height'] + pad,
+            outline=Theme.PRIMARY, width=2, dash=(4, 4), tags='selection')
 
     def reset_step_counter(self):
         """Reset the step counter to 0."""
@@ -1883,38 +2187,74 @@ class AnnotationEditor:
         self.status_var.set("Step counter reset to 0")
 
     def delete_last_step(self):
-        """Delete the last step element."""
+        """Delete the last step element (canvas-only)."""
         if not self.step_elements:
             self.status_var.set("No steps to delete")
             return
 
-        # Remove last step
         last_step = self.step_elements.pop()
-        
-        # Remove from canvas
-        if last_step['shadow_id']:
-            self.canvas.delete(last_step['shadow_id'])
-        if last_step['bg_id']:
-            self.canvas.delete(last_step['bg_id'])
-        if last_step['text_id']:
-            self.canvas.delete(last_step['text_id'])
+        if 'img_id' in last_step:
+            self.canvas.delete(last_step['img_id'])
+        if 'selection_id' in last_step:
+            self.canvas.delete(last_step['selection_id'])
 
-        # Decrement counter
         self.step_counter -= 1
-
-        # Save state for undo
-        self.history.append(self.image.copy())
-
-        # Remove from image - need to redraw without this step
-        # For simplicity, we'll just refresh
-        self.refresh_display()
         self.status_var.set(f"Deleted step {last_step['number']}")
 
     def refresh_all_steps(self):
         """Refresh all step elements on canvas (used after undo/redo)."""
-        # This would be called to rebuild step elements after undo
-        # For now, steps are drawn directly on the image
         pass
+
+    def select_step_element(self, step_id):
+        """Select a step element and show selection border."""
+        self.deselect_all()
+        self.selected_step_id = step_id
+
+        for elem in self.step_elements:
+            if elem['id'] == step_id:
+                pad = 4
+                x1 = elem['x'] - pad
+                y1 = elem['y'] - pad
+                x2 = elem['x'] + elem['width'] + pad
+                y2 = elem['y'] + elem['height'] + pad
+
+                elem['selection_id'] = self.canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    outline=Theme.PRIMARY,
+                    width=2,
+                    dash=(4, 4),
+                    tags='selection'
+                )
+                self.step_shape_var.set(elem['shape'])
+                self.step_size_var.set(elem['size'])
+                self.step_rotation_var.set(elem.get('rotation', 0))
+                self.step_props_frame.pack(side='top', fill='x')
+                self.text_props_frame.pack_forget()
+                self.status_var.set(f"Step {elem['number']} selected — drag to move, Delete to remove")
+                break
+
+    def deselect_step_element(self):
+        """Remove step selection border."""
+        for elem in self.step_elements:
+            if 'selection_id' in elem:
+                self.canvas.delete(elem['selection_id'])
+                del elem['selection_id']
+        self.selected_step_id = None
+
+    def delete_selected_step(self, event=None):
+        """Delete the selected step element."""
+        if self.selected_step_id is None:
+            return
+        for i, elem in enumerate(self.step_elements):
+            if elem['id'] == self.selected_step_id:
+                if 'img_id' in elem:
+                    self.canvas.delete(elem['img_id'])
+                if 'selection_id' in elem:
+                    self.canvas.delete(elem['selection_id'])
+                self.step_elements.pop(i)
+                self.selected_step_id = None
+                self.status_var.set("Step deleted")
+                break
 
     def get_canvas_coords(self, event):
         """Get canvas coordinates accounting for scroll."""
@@ -1949,16 +2289,13 @@ class AnnotationEditor:
 
         # Handle step tool
         elif self.current_tool == 'step':
-            # Check if clicking on existing step to drag
             clicked_step = self.find_step_at_position(x, y)
             if clicked_step:
-                # Select and prepare to drag
-                self.selected_step_id = clicked_step['id']
+                self.select_step_element(clicked_step['id'])
                 self.dragging_step = True
                 self.drag_step_offset_x = x - clicked_step['x']
                 self.drag_step_offset_y = y - clicked_step['y']
             else:
-                # Add new step
                 self.drawing = False
                 self.add_step_element(x, y)
     
@@ -2002,40 +2339,19 @@ class AnnotationEditor:
         if self.dragging_step and self.selected_step_id is not None:
             x, y = self.get_canvas_coords(event)
 
-            # Find selected step
             for elem in self.step_elements:
                 if elem['id'] == self.selected_step_id:
-                    # Move step
                     new_x = x - self.drag_step_offset_x
                     new_y = y - self.drag_step_offset_y
 
-                    # Update canvas positions
-                    shadow_offset_x = 2
-                    shadow_offset_y = 3
-                    
-                    # Calculate dimensions based on shape
-                    if elem['shape'] in ['rounded_rect']:
-                        elem_width = elem['size'] * 1.5
-                        elem_height = elem['size'] * 1.8
-                    elif elem['shape'] in ['teardrop']:
-                        elem_width = elem['size']
-                        elem_height = elem['size'] + 12
-                    else:
-                        elem_width = elem['size']
-                        elem_height = elem['size']
-                    
-                    if elem['shadow_id'] is not None:
-                        self.canvas.coords(elem['shadow_id'], 
-                                          new_x + shadow_offset_x, new_y + shadow_offset_y, 
-                                          new_x + elem_width + shadow_offset_x, new_y + elem_height + shadow_offset_y)
-                    if elem['bg_id'] is not None:
-                        self.canvas.coords(elem['bg_id'], new_x, new_y, new_x + elem_width, new_y + elem_height)
-                    if elem['text_id'] is not None:
-                        center_x = new_x + elem_width // 2
-                        center_y = new_y + elem_height // 2
-                        self.canvas.coords(elem['text_id'], center_x, center_y)
+                    dx = new_x - elem['x']
+                    dy = new_y - elem['y']
 
-                    # Update position
+                    if 'img_id' in elem:
+                        self.canvas.move(elem['img_id'], dx, dy)
+                    if 'selection_id' in elem:
+                        self.canvas.move(elem['selection_id'], dx, dy)
+
                     elem['x'] = new_x
                     elem['y'] = new_y
                     break
@@ -2163,7 +2479,24 @@ class AnnotationEditor:
             return
         
         self.refresh_display()
-    
+
+    def on_canvas_motion(self, event):
+        """Handle mouse motion for hover cursor feedback."""
+        if self.dragging_text or self.dragging_step or self.drawing:
+            return
+
+        x, y = self.get_canvas_coords(event)
+
+        # Check if hovering over a step
+        if self.current_tool == 'step':
+            hovered = self.find_step_at_position(x, y)
+            if hovered:
+                self.canvas.config(cursor="hand2")
+            else:
+                self.canvas.config(cursor="")
+        else:
+            self.canvas.config(cursor="")
+
     def on_canvas_double_click(self, event):
         """Handle double-click to edit text."""
         x, y = self.get_canvas_coords(event)
@@ -2223,16 +2556,14 @@ class AnnotationEditor:
         self.canvas.create_image(0, 0, image=self.display_image, anchor='nw')
         self.canvas.config(scrollregion=self.canvas.bbox('all'))
     
-    def render_text_to_image(self):
-        """Render all text elements to the image before saving."""
+    def render_annotations_to_image(self):
+        """Render all text and step elements to the image before saving."""
         # Deselect all text first to remove selection boxes
         self.deselect_all()
-        
-        # Create a copy to draw on
+
+        # Render text elements
         draw = ImageDraw.Draw(self.image)
-        
         for elem in self.text_elements:
-            # Get font
             try:
                 from PIL import ImageFont
                 font = ImageFont.truetype(f"{elem['font_family'].lower().replace(' ', '')}.ttf", elem['font_size'])
@@ -2241,14 +2572,150 @@ class AnnotationEditor:
                     font = ImageFont.truetype("arial.ttf", elem['font_size'])
                 except:
                     font = ImageFont.load_default()
+            draw.text((elem['x'], elem['y']), elem['text'], fill=elem['color'], font=font)
+
+        # Render step elements with supersampled quality
+        if not self.step_elements:
+            return
+
+        from PIL import ImageFilter
+
+        # Teardrop polygon helper (same as in add_step_element)
+        def get_poly_pts(origin_x, origin_y, scale, off_x=0, off_y=0):
+            pts = []
+            p0, p1, p2, p3 = (50, 10), (100, 10), (135, 50), (135, 50)
+            for i in range(21):
+                t = i / 20.0
+                px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
+                py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
+                pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
+            p0, p1, p2, p3 = (135, 50), (135, 50), (100, 90), (50, 90)
+            for i in range(1, 21):
+                t = i / 20.0
+                px = (1-t)**3 * p0[0] + 3*(1-t)**2*t * p1[0] + 3*(1-t)*t**2 * p2[0] + t**3 * p3[0]
+                py = (1-t)**3 * p0[1] + 3*(1-t)**2*t * p1[1] + 3*(1-t)*t**2 * p2[1] + t**3 * p3[1]
+                pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
+            for i in range(1, 41):
+                angle = math.pi/2 + (i / 40.0) * math.pi
+                px = 50 + 40 * math.cos(angle)
+                py = 50 + 40 * math.sin(angle)
+                pts.append((origin_x + px * scale + off_x, origin_y + py * scale + off_y))
+            return pts
+
+        shadow_offset_x = 2
+        shadow_offset_y = 4
+        shadow_blur_radius = 8
+        shadow_alpha = 140
+        SS = 4
+        pad = 26
+
+        img_w, img_h = self.image.size
+
+        for elem in self.step_elements:
+            x_pos = elem['x']
+            y_pos = elem['y']
+            rect_width = elem['width']
+            rect_height = elem['height']
+            step_size = elem['size']
+            shape = elem['shape']
+            fill_color = elem['color']
+            text_color = elem.get('text_color', 'white')
+            step_num = elem['number']
+
+            # Parse fill color
+            if isinstance(fill_color, str) and fill_color.startswith('#'):
+                r = int(fill_color[1:3], 16)
+                g = int(fill_color[3:5], 16)
+                b = int(fill_color[5:7], 16)
+                fill_color = (r, g, b, 255)
+
+            left = max(0, int(x_pos - pad))
+            top = max(0, int(y_pos - pad))
+            right = min(img_w, int(x_pos + rect_width + shadow_offset_x + pad) + 1)
+            bottom = min(img_h, int(y_pos + rect_height + shadow_offset_y + pad) + 1)
+            tile_w = right - left
+            tile_h = bottom - top
+
+            if tile_w <= 0 or tile_h <= 0:
+                continue
+
+            ss_size = (tile_w * SS, tile_h * SS)
+            mx_img = x_pos - left
+            my_img = y_pos - top
+            mx = mx_img * SS
+            my = my_img * SS
+            sox = shadow_offset_x * SS
+            soy = shadow_offset_y * SS
+            ss_w = rect_width * SS
+            ss_h = rect_height * SS
+            shadow_rgba = (0, 0, 0, shadow_alpha)
+
+            shadow_layer = Image.new('RGBA', ss_size, (0, 0, 0, 0))
+            shadow_draw = ImageDraw.Draw(shadow_layer)
+            shape_layer = Image.new('RGBA', ss_size, (0, 0, 0, 0))
+            shape_draw = ImageDraw.Draw(shape_layer)
+
+            if shape == 'circle':
+                shadow_draw.ellipse([mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy], fill=shadow_rgba)
+                shape_draw.ellipse([mx, my, mx + ss_w, my + ss_h], fill=fill_color)
+            elif shape == 'square':
+                shadow_draw.rounded_rectangle([mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy], radius=6*SS, fill=shadow_rgba)
+                shape_draw.rounded_rectangle([mx, my, mx + ss_w, my + ss_h], radius=6*SS, fill=fill_color)
+            elif shape == 'rounded_rect':
+                radius_ss = (int(rect_height) // 2) * SS
+                shadow_draw.rounded_rectangle([mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy], radius=radius_ss, fill=shadow_rgba)
+                shape_draw.rounded_rectangle([mx, my, mx + ss_w, my + ss_h], radius=radius_ss, fill=fill_color)
+            elif shape == 'teardrop':
+                ss_scale = (step_size * SS) / 100.0
+                shadow_draw.polygon(get_poly_pts(mx, my, ss_scale, sox, soy), fill=shadow_rgba)
+                shape_draw.polygon(get_poly_pts(mx, my, ss_scale), fill=fill_color)
+
+            shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur_radius * SS))
             
-            # Draw text
-            draw.text(
-                (elem['x'], elem['y']),
-                elem['text'],
-                fill=elem['color'],
-                font=font
-            )
+            # Apply rotation to shape layer only (not the text)
+            rotation = elem.get('rotation', 0)
+            if rotation and rotation % 360 != 0 and shape == 'teardrop':
+                # Rotate only the shape layer around its center
+                shape_layer = shape_layer.rotate(-rotation, resample=Image.BICUBIC, expand=True, center=(ss_w/2, ss_h/2))
+                # Adjust shadow position for expanded shape layer
+                new_ss_w = shape_layer.width
+                new_ss_h = shape_layer.height
+                # Recreate shadow layer with same dimensions as rotated shape
+                shadow_layer_expanded = Image.new('RGBA', (new_ss_w, new_ss_h), (0, 0, 0, 0))
+                # Paste original shadow at offset to match shape position
+                offset_x = (new_ss_w - ss_w) // 2
+                offset_y = (new_ss_h - ss_h) // 2
+                shadow_layer_expanded.paste(shadow_layer, (offset_x, offset_y))
+                # Composite
+                tile = Image.alpha_composite(shadow_layer_expanded, shape_layer)
+            else:
+                tile = Image.alpha_composite(shadow_layer, shape_layer)
+            
+            tile = tile.resize((tile_w, tile_h), Image.LANCZOS)
+
+            # Draw number on tile (will NOT be rotated)
+            try:
+                from PIL import ImageFont
+                font = None
+                for f in ["segoeuib.ttf", "arialbd.ttf", "Verdana_Bold.ttf"]:
+                    try:
+                        font = ImageFont.truetype(f, max(8, int(round(step_size * 0.47))))
+                        break
+                    except: continue
+                if not font:
+                    font = ImageFont.truetype("arial.ttf", max(8, int(round(step_size * 0.47))))
+            except:
+                font = ImageFont.load_default()
+
+            tile_draw = ImageDraw.Draw(tile)
+            tile_draw.text((tile_w / 2, tile_h / 2), str(step_num), fill=text_color, font=font, anchor="mm")
+
+            # Composite onto main image
+            base = self.image.convert('RGBA')
+            ox = left
+            oy = top
+            base.alpha_composite(tile, dest=(ox, oy))
+            self.image = base.convert('RGB')
     
     def undo(self, event=None):
         """Undo the last action."""
@@ -2279,7 +2746,7 @@ class AnnotationEditor:
                     return
             
             # Render text elements to image before saving
-            self.render_text_to_image()
+            self.render_annotations_to_image()
             
             # Generate filename with timestamp
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2320,7 +2787,7 @@ class AnnotationEditor:
     def save(self, event=None):
         """Save the image via file dialog."""
         # Render text elements to image before saving
-        self.render_text_to_image()
+        self.render_annotations_to_image()
 
         file_path = filedialog.asksaveasfilename(
             title="Save Screenshot",
@@ -2347,36 +2814,79 @@ class AnnotationEditor:
     def save_and_copy(self):
         """Save the image and copy path to clipboard."""
         # Render text elements to image before saving
-        self.render_text_to_image()
-        
+        self.render_annotations_to_image()
+
         # If we have a last saved path, use it
         if self.last_saved_path:
             file_path = self.last_saved_path
         else:
-            # Otherwise ask for a path
-            file_path = filedialog.asksaveasfilename(
-                title="Save Screenshot",
-                defaultextension=".png",
-                filetypes=[
-                    ("PNG files", "*.png"),
-                    ("JPEG files", "*.jpg"),
-                    ("BMP files", "*.bmp"),
-                    ("All files", "*.*")
-                ]
-            )
-        
+            # Auto-generate filename based on timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            fmt = self.settings.get('image_format', 'png')
+            ext = f".{fmt}"
+            filename = f"screensnap_{timestamp}{ext}"
+
+            # Determine save directory: use default_save_path if set, else current directory
+            save_dir = self.settings.get('default_save_path', '')
+            if not save_dir or not os.path.isdir(save_dir):
+                save_dir = str(Path.home() / "Pictures")
+
+            os.makedirs(save_dir, exist_ok=True)
+            file_path = os.path.join(save_dir, filename)
+
         if file_path:
             try:
                 self.image.save(file_path)
                 self.last_saved_path = file_path
-                
+
                 # Copy absolute path to clipboard
                 abs_path = os.path.abspath(file_path)
                 pyperclip.copy(abs_path)
-                
+
                 self.status_var.set(f"Saved & copied to clipboard: {abs_path}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save file: {e}")
+
+    def share_to_imgbb(self):
+        """Upload image to ImgBB and copy link to clipboard."""
+        # Render text elements to image before uploading
+        self.render_annotations_to_image()
+
+        api_key = self.settings.get('imbb_api_key', '')
+        if not api_key:
+            messagebox.showwarning(
+                "ImgBB API Key Required",
+                "You need an ImgBB API key to use this feature.\n\n"
+                "1. Go to imgbb.com/api\n"
+                "2. Sign up for a free account\n"
+                "3. Copy your API key\n"
+                "4. Open Settings and paste it in the ImgBB section"
+            )
+            return
+
+        self.status_var.set("Uploading to ImgBB...")
+        self.root.config(cursor="watch")
+        self.root.update()
+
+        try:
+            result = upload_to_imgbb(self.image, api_key, auto_delete_seconds=86400)
+
+            if 'error' in result:
+                self.status_var.set(f"ImgBB upload failed: {result['error']}")
+                messagebox.showerror("Upload Failed", result['error'])
+            else:
+                url = result['url']
+                pyperclip.copy(url)
+                self.status_var.set(f"Uploaded to ImgBB — link copied to clipboard")
+                messagebox.showinfo(
+                    "Upload Successful",
+                    f"Image uploaded to ImgBB!\n\n"
+                    f"Link: {url}\n\n"
+                    f"Auto-deletes in 24 hours.\n"
+                    f"Link has been copied to clipboard."
+                )
+        finally:
+            self.root.config(cursor="")
 
 
 class LibraryBrowser:

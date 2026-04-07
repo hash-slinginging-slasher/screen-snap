@@ -1969,7 +1969,10 @@ class AnnotationEditor:
             text = self.prompt_text()
             if not text:
                 return
-        
+
+        # Snapshot the pre-mutation state so undo can remove this text.
+        self.save_state()
+
         # Create text element
         text_element = {
             'id': len(self.text_elements),
@@ -1999,18 +2002,20 @@ class AnnotationEditor:
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         
-        # Add to canvas
+        # Add to canvas at canvas-space coordinates with a zoom-scaled font.
+        z = self.zoom if self.zoom else 1.0
         canvas_id = self.canvas.create_text(
-            x, y,
+            x * z, y * z,
             text=text,
             fill=text_element['color'],
-            font=(text_element['font_family'], text_element['font_size']),
+            font=(text_element['font_family'],
+                  max(1, int(round(text_element['font_size'] * z)))),
             anchor='nw'
         )
         text_element['canvas_id'] = canvas_id
         text_element['width'] = text_width
         text_element['height'] = text_height
-        
+
         self.text_elements.append(text_element)
         self.select_text_element(text_element['id'])
         self.status_var.set(f"Text added: '{text}'")
@@ -2034,11 +2039,12 @@ class AnnotationEditor:
         self.font_family_var.set(text_elem['font_family'])
         self.font_size_var.set(text_elem['font_size'])
         
-        # Draw blinking cursor at the START of text
-        cursor_x = text_elem['x']
-        cursor_y1 = text_elem['y']
-        cursor_y2 = text_elem['y'] + text_elem['height']
-        
+        # Draw blinking cursor at the START of text (canvas-space coords)
+        z = self.zoom if self.zoom else 1.0
+        cursor_x = text_elem['x'] * z
+        cursor_y1 = text_elem['y'] * z
+        cursor_y2 = (text_elem['y'] + text_elem['height']) * z
+
         text_elem['cursor_id'] = self.canvas.create_line(
             cursor_x, cursor_y1, cursor_x, cursor_y2,
             fill='#2196F3',
@@ -2085,10 +2091,12 @@ class AnnotationEditor:
         """Delete the selected text element."""
         if self.selected_text_id is None:
             return
-        
+
         # Find and remove from canvas
         for i, elem in enumerate(self.text_elements):
             if elem['id'] == self.selected_text_id:
+                # Snapshot before mutation so undo can bring the text back.
+                self.save_state()
                 if elem['canvas_id']:
                     self.canvas.delete(elem['canvas_id'])
                 self.text_elements.pop(i)
@@ -2100,10 +2108,12 @@ class AnnotationEditor:
         """Update the selected text element with new properties."""
         if self.selected_text_id is None:
             return
-        
+
         # Find the text element
         for elem in self.text_elements:
             if elem['id'] == self.selected_text_id:
+                # Snapshot before mutation so undo can revert the edit.
+                self.save_state()
                 # Update properties
                 elem['font_family'] = self.font_family_var.get()
                 elem['font_size'] = self.font_size_var.get()
@@ -2123,28 +2133,30 @@ class AnnotationEditor:
                     except:
                         font = ImageFont.load_default()
                 
-                # Recreate on canvas
+                # Recreate on canvas at canvas-space coords with zoomed font
+                z = self.zoom if self.zoom else 1.0
                 elem['canvas_id'] = self.canvas.create_text(
-                    elem['x'], elem['y'],
+                    elem['x'] * z, elem['y'] * z,
                     text=elem['text'],
                     fill=elem['color'],
-                    font=(elem['font_family'], elem['font_size']),
+                    font=(elem['font_family'],
+                          max(1, int(round(elem['font_size'] * z)))),
                     anchor='nw'
                 )
-                
-                # Update dimensions
+
+                # Update dimensions (stored in image space)
                 temp_img = Image.new('RGB', (1, 1))
                 draw = ImageDraw.Draw(temp_img)
                 bbox = draw.textbbox((0, 0), elem['text'], font=font)
                 elem['width'] = bbox[2] - bbox[0]
                 elem['height'] = bbox[3] - bbox[1]
-                
-                # Update cursor position
+
+                # Update cursor position (canvas-space)
                 self.canvas.delete('selection')
-                cursor_x = elem['x']
-                cursor_y1 = elem['y']
-                cursor_y2 = elem['y'] + elem['height']
-                
+                cursor_x = elem['x'] * z
+                cursor_y1 = elem['y'] * z
+                cursor_y2 = (elem['y'] + elem['height']) * z
+
                 elem['cursor_id'] = self.canvas.create_line(
                     cursor_x, cursor_y1, cursor_x, cursor_y2,
                     fill='#2196F3',
@@ -2181,9 +2193,17 @@ class AnnotationEditor:
 
         return None
 
-    def _render_step_image(self, elem):
-        """Render a step element to a PIL Image with 4x supersampling.
-        Returns (PhotoImage, width, height) for canvas display."""
+    def _render_step_image(self, elem, zoom=1.0):
+        """Render a step element to a PhotoImage, optionally scaled by `zoom`.
+
+        At ``zoom`` = 1.0 the returned tile matches the element's
+        image-space size. Larger/smaller zooms produce a correspondingly
+        larger/smaller tile so the step lines up with the zoomed canvas
+        background. The 4× supersampling is still performed in image
+        space, then the final downsample targets the zoomed size, which
+        keeps edges crisp at arbitrary zoom levels.
+        Returns (PhotoImage, width, height) for canvas display.
+        """
         from PIL import ImageFilter
 
         step_size = elem['size']
@@ -2191,11 +2211,7 @@ class AnnotationEditor:
         fill_color = elem['color']
         text_color = elem.get('text_color', 'white')
         step_num = elem['number']
-        font_size = max(8, int(round(step_size * 0.47)))
-
-        # Save state for undo (and invalidate redo stack)
-        self.history.append(self.image.copy())
-        self.redo_stack.clear()
+        font_size = max(8, int(round(step_size * 0.47 * zoom)))
 
         # Dimensions
         if shape == 'rounded_rect':
@@ -2299,8 +2315,10 @@ class AnnotationEditor:
             tile = Image.alpha_composite(shadow_layer_expanded, shape_layer)
         else:
             tile = Image.alpha_composite(shadow_layer, shape_layer)
-        
-        tile = tile.resize((sw, sh), Image.LANCZOS)
+
+        target_w = max(1, int(round(sw * zoom)))
+        target_h = max(1, int(round(sh * zoom)))
+        tile = tile.resize((target_w, target_h), Image.LANCZOS)
 
         # Draw number on top (never rotated)
         try:
@@ -2327,6 +2345,10 @@ class AnnotationEditor:
 
     def add_step_element(self, x, y):
         """Add a numbered step marker at the given position (canvas-only until save)."""
+        # Snapshot the pre-mutation state so undo can remove this step and
+        # restore the previous step_counter value.
+        self.save_state()
+
         self.step_counter += 1
         step_num = self.step_counter
 
@@ -2371,14 +2393,18 @@ class AnnotationEditor:
             'rotation': self.step_rotation,
         }
 
-        # Render to supersampled image
-        photo, img_w, img_h = self._render_step_image(elem)
+        # Render at the current zoom so the overlay lines up with the
+        # zoomed canvas background.
+        z = self.zoom if self.zoom else 1.0
+        photo, img_w, img_h = self._render_step_image(elem, zoom=z)
 
         # Store photo reference to prevent GC
         elem['photo'] = photo
 
-        # Display on canvas as image (smooth, anti-aliased)
-        img_id = self.canvas.create_image(x_pos, y_pos, image=photo, anchor='nw')
+        # Display on canvas as image at canvas-space coordinates.
+        img_id = self.canvas.create_image(
+            x_pos * z, y_pos * z, image=photo, anchor='nw'
+        )
         elem['img_id'] = img_id
 
         self.step_elements.append(elem)
@@ -2390,6 +2416,8 @@ class AnnotationEditor:
         if self.selected_step_id is not None:
             for elem in self.step_elements:
                 if elem['id'] == self.selected_step_id:
+                    # Snapshot before mutation so undo can revert the change.
+                    self.save_state()
                     elem['shape'] = self.step_shape
                     if elem['shape'] == 'rounded_rect':
                         elem['width'] = elem['size'] * 1.5
@@ -2418,6 +2446,8 @@ class AnnotationEditor:
         if self.selected_step_id is not None:
             for elem in self.step_elements:
                 if elem['id'] == self.selected_step_id:
+                    # Snapshot before mutation so undo can revert the change.
+                    self.save_state()
                     elem['size'] = new_size
                     if elem['shape'] == 'rounded_rect':
                         elem['width'] = new_size * 1.5
@@ -2445,6 +2475,8 @@ class AnnotationEditor:
         if self.selected_step_id is not None:
             for elem in self.step_elements:
                 if elem['id'] == self.selected_step_id:
+                    # Snapshot before mutation so undo can revert the change.
+                    self.save_state()
                     elem['rotation'] = new_rot
                     self._rebuild_step_canvas(elem)
                     break
@@ -2457,15 +2489,19 @@ class AnnotationEditor:
         if 'selection_id' in elem:
             self.canvas.delete(elem['selection_id'])
 
-        photo, img_w, img_h = self._render_step_image(elem)
+        z = self.zoom if self.zoom else 1.0
+        photo, img_w, img_h = self._render_step_image(elem, zoom=z)
         elem['photo'] = photo
-        elem['img_id'] = self.canvas.create_image(elem['x'], elem['y'], image=photo, anchor='nw')
+        elem['img_id'] = self.canvas.create_image(
+            elem['x'] * z, elem['y'] * z, image=photo, anchor='nw'
+        )
 
-        # Redraw selection border
+        # Redraw selection border at canvas-space coordinates
         pad = 4
         elem['selection_id'] = self.canvas.create_rectangle(
-            elem['x'] - pad, elem['y'] - pad,
-            elem['x'] + elem['width'] + pad, elem['y'] + elem['height'] + pad,
+            (elem['x'] - pad) * z, (elem['y'] - pad) * z,
+            (elem['x'] + elem['width'] + pad) * z,
+            (elem['y'] + elem['height'] + pad) * z,
             outline=Theme.PRIMARY, width=2, dash=(4, 4), tags='selection')
 
     def reset_step_counter(self):
@@ -2479,6 +2515,9 @@ class AnnotationEditor:
             self.status_var.set("No steps to delete")
             return
 
+        # Snapshot the pre-mutation state so undo can bring the step back.
+        self.save_state()
+
         last_step = self.step_elements.pop()
         if 'img_id' in last_step:
             self.canvas.delete(last_step['img_id'])
@@ -2486,14 +2525,6 @@ class AnnotationEditor:
             self.canvas.delete(last_step['selection_id'])
 
         self.step_counter -= 1
-
-        # Save state for undo (and invalidate redo stack)
-        self.history.append(self.image.copy())
-        self.redo_stack.clear()
-
-        # Remove from image - need to redraw without this step
-        # For simplicity, we'll just refresh
-        self.refresh_display()
         self.status_var.set(f"Deleted step {last_step['number']}")
 
     def refresh_all_steps(self):
@@ -2505,13 +2536,14 @@ class AnnotationEditor:
         self.deselect_all()
         self.selected_step_id = step_id
 
+        z = self.zoom if self.zoom else 1.0
         for elem in self.step_elements:
             if elem['id'] == step_id:
                 pad = 4
-                x1 = elem['x'] - pad
-                y1 = elem['y'] - pad
-                x2 = elem['x'] + elem['width'] + pad
-                y2 = elem['y'] + elem['height'] + pad
+                x1 = (elem['x'] - pad) * z
+                y1 = (elem['y'] - pad) * z
+                x2 = (elem['x'] + elem['width'] + pad) * z
+                y2 = (elem['y'] + elem['height'] + pad) * z
 
                 elem['selection_id'] = self.canvas.create_rectangle(
                     x1, y1, x2, y2,
@@ -2542,6 +2574,8 @@ class AnnotationEditor:
             return
         for i, elem in enumerate(self.step_elements):
             if elem['id'] == self.selected_step_id:
+                # Snapshot before mutation so undo can restore the step.
+                self.save_state()
                 if 'img_id' in elem:
                     self.canvas.delete(elem['img_id'])
                 if 'selection_id' in elem:
@@ -2571,20 +2605,17 @@ class AnnotationEditor:
         self.start_x = cx
         self.start_y = cy
 
-        # Text tool still needs zoom=1 (canvas text items aren't scaled yet).
-        if self.current_tool == 'text' and abs(self.zoom - 1.0) > 1e-6:
-            self.drawing = False
-            self.status_var.set("Text tool requires 100% zoom.")
-            return
-
         # Handle text tool
         if self.current_tool == 'text':
             # Check if clicking on existing text
             clicked_text = self.find_text_at_position(ix, iy)
             if clicked_text:
-                # Select and prepare to drag
+                # Select and prepare to drag. The pre-drag snapshot is taken
+                # lazily on the first drag motion (see on_canvas_drag) to
+                # avoid polluting history with no-op clicks.
                 self.select_text_element(clicked_text['id'])
                 self.dragging_text = True
+                self._drag_snapshot_taken = False
                 self.drag_offset_x = ix - clicked_text['x']
                 self.drag_offset_y = iy - clicked_text['y']
             else:
@@ -2599,6 +2630,7 @@ class AnnotationEditor:
             if clicked_step:
                 self.select_step_element(clicked_step['id'])
                 self.dragging_step = True
+                self._drag_snapshot_taken = False
                 self.drag_step_offset_x = ix - clicked_step['x']
                 self.drag_step_offset_y = iy - clicked_step['y']
             else:
@@ -2608,30 +2640,39 @@ class AnnotationEditor:
     
     def on_canvas_drag(self, event):
         """Handle canvas mouse drag."""
-        # Handle text dragging
+        # Handle text dragging (elem['x']/['y'] are stored in IMAGE space,
+        # while canvas items live in canvas space — so we convert deltas).
         if self.dragging_text and self.selected_text_id is not None:
-            x, y = self.get_canvas_coords(event)
+            # Snapshot the pre-drag state on the first motion event so
+            # undo restores the original text position.
+            if not getattr(self, '_drag_snapshot_taken', False):
+                self.save_state()
+                self._drag_snapshot_taken = True
 
-            # Find selected text
+            cx, cy = self.get_canvas_coords(event)
+            z = self.zoom if self.zoom else 1.0
+            ix, iy = cx / z, cy / z
+
             for elem in self.text_elements:
                 if elem['id'] == self.selected_text_id:
-                    # Move text
-                    new_x = x - self.drag_offset_x
-                    new_y = y - self.drag_offset_y
+                    new_x = ix - self.drag_offset_x
+                    new_y = iy - self.drag_offset_y
 
-                    # Update canvas position
+                    # Update canvas position (canvas-space)
                     if elem['canvas_id']:
-                        self.canvas.coords(elem['canvas_id'], new_x, new_y)
+                        self.canvas.coords(
+                            elem['canvas_id'], new_x * z, new_y * z
+                        )
 
-                    # Update position
+                    # Update position (image-space)
                     elem['x'] = new_x
                     elem['y'] = new_y
 
-                    # Update cursor position
+                    # Update cursor position (canvas-space)
                     self.canvas.delete('selection')
-                    cursor_x = new_x
-                    cursor_y1 = new_y
-                    cursor_y2 = new_y + elem['height']
+                    cursor_x = new_x * z
+                    cursor_y1 = new_y * z
+                    cursor_y2 = (new_y + elem['height']) * z
 
                     elem['cursor_id'] = self.canvas.create_line(
                         cursor_x, cursor_y1, cursor_x, cursor_y2,
@@ -2644,6 +2685,12 @@ class AnnotationEditor:
 
         # Handle step dragging (step coords are stored in IMAGE space)
         if self.dragging_step and self.selected_step_id is not None:
+            # Snapshot the pre-drag state on the first motion event so
+            # undo restores the original step position.
+            if not getattr(self, '_drag_snapshot_taken', False):
+                self.save_state()
+                self._drag_snapshot_taken = True
+
             cx, cy = self.get_canvas_coords(event)
             z = self.zoom if self.zoom else 1.0
             x, y = cx / z, cy / z
@@ -2653,8 +2700,9 @@ class AnnotationEditor:
                     new_x = x - self.drag_step_offset_x
                     new_y = y - self.drag_step_offset_y
 
-                    dx = new_x - elem['x']
-                    dy = new_y - elem['y']
+                    # Deltas in IMAGE space, converted to canvas space for move().
+                    dx = (new_x - elem['x']) * z
+                    dy = (new_y - elem['y']) * z
 
                     if 'img_id' in elem:
                         self.canvas.move(elem['img_id'], dx, dy)
@@ -2758,8 +2806,7 @@ class AnnotationEditor:
             return
         
         # Save state for undo (and invalidate redo stack)
-        self.history.append(self.image.copy())
-        self.redo_stack.clear()
+        self.save_state()
 
         # Convert canvas coords to image coords (divide by zoom).
         z = self.zoom if self.zoom else 1.0
@@ -2814,12 +2861,9 @@ class AnnotationEditor:
 
     def on_canvas_double_click(self, event):
         """Handle double-click to edit text."""
-        if abs(self.zoom - 1.0) > 1e-6:
-            self.status_var.set(
-                "Text editing requires 100% zoom (Ctrl+0 to reset)."
-            )
-            return
-        x, y = self.get_canvas_coords(event)
+        cx, cy = self.get_canvas_coords(event)
+        z = self.zoom if self.zoom else 1.0
+        x, y = cx / z, cy / z
         
         # Find text at position
         clicked_text = self.find_text_at_position(x, y)
@@ -2827,6 +2871,8 @@ class AnnotationEditor:
             # Prompt for new text
             new_text = self.prompt_text(clicked_text['text'])
             if new_text and new_text != clicked_text['text']:
+                # Snapshot before mutation so undo can restore the old text.
+                self.save_state()
                 # Update text
                 clicked_text['text'] = new_text
                 
@@ -2834,32 +2880,34 @@ class AnnotationEditor:
                 if clicked_text['canvas_id']:
                     self.canvas.delete(clicked_text['canvas_id'])
                 
+                z = self.zoom if self.zoom else 1.0
                 clicked_text['canvas_id'] = self.canvas.create_text(
-                    clicked_text['x'], clicked_text['y'],
+                    clicked_text['x'] * z, clicked_text['y'] * z,
                     text=new_text,
                     fill=clicked_text['color'],
-                    font=(clicked_text['font_family'], clicked_text['font_size']),
+                    font=(clicked_text['font_family'],
+                          max(1, int(round(clicked_text['font_size'] * z)))),
                     anchor='nw'
                 )
-                
-                # Update dimensions
+
+                # Update dimensions (stored in image space)
                 try:
                     from PIL import ImageFont
                     font = ImageFont.truetype(f"{clicked_text['font_family'].lower().replace(' ', '')}.ttf", clicked_text['font_size'])
                 except:
                     font = ImageFont.truetype("arial.ttf", clicked_text['font_size'])
-                
+
                 temp_img = Image.new('RGB', (1, 1))
                 draw = ImageDraw.Draw(temp_img)
                 bbox = draw.textbbox((0, 0), new_text, font=font)
                 clicked_text['width'] = bbox[2] - bbox[0]
                 clicked_text['height'] = bbox[3] - bbox[1]
-                
-                # Update cursor position
+
+                # Update cursor position (canvas-space)
                 self.canvas.delete('selection')
-                cursor_x = clicked_text['x']
-                cursor_y1 = clicked_text['y']
-                cursor_y2 = clicked_text['y'] + clicked_text['height']
+                cursor_x = clicked_text['x'] * z
+                cursor_y1 = clicked_text['y'] * z
+                cursor_y2 = (clicked_text['y'] + clicked_text['height']) * z
                 
                 clicked_text['cursor_id'] = self.canvas.create_line(
                     cursor_x, cursor_y1, cursor_x, cursor_y2,
@@ -2873,10 +2921,12 @@ class AnnotationEditor:
     def refresh_display(self):
         """Refresh the canvas display with current image at current zoom.
 
-        Delete + recreate the canvas image so it always ends up on TOP of
-        the z-stack. This matches the original pre-zoom behavior where the
-        baked-in step/text pixels (stored in self.image) are guaranteed to
-        be visible over any lingering flat canvas proxies.
+        Delete + recreate the canvas image, then lower it to the bottom of
+        the z-stack so that deferred-rendered overlays (step images, text
+        items, selection borders, preview shapes) remain visible above the
+        background. The dot-grid items re-lower themselves when drawn. If
+        the zoom level has changed since the last refresh, also re-render
+        every step/text overlay so they track the zoomed background.
         """
         if abs(self.zoom - 1.0) < 1e-6:
             display_source = self.image
@@ -2894,9 +2944,83 @@ class AnnotationEditor:
         self.image_id = self.canvas.create_image(
             0, 0, image=self.display_image, anchor='nw'
         )
+        # Lower the background image below all annotation overlays so
+        # canvas-only step/text/selection items stay visible after redraws,
+        # then re-lower the grid so it stays underneath the image.
+        self.canvas.tag_lower(self.image_id)
+        self.canvas.tag_lower('grid')
         self.canvas.config(
             scrollregion=(0, 0, display_source.width, display_source.height)
         )
+
+        # Reposition/rescale overlays when zoom changes. We only re-render
+        # the expensive step photos when the zoom actually changed, to
+        # avoid flooding refresh_display calls (e.g. after every shape
+        # draw) with unnecessary supersampled renders.
+        last_zoom = getattr(self, '_last_overlay_zoom', None)
+        if last_zoom is None or abs(last_zoom - self.zoom) > 1e-6:
+            self._sync_overlays_to_zoom()
+            self._last_overlay_zoom = self.zoom
+
+    def _sync_overlays_to_zoom(self):
+        """Re-render and reposition all step/text overlays at the current
+        zoom level. Called from refresh_display whenever zoom changes."""
+        z = self.zoom if self.zoom else 1.0
+
+        # Steps: re-render the PhotoImage at the zoomed size and place the
+        # canvas item at canvas-space coordinates.
+        for elem in self.step_elements:
+            if 'img_id' in elem:
+                try:
+                    self.canvas.delete(elem['img_id'])
+                except Exception:
+                    pass
+            photo, _, _ = self._render_step_image(elem, zoom=z)
+            elem['photo'] = photo
+            elem['img_id'] = self.canvas.create_image(
+                elem['x'] * z, elem['y'] * z, image=photo, anchor='nw'
+            )
+            # Rebuild the selection border if this step is selected.
+            if 'selection_id' in elem:
+                try:
+                    self.canvas.delete(elem['selection_id'])
+                except Exception:
+                    pass
+                pad = 4
+                elem['selection_id'] = self.canvas.create_rectangle(
+                    (elem['x'] - pad) * z, (elem['y'] - pad) * z,
+                    (elem['x'] + elem['width'] + pad) * z,
+                    (elem['y'] + elem['height'] + pad) * z,
+                    outline=Theme.PRIMARY, width=2, dash=(4, 4),
+                    tags='selection'
+                )
+
+        # Text: recreate each canvas text item at canvas-space coords with
+        # a zoom-scaled font. Also rebuild the selection cursor if shown.
+        for elem in self.text_elements:
+            if elem.get('canvas_id'):
+                try:
+                    self.canvas.delete(elem['canvas_id'])
+                except Exception:
+                    pass
+            elem['canvas_id'] = self.canvas.create_text(
+                elem['x'] * z, elem['y'] * z,
+                text=elem['text'],
+                fill=elem['color'],
+                font=(elem['font_family'],
+                      max(1, int(round(elem['font_size'] * z)))),
+                anchor='nw'
+            )
+            if 'cursor_id' in elem:
+                try:
+                    self.canvas.delete(elem['cursor_id'])
+                except Exception:
+                    pass
+                elem['cursor_id'] = self.canvas.create_line(
+                    elem['x'] * z, elem['y'] * z,
+                    elem['x'] * z, (elem['y'] + elem['height']) * z,
+                    fill='#2196F3', width=2, tags='selection'
+                )
 
     def on_scroll_vertical(self, event):
         """Plain wheel pans the canvas vertically. Never zooms."""
@@ -3108,16 +3232,135 @@ class AnnotationEditor:
             base.alpha_composite(tile, dest=(ox, oy))
             self.image = base.convert('RGB')
     
+    # ------------------------------------------------------------------
+    # Undo / redo
+    #
+    # History entries are full logical snapshots of the editor state:
+    #   {'image': PIL.Image, 'text_elements': [...], 'step_elements': [...],
+    #    'step_counter': int}
+    #
+    # Shape tools (rectangle/line/circle/crop) burn pixels into self.image,
+    # but the step and text tools live purely as canvas overlays until
+    # render_annotations_to_image() bakes them in at save time. A plain
+    # self.image snapshot therefore misses every step/text mutation, which
+    # is why the old undo/redo appeared to do nothing. The snapshot model
+    # below captures the element lists too and rebuilds the canvas overlays
+    # on restore.
+    # ------------------------------------------------------------------
+
+    _TEXT_SNAPSHOT_FIELDS = (
+        'id', 'text', 'x', 'y', 'color',
+        'font_family', 'font_size', 'width', 'height',
+    )
+    _STEP_SNAPSHOT_FIELDS = (
+        'id', 'number', 'x', 'y', 'size', 'width', 'height',
+        'shape', 'color', 'text_color', 'rotation',
+    )
+
+    def _snapshot_text_elements(self):
+        """Return a list of dicts containing only the logical (non-canvas)
+        fields of each text element, safe to deep-copy for undo history."""
+        return [
+            {k: elem[k] for k in self._TEXT_SNAPSHOT_FIELDS if k in elem}
+            for elem in self.text_elements
+        ]
+
+    def _snapshot_step_elements(self):
+        """Return a list of dicts containing only the logical (non-canvas)
+        fields of each step element, safe to deep-copy for undo history."""
+        return [
+            {k: elem[k] for k in self._STEP_SNAPSHOT_FIELDS if k in elem}
+            for elem in self.step_elements
+        ]
+
+    def _snapshot_state(self):
+        """Capture the full editor state as a dict."""
+        return {
+            'image': self.image.copy(),
+            'text_elements': self._snapshot_text_elements(),
+            'step_elements': self._snapshot_step_elements(),
+            'step_counter': self.step_counter,
+        }
+
+    def save_state(self):
+        """Push the current editor state onto the undo history and invalidate
+        the redo stack. Call this BEFORE any mutation that should be undoable."""
+        self.history.append(self._snapshot_state())
+        self.redo_stack.clear()
+        # Cap the history at a sensible size to keep memory bounded.
+        if len(self.history) > 100:
+            self.history = self.history[-100:]
+
+    def _clear_overlay_canvas_items(self):
+        """Delete all canvas items belonging to step/text overlays and drop
+        the stale ids/photo refs from the element dicts. Leaves the element
+        lists themselves untouched."""
+        for elem in self.text_elements:
+            cid = elem.get('canvas_id')
+            if cid is not None:
+                try:
+                    self.canvas.delete(cid)
+                except Exception:
+                    pass
+            elem['canvas_id'] = None
+            if 'cursor_id' in elem:
+                try:
+                    self.canvas.delete(elem['cursor_id'])
+                except Exception:
+                    pass
+                del elem['cursor_id']
+        for elem in self.step_elements:
+            if 'img_id' in elem:
+                try:
+                    self.canvas.delete(elem['img_id'])
+                except Exception:
+                    pass
+                del elem['img_id']
+            if 'selection_id' in elem:
+                try:
+                    self.canvas.delete(elem['selection_id'])
+                except Exception:
+                    pass
+                del elem['selection_id']
+            if 'photo' in elem:
+                del elem['photo']
+        # Remove any leftover selection visuals (cursors / dashed borders).
+        try:
+            self.canvas.delete('selection')
+        except Exception:
+            pass
+
+    def _apply_state(self, state):
+        """Restore a snapshot produced by _snapshot_state()."""
+        # Drop all existing overlay canvas items before we swap the element
+        # lists, otherwise they become orphaned on the canvas.
+        self._clear_overlay_canvas_items()
+        self.selected_text_id = None
+        self.selected_step_id = None
+
+        self.image = state['image'].copy()
+        # Deep-enough copy: the snapshot dicts only contain primitives.
+        self.text_elements = [dict(e) for e in state['text_elements']]
+        for e in self.text_elements:
+            e['canvas_id'] = None
+        self.step_elements = [dict(e) for e in state['step_elements']]
+        self.step_counter = state['step_counter']
+
+        # Redraw the background image at the current zoom and force a
+        # rebuild of every text / step overlay from the restored lists.
+        self.refresh_display()
+        self._sync_overlays_to_zoom()
+        self._last_overlay_zoom = self.zoom
+
     def undo(self, event=None):
         """Undo the last action (Ctrl+Z)."""
         if not self.history:
             self.status_var.set("Nothing to undo")
             return
 
-        # Push current state onto redo stack before reverting
-        self.redo_stack.append(self.image.copy())
-        self.image = self.history.pop()
-        self.refresh_display()
+        # Push current state onto the redo stack before reverting.
+        self.redo_stack.append(self._snapshot_state())
+        self._apply_state(self.history.pop())
         self.status_var.set(f"Undo ({len(self.history)} remaining)")
 
     def redo(self, event=None):
@@ -3126,10 +3369,9 @@ class AnnotationEditor:
             self.status_var.set("Nothing to redo")
             return
 
-        # Push current state back onto history for future undo
-        self.history.append(self.image.copy())
-        self.image = self.redo_stack.pop()
-        self.refresh_display()
+        # Push current state back onto history for future undo.
+        self.history.append(self._snapshot_state())
+        self._apply_state(self.redo_stack.pop())
         self.status_var.set(f"Redo ({len(self.redo_stack)} remaining)")
     
     def auto_save_on_open(self):

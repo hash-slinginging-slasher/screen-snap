@@ -143,13 +143,210 @@ def get_all_screens_bbox():
         return None
 
 
+# DPI_AWARENESS_CONTEXT handles (negative pseudo-handles from WinUser.h)
+_DPI_CTX_PER_MONITOR_AWARE_V2 = -4
+_DPI_CTX_PER_MONITOR_AWARE = -3
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    """Windows BITMAPINFOHEADER for GetDIBits()."""
+    _fields_ = [
+        ("biSize", ctypes.c_uint32),
+        ("biWidth", ctypes.c_int32),
+        ("biHeight", ctypes.c_int32),
+        ("biPlanes", ctypes.c_uint16),
+        ("biBitCount", ctypes.c_uint16),
+        ("biCompression", ctypes.c_uint32),
+        ("biSizeImage", ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_int32),
+        ("biYPelsPerMeter", ctypes.c_int32),
+        ("biClrUsed", ctypes.c_uint32),
+        ("biClrImportant", ctypes.c_uint32),
+    ]
+
+
+def _bitblt_capture(left, top, width, height):
+    """Capture a screen region using Windows GDI BitBlt.
+
+    This is the same technique Windows' built-in Print Screen and Snipping
+    Tool use: GetDC(NULL) → CreateCompatibleBitmap → BitBlt(SRCCOPY) →
+    GetDIBits. Returns a PIL Image in RGB mode.
+    """
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    # ctypes signatures (required for 64-bit: HANDLE/HDC/HBITMAP are pointers)
+    user32.GetDC.restype = ctypes.c_void_p
+    user32.GetDC.argtypes = [ctypes.c_void_p]
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleBitmap.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+    ]
+    gdi32.SelectObject.restype = ctypes.c_void_p
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.BitBlt.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    gdi32.GetDIBits.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+    ]
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+
+    SRCCOPY = 0x00CC0020
+    CAPTUREBLT = 0x40000000      # Include layered (transparent) windows
+    DIB_RGB_COLORS = 0
+    BI_RGB = 0
+
+    screen_dc = None
+    mem_dc = None
+    bitmap = None
+    try:
+        screen_dc = user32.GetDC(None)            # Desktop DC (entire virtual screen)
+        if not screen_dc:
+            raise RuntimeError("GetDC(NULL) failed")
+        mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+        if not mem_dc:
+            raise RuntimeError("CreateCompatibleDC failed")
+        bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        if not bitmap:
+            raise RuntimeError("CreateCompatibleBitmap failed")
+        gdi32.SelectObject(mem_dc, bitmap)
+
+        if not gdi32.BitBlt(
+            mem_dc, 0, 0, width, height,
+            screen_dc, left, top, SRCCOPY | CAPTUREBLT,
+        ):
+            raise RuntimeError("BitBlt failed")
+
+        bmi = _BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.biWidth = width
+        bmi.biHeight = -height      # Negative = top-down DIB (skip vertical flip)
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = BI_RGB
+
+        buffer = (ctypes.c_ubyte * (width * height * 4))()
+        if not gdi32.GetDIBits(
+            mem_dc, bitmap, 0, height, buffer, ctypes.byref(bmi), DIB_RGB_COLORS,
+        ):
+            raise RuntimeError("GetDIBits failed")
+
+        # Windows DIB is BGRA; convert to RGB to match the rest of the app.
+        img = Image.frombuffer(
+            'RGBA', (width, height), bytes(buffer), 'raw', 'BGRA', 0, 1,
+        )
+        return img.convert('RGB')
+    finally:
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if mem_dc:
+            gdi32.DeleteDC(mem_dc)
+        if screen_dc:
+            user32.ReleaseDC(None, screen_dc)
+
+
 def capture_all_screens():
-    """Capture all monitors as a single image."""
-    bbox = get_all_screens_bbox()
-    if bbox:
-        return ImageGrab.grab(bbox=bbox, all_screens=True)
-    else:
-        return ImageGrab.grab(all_screens=True)
+    """Capture all monitors as a single image, matching native Win+PrtScn.
+
+    Uses Windows GDI BitBlt directly (the same path used by Windows' built-in
+    Print Screen and Snipping Tool). Temporarily switches the calling thread
+    to Per-Monitor V2 DPI awareness so GetSystemMetrics and BitBlt return true
+    physical pixels regardless of display scaling. Falls back to Pillow's
+    ImageGrab if BitBlt fails for any reason.
+    """
+    user32 = ctypes.windll.user32
+    old_ctx = None
+    set_thread_ctx = getattr(user32, 'SetThreadDpiAwarenessContext', None)
+    if set_thread_ctx is not None:
+        set_thread_ctx.restype = ctypes.c_void_p
+        set_thread_ctx.argtypes = [ctypes.c_void_p]
+        try:
+            old_ctx = set_thread_ctx(ctypes.c_void_p(_DPI_CTX_PER_MONITOR_AWARE_V2))
+            if not old_ctx:
+                # V2 not supported on this Windows build; try V1.
+                old_ctx = set_thread_ctx(ctypes.c_void_p(_DPI_CTX_PER_MONITOR_AWARE))
+        except Exception:
+            old_ctx = None
+    try:
+        # Virtual screen bounds (physical pixels thanks to DPI context above).
+        left = user32.GetSystemMetrics(76)    # SM_XVIRTUALSCREEN
+        top = user32.GetSystemMetrics(77)     # SM_YVIRTUALSCREEN
+        width = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        height = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        try:
+            return _bitblt_capture(left, top, width, height)
+        except Exception:
+            # Fall back to Pillow if GDI path fails.
+            return ImageGrab.grab(
+                bbox=(left, top, left + width, top + height),
+                all_screens=True,
+            )
+    finally:
+        if old_ctx and set_thread_ctx is not None:
+            try:
+                set_thread_ctx(ctypes.c_void_p(old_ctx))
+            except Exception:
+                pass
+
+
+# ── Global hotkey (Print Screen) ───────────────────────────────────
+# Registers PrintScreen as a Windows-wide hotkey so the user can
+# trigger a full-screen capture without focusing the launcher.
+# RegisterHotKey requires a message pump, which runs on a dedicated
+# daemon thread. The hotkey callback must marshal back to the Tk
+# main thread via root.after(0, ...).
+_hotkey_thread = None
+_hotkey_callback = None
+_HOTKEY_ID = 1
+_VK_SNAPSHOT = 0x2C     # Print Screen
+_WM_HOTKEY = 0x0312
+_MOD_NOREPEAT = 0x4000
+
+
+def _hotkey_worker():
+    """Background thread: register PrtScn and pump Windows messages."""
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    if not user32.RegisterHotKey(None, _HOTKEY_ID, _MOD_NOREPEAT, _VK_SNAPSHOT):
+        # Another process owns PrtScn (OneDrive, Snipping Tool, etc.)
+        print("ScreenSnap: could not register PrintScreen hotkey "
+              "(another app may own it).", file=sys.stderr)
+        return
+    try:
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == _WM_HOTKEY and msg.wParam == _HOTKEY_ID:
+                cb = _hotkey_callback
+                if cb:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+    finally:
+        user32.UnregisterHotKey(None, _HOTKEY_ID)
+
+
+def start_global_hotkey(callback):
+    """Install a PrintScreen hotkey handler (idempotent).
+
+    `callback` is invoked from the hotkey thread; callers should marshal
+    any Tk interaction back to the Tk thread via root.after(0, ...).
+    """
+    global _hotkey_thread, _hotkey_callback
+    _hotkey_callback = callback
+    if _hotkey_thread and _hotkey_thread.is_alive():
+        return
+    _hotkey_thread = threading.Thread(
+        target=_hotkey_worker, daemon=True, name="ScreenSnap-Hotkey"
+    )
+    _hotkey_thread.start()
 
 
 # ── Single persistent Tk root ──────────────────────────────────────
@@ -629,10 +826,16 @@ class LauncherWindow:
         self.root.withdraw()
         self.root.after(200, self.execute_full_capture)
 
-    def execute_full_capture(self):
-        """Execute full screen capture and open editor."""
+    def execute_full_capture(self, screenshot=None):
+        """Execute full screen capture and open editor.
+
+        If `screenshot` is provided, skip the capture step and use the
+        pre-captured image (used by the PrtScn hotkey path so the launcher
+        and anything else on screen are included in the shot).
+        """
         try:
-            screenshot = capture_all_screens()
+            if screenshot is None:
+                screenshot = capture_all_screens()
             # Auto-save to library
             fmt = self.settings.get('image_format', 'png')
             lib_path = LibraryManager.save_to_library(screenshot, fmt)
@@ -864,7 +1067,37 @@ class LauncherWindow:
 
     def run(self):
         """Run the launcher."""
+        # Install PrintScreen global hotkey (PrtScn = full screen capture)
+        start_global_hotkey(self._hotkey_fire)
         self.root.mainloop()
+
+    def _hotkey_fire(self):
+        """Called from the hotkey thread. Schedules capture on the Tk thread."""
+        try:
+            self.root.after(0, self._on_global_hotkey)
+        except Exception:
+            # Root may have been destroyed between launcher rebuilds.
+            pass
+
+    def _on_global_hotkey(self):
+        """Handle PrtScn. Captures exactly what's on screen right now.
+
+        Unlike the launcher's Full Screen button (which hides the launcher
+        first), this grabs the current screen state immediately so anything
+        visible — including the ScreenSnap launcher itself — is captured.
+        """
+        try:
+            if not self.root.winfo_exists():
+                return
+            # If the root is withdrawn, a capture or editor is already active;
+            # ignore the hotkey to avoid re-entrancy.
+            if self.root.state() == 'withdrawn':
+                return
+            # Capture BEFORE touching any windows so the shot is WYSIWYG.
+            screenshot = capture_all_screens()
+            self.execute_full_capture(screenshot=screenshot)
+        except Exception:
+            pass
 
 
 class SettingsDialog:
@@ -1313,6 +1546,7 @@ class AnnotationEditor:
         self.image = image.copy()
         self.original_image = image.copy()
         self.history = []  # For undo
+        self.redo_stack = []  # For redo
         self.current_tool = None
         self.current_color = self.COLORS[0] # #F58662
         self.stroke_width = 3
@@ -1323,6 +1557,14 @@ class AnnotationEditor:
         self.last_saved_path = None
         self.library_path = library_path
         self.settings = settings or {}
+
+        # Zoom state — canvas is 1:1 with image at zoom=1.0. At other zoom
+        # levels the image is resized for display, shape tools still work
+        # (coords converted on commit), and text/step tools are view-only
+        # (their canvas proxies are hidden and text is baked into a preview).
+        self.zoom = 1.0
+        self.min_zoom = 0.1
+        self.max_zoom = 8.0
 
         # Text elements list (Photoshop-like layers)
         self.text_elements = []
@@ -1446,16 +1688,27 @@ class AnnotationEditor:
         self.canvas_bg = tk.Frame(canvas_container, bg=Theme.SURFACE_LOW, padx=2, pady=2)
         self.canvas_bg.pack(fill='both', expand=True)
 
-        self.canvas = tk.Canvas(self.canvas_bg, bg=Theme.SURFACE_LOW, highlightthickness=0)
-        self.canvas.pack(fill='both', expand=True)
+        # Scrollbars for zoomed navigation
+        self.v_scroll = tk.Scrollbar(self.canvas_bg, orient='vertical')
+        self.h_scroll = tk.Scrollbar(self.canvas_bg, orient='horizontal')
+        self.canvas = tk.Canvas(
+            self.canvas_bg, bg=Theme.SURFACE_LOW, highlightthickness=0,
+            xscrollcommand=self.h_scroll.set,
+            yscrollcommand=self.v_scroll.set,
+        )
+        self.v_scroll.config(command=self.canvas.yview)
+        self.h_scroll.config(command=self.canvas.xview)
+        self.v_scroll.pack(side='right', fill='y')
+        self.h_scroll.pack(side='bottom', fill='x')
+        self.canvas.pack(side='left', fill='both', expand=True)
 
         # Grid pattern for canvas
         self.root.after(100, self.draw_canvas_grid)
 
-        # Display image
+        # Display image — single persistent canvas item updated via itemconfig
         self.display_image = ImageTk.PhotoImage(self.image)
-        self.canvas.create_image(0, 0, image=self.display_image, anchor='nw')
-        self.canvas.config(scrollregion=self.canvas.bbox('all'))
+        self.image_id = self.canvas.create_image(0, 0, image=self.display_image, anchor='nw')
+        self.canvas.config(scrollregion=(0, 0, self.image.width, self.image.height))
 
         # Status Bar
         status_frame = tk.Frame(self.root, bg=Theme.SURFACE, padx=10, pady=5)
@@ -1470,7 +1723,15 @@ class AnnotationEditor:
         self.canvas.bind('<ButtonRelease-1>', self.on_canvas_release)
         self.canvas.bind('<Double-Button-1>', self.on_canvas_double_click)
         self.canvas.bind('<Motion>', self.on_canvas_motion)
+        # Zoom is ONLY triggered by Ctrl + mouse wheel.
+        # Plain wheel = vertical pan, Shift+wheel = horizontal pan.
+        self.canvas.bind('<Control-MouseWheel>', self.on_mousewheel)
+        self.canvas.bind('<MouseWheel>', self.on_scroll_vertical)
+        self.canvas.bind('<Shift-MouseWheel>', self.on_scroll_horizontal)
         self.root.bind('<Control-z>', self.undo)
+        self.root.bind('<Control-Z>', self.undo)
+        self.root.bind('<Control-y>', self.redo)
+        self.root.bind('<Control-Y>', self.redo)
         self.root.bind('<Control-s>', self.save)
         self.root.bind('<Escape>', self.deselect_all)
         self.root.bind('<Delete>', self.delete_selected_step)
@@ -1527,6 +1788,28 @@ class AnnotationEditor:
             )
             btn.pack(side='left', padx=2)
             setattr(self, f'{tool}_btn', btn)
+
+        tk.Frame(toolbar, width=1, bg=Theme.OUTLINE).pack(side='left', fill='y', padx=20)
+
+        # 1b. History Group (Undo / Redo — Quick Access)
+        history_frame = tk.Frame(toolbar, bg=Theme.SURFACE)
+        history_frame.pack(side='left')
+
+        self.undo_btn = ModernButton(
+            history_frame,
+            text="↶ UNDO",
+            variant="secondary",
+            command=self.undo,
+        )
+        self.undo_btn.pack(side='left', padx=2)
+
+        self.redo_btn = ModernButton(
+            history_frame,
+            text="↷ REDO",
+            variant="secondary",
+            command=self.redo,
+        )
+        self.redo_btn.pack(side='left', padx=2)
 
         tk.Frame(toolbar, width=1, bg=Theme.OUTLINE).pack(side='left', fill='y', padx=20)
 
@@ -1910,6 +2193,10 @@ class AnnotationEditor:
         step_num = elem['number']
         font_size = max(8, int(round(step_size * 0.47)))
 
+        # Save state for undo (and invalidate redo stack)
+        self.history.append(self.image.copy())
+        self.redo_stack.clear()
+
         # Dimensions
         if shape == 'rounded_rect':
             rect_w = step_size * 1.5
@@ -2199,6 +2486,14 @@ class AnnotationEditor:
             self.canvas.delete(last_step['selection_id'])
 
         self.step_counter -= 1
+
+        # Save state for undo (and invalidate redo stack)
+        self.history.append(self.image.copy())
+        self.redo_stack.clear()
+
+        # Remove from image - need to redraw without this step
+        # For simplicity, we'll just refresh
+        self.refresh_display()
         self.status_var.set(f"Deleted step {last_step['number']}")
 
     def refresh_all_steps(self):
@@ -2267,37 +2562,49 @@ class AnnotationEditor:
         if not self.current_tool:
             return
 
-        x, y = self.get_canvas_coords(event)
+        cx, cy = self.get_canvas_coords(event)
+        # Image-space coordinates (step/text tools operate in image pixels).
+        z = self.zoom if self.zoom else 1.0
+        ix, iy = cx / z, cy / z
+
         self.drawing = True
-        self.start_x = x
-        self.start_y = y
+        self.start_x = cx
+        self.start_y = cy
+
+        # Text tool still needs zoom=1 (canvas text items aren't scaled yet).
+        if self.current_tool == 'text' and abs(self.zoom - 1.0) > 1e-6:
+            self.drawing = False
+            self.status_var.set("Text tool requires 100% zoom.")
+            return
 
         # Handle text tool
         if self.current_tool == 'text':
             # Check if clicking on existing text
-            clicked_text = self.find_text_at_position(x, y)
+            clicked_text = self.find_text_at_position(ix, iy)
             if clicked_text:
                 # Select and prepare to drag
                 self.select_text_element(clicked_text['id'])
                 self.dragging_text = True
-                self.drag_offset_x = x - clicked_text['x']
-                self.drag_offset_y = y - clicked_text['y']
+                self.drag_offset_x = ix - clicked_text['x']
+                self.drag_offset_y = iy - clicked_text['y']
             else:
                 # Add new text
                 self.drawing = False
-                self.add_text_element(x, y)
+                self.add_text_element(ix, iy)
 
-        # Handle step tool
+        # Handle step tool — works at ANY zoom level.
         elif self.current_tool == 'step':
-            clicked_step = self.find_step_at_position(x, y)
+            # Check if clicking on existing step to drag
+            clicked_step = self.find_step_at_position(ix, iy)
             if clicked_step:
                 self.select_step_element(clicked_step['id'])
                 self.dragging_step = True
-                self.drag_step_offset_x = x - clicked_step['x']
-                self.drag_step_offset_y = y - clicked_step['y']
+                self.drag_step_offset_x = ix - clicked_step['x']
+                self.drag_step_offset_y = iy - clicked_step['y']
             else:
+                # Add new step (pass image-space coordinates)
                 self.drawing = False
-                self.add_step_element(x, y)
+                self.add_step_element(ix, iy)
     
     def on_canvas_drag(self, event):
         """Handle canvas mouse drag."""
@@ -2335,9 +2642,11 @@ class AnnotationEditor:
                     break
             return
 
-        # Handle step dragging
+        # Handle step dragging (step coords are stored in IMAGE space)
         if self.dragging_step and self.selected_step_id is not None:
-            x, y = self.get_canvas_coords(event)
+            cx, cy = self.get_canvas_coords(event)
+            z = self.zoom if self.zoom else 1.0
+            x, y = cx / z, cy / z
 
             for elem in self.step_elements:
                 if elem['id'] == self.selected_step_id:
@@ -2448,36 +2757,42 @@ class AnnotationEditor:
         if x2 - x1 < 5 or y2 - y1 < 5:
             return
         
-        # Save state for undo
+        # Save state for undo (and invalidate redo stack)
         self.history.append(self.image.copy())
-        
+        self.redo_stack.clear()
+
+        # Convert canvas coords to image coords (divide by zoom).
+        z = self.zoom if self.zoom else 1.0
+        ix1, iy1 = x1 / z, y1 / z
+        ix2, iy2 = x2 / z, y2 / z
+
         # Draw shape on image
         draw = ImageDraw.Draw(self.image)
-        
+
         if self.current_tool == 'rectangle':
             draw.rectangle(
-                [x1, y1, x2, y2],
+                [ix1, iy1, ix2, iy2],
                 outline=self.current_color,
                 width=self.stroke_width
             )
         elif self.current_tool == 'line':
             draw.line(
-                [(x1, y1), (x2, y2)],
+                [(ix1, iy1), (ix2, iy2)],
                 fill=self.current_color,
                 width=self.stroke_width
             )
         elif self.current_tool == 'circle':
             draw.ellipse(
-                [x1, y1, x2, y2],
+                [ix1, iy1, ix2, iy2],
                 outline=self.current_color,
                 width=self.stroke_width
             )
         elif self.current_tool == 'crop':
             # Crop the image
-            self.image = self.image.crop((int(x1), int(y1), int(x2), int(y2)))
+            self.image = self.image.crop((int(ix1), int(iy1), int(ix2), int(iy2)))
             self.refresh_display()
             return
-        
+
         self.refresh_display()
 
     def on_canvas_motion(self, event):
@@ -2499,6 +2814,11 @@ class AnnotationEditor:
 
     def on_canvas_double_click(self, event):
         """Handle double-click to edit text."""
+        if abs(self.zoom - 1.0) > 1e-6:
+            self.status_var.set(
+                "Text editing requires 100% zoom (Ctrl+0 to reset)."
+            )
+            return
         x, y = self.get_canvas_coords(event)
         
         # Find text at position
@@ -2551,10 +2871,81 @@ class AnnotationEditor:
                 self.status_var.set(f"Text updated: '{new_text}'")
     
     def refresh_display(self):
-        """Refresh the canvas display with current image."""
-        self.display_image = ImageTk.PhotoImage(self.image)
-        self.canvas.create_image(0, 0, image=self.display_image, anchor='nw')
-        self.canvas.config(scrollregion=self.canvas.bbox('all'))
+        """Refresh the canvas display with current image at current zoom.
+
+        Delete + recreate the canvas image so it always ends up on TOP of
+        the z-stack. This matches the original pre-zoom behavior where the
+        baked-in step/text pixels (stored in self.image) are guaranteed to
+        be visible over any lingering flat canvas proxies.
+        """
+        if abs(self.zoom - 1.0) < 1e-6:
+            display_source = self.image
+        else:
+            new_w = max(1, int(round(self.image.width * self.zoom)))
+            new_h = max(1, int(round(self.image.height * self.zoom)))
+            resample = Image.LANCZOS if self.zoom < 1.0 else Image.NEAREST
+            display_source = self.image.resize((new_w, new_h), resample)
+        self.display_image = ImageTk.PhotoImage(display_source)
+        if getattr(self, 'image_id', None):
+            try:
+                self.canvas.delete(self.image_id)
+            except Exception:
+                pass
+        self.image_id = self.canvas.create_image(
+            0, 0, image=self.display_image, anchor='nw'
+        )
+        self.canvas.config(
+            scrollregion=(0, 0, display_source.width, display_source.height)
+        )
+
+    def on_scroll_vertical(self, event):
+        """Plain wheel pans the canvas vertically. Never zooms."""
+        if getattr(event, 'delta', 0) == 0:
+            return 'break'
+        # If Ctrl is held, defer to the zoom handler and do nothing here.
+        # (state bit 0x4 = Control on Windows.)
+        if getattr(event, 'state', 0) & 0x4:
+            return 'break'
+        self.canvas.yview_scroll(int(-event.delta / 120), 'units')
+        return 'break'
+
+    def on_scroll_horizontal(self, event):
+        """Shift+wheel pans the canvas horizontally. Never zooms."""
+        if getattr(event, 'delta', 0) == 0:
+            return 'break'
+        self.canvas.xview_scroll(int(-event.delta / 120), 'units')
+        return 'break'
+
+    def on_mousewheel(self, event):
+        """Zoom in/out around the cursor. ONLY fires on Ctrl + mouse wheel."""
+        if getattr(event, 'delta', 0) == 0:
+            return 'break'
+        factor = 1.25 if event.delta > 0 else 0.8
+        new_zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * factor))
+        if abs(new_zoom - self.zoom) < 1e-6:
+            return 'break'
+
+        # Anchor: keep the image pixel under the cursor anchored there.
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        img_x = cx / self.zoom if self.zoom else 0
+        img_y = cy / self.zoom if self.zoom else 0
+
+        self.zoom = new_zoom
+        self.refresh_display()
+
+        # Re-scroll so (img_x, img_y) lines up with the same cursor position.
+        new_cx = img_x * self.zoom
+        new_cy = img_y * self.zoom
+        total_w = self.image.width * self.zoom
+        total_h = self.image.height * self.zoom
+        if total_w > 0:
+            self.canvas.xview_moveto(max(0.0, (new_cx - event.x) / total_w))
+        if total_h > 0:
+            self.canvas.yview_moveto(max(0.0, (new_cy - event.y) / total_h))
+
+        self.status_var.set(f"Zoom: {int(self.zoom * 100)}%")
+        return 'break'
     
     def render_annotations_to_image(self):
         """Render all text and step elements to the image before saving."""
@@ -2718,14 +3109,28 @@ class AnnotationEditor:
             self.image = base.convert('RGB')
     
     def undo(self, event=None):
-        """Undo the last action."""
+        """Undo the last action (Ctrl+Z)."""
         if not self.history:
             self.status_var.set("Nothing to undo")
             return
-        
+
+        # Push current state onto redo stack before reverting
+        self.redo_stack.append(self.image.copy())
         self.image = self.history.pop()
         self.refresh_display()
         self.status_var.set(f"Undo ({len(self.history)} remaining)")
+
+    def redo(self, event=None):
+        """Redo the last undone action (Ctrl+Y)."""
+        if not self.redo_stack:
+            self.status_var.set("Nothing to redo")
+            return
+
+        # Push current state back onto history for future undo
+        self.history.append(self.image.copy())
+        self.image = self.redo_stack.pop()
+        self.refresh_display()
+        self.status_var.set(f"Redo ({len(self.redo_stack)} remaining)")
     
     def auto_save_on_open(self):
         """Auto-save image when editor opens, if enabled in settings."""

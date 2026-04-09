@@ -774,39 +774,69 @@ class LauncherWindow:
             self.execute_region_capture()
 
     def _auto_start_printscreen_monitor(self):
-        """Auto-start the Print Screen monitor if enabled in settings."""
-        if not self.settings.get('printscreen_monitor', False):
+        """Auto-start the Print Screen monitor (hidden, tray-only)."""
+        if not self.settings.get('printscreen_monitor', True):
             return
-        
-        # Check if already running
+
+        import subprocess, sys, os
+        from pathlib import Path
+
+        # Locate the monitor script next to the exe (frozen) or the .py (source)
+        if getattr(sys, 'frozen', False):
+            base_dir = Path(sys.executable).parent
+        else:
+            base_dir = Path(__file__).parent
+        monitor_exe = base_dir / "ScreenSnapMonitor.exe"
+        monitor_script = base_dir / "screensnap-printscreen-monitor.py"
+        use_exe = monitor_exe.exists()
+        if not use_exe and not monitor_script.exists():
+            return
+
+        # Lockfile check — avoids launching duplicates
+        lock_file = base_dir / ".printscreen-monitor.lock"
         try:
-            import subprocess
-            result = subprocess.run(
-                ['wmic', 'process', 'where', "name='python.exe' and commandline like '%screensnap-printscreen-monitor%'",
-                 'get', 'ProcessId', '/format:list'],
-                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            if result.stdout.strip() and any(c.isdigit() for c in result.stdout):
-                print("Print Screen monitor is already running")
-                return
-        except:
+            if lock_file.exists():
+                pid = int(lock_file.read_text().strip() or "0")
+                if pid > 0:
+                    # Probe if process still alive
+                    try:
+                        os.kill(pid, 0)
+                        return  # already running
+                    except OSError:
+                        pass  # stale, fall through
+        except Exception:
             pass
-        
-        # Start the monitor
+
+        # Prefer pythonw.exe so no console window appears
+        python_exe = sys.executable
+        if getattr(sys, 'frozen', False) or os.path.basename(python_exe).lower() == 'python.exe':
+            candidate = Path(python_exe).parent / 'pythonw.exe'
+            if candidate.exists():
+                python_exe = str(candidate)
+            elif getattr(sys, 'frozen', False):
+                # No bundled python — try system pythonw
+                python_exe = 'pythonw'
+
         try:
-            import subprocess
-            import sys
-            from pathlib import Path
-            
-            script_dir = Path(__file__).parent
-            monitor_script = script_dir / "screensnap-printscreen-monitor.py"
-            
-            if monitor_script.exists():
-                print("Auto-starting Print Screen monitor...")
-                subprocess.Popen(
-                    [sys.executable, str(monitor_script)],
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
+            flags = 0
+            if sys.platform == 'win32':
+                flags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, 'DETACHED_PROCESS', 0)
+            if use_exe:
+                cmd = [str(monitor_exe)]
+            else:
+                cmd = [python_exe, str(monitor_script)]
+            proc = subprocess.Popen(
+                cmd,
+                creationflags=flags,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                lock_file.write_text(str(proc.pid))
+            except Exception:
+                pass
         except Exception as e:
             print(f"Failed to auto-start Print Screen monitor: {e}")
 

@@ -1,31 +1,40 @@
 @echo off
-REM Build ScreenSnap executable with custom icon
-REM This script creates a standalone .exe using PyInstaller
+REM Build ScreenSnap and ScreenSnapMonitor executables
+REM Produces dist\ScreenSnap.exe and dist\ScreenSnapMonitor.exe
 
-echo Building ScreenSnap executable with custom icon...
+echo Building ScreenSnap executables...
 echo.
 
-REM First create the icon if it doesn't exist
 if not exist "screensnap.ico" (
     echo Creating custom icon...
     python create-icon.py
     echo.
 )
 
-pyinstaller --onefile --windowed --name ScreenSnap --icon=screensnap.ico --hidden-import PIL --hidden-import pyperclip --hidden-import tkinter --clean screensnap.py
+echo [1/2] Building ScreenSnap.exe...
+pyinstaller --onefile --windowed --name ScreenSnap --icon=screensnap.ico ^
+    --hidden-import PIL --hidden-import pyperclip --hidden-import tkinter ^
+    --clean screensnap.py
+if errorlevel 1 goto :fail
 
 echo.
-if exist "dist\ScreenSnap.exe" (
+echo [2/2] Building ScreenSnapMonitor.exe...
+pyinstaller --onefile --windowed --name ScreenSnapMonitor --icon=screensnap.ico ^
+    --hidden-import keyboard --hidden-import pystray --hidden-import PIL ^
+    --clean screensnap-printscreen-monitor.py
+if errorlevel 1 goto :fail
+
+echo.
+if exist "dist\ScreenSnap.exe" if exist "dist\ScreenSnapMonitor.exe" (
     echo Build successful!
-    echo Executable location: dist\ScreenSnap.exe
-    echo.
-    dir dist\ScreenSnap.exe | find "ScreenSnap.exe"
-) else (
-    echo Build failed! Check the error messages above.
-    echo.
-    echo Tip: If you get "Access is denied", the old .exe is locked.
-    echo Try rebooting your computer, or build as ScreenSnap_v2.exe instead.
+    echo   dist\ScreenSnap.exe
+    echo   dist\ScreenSnapMonitor.exe
+    goto :done
 )
 
+:fail
+echo Build failed! Check the error messages above.
+
+:done
 echo.
 pause

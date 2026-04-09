@@ -36,8 +36,8 @@ echo.
 echo To stop the monitor, right-click the tray icon and select "Quit".
 echo.
 
-REM Start the monitor
-start "ScreenSnap Print Screen Monitor" /MIN python "%SCRIPT_DIR%\screensnap-printscreen-monitor.py"
+REM Start the monitor (use pythonw to avoid console window)
+start "" pythonw "%SCRIPT_DIR%\screensnap-printscreen-monitor.py"
 
 echo Print Screen Monitor started!
 echo.

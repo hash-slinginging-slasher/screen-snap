@@ -38,26 +38,27 @@ class PrintScreenMonitor:
         self.capture_count = 0
         
     def _find_screensnap(self):
-        """Find the ScreenSnap executable."""
-        # Look for screensnap-exe.bat in the same directory
-        script_dir = Path(__file__).parent
-        exe_bat = script_dir / "screensnap-exe.bat"
-        exe = script_dir / "dist" / "ScreenSnap.exe"
-        
-        if exe_bat.exists():
-            return str(exe_bat)
-        elif exe.exists():
-            return str(exe)
+        """Find ScreenSnap.exe or fall back to the .bat launcher."""
+        # When frozen, look next to the monitor exe first
+        if getattr(sys, 'frozen', False):
+            base = Path(sys.executable).parent
         else:
-            # Search parent directories
-            for parent in script_dir.parents:
-                bat = parent / "screensnap-exe.bat"
-                if bat.exists():
-                    return str(bat)
-                exe = parent / "dist" / "ScreenSnap.exe"
-                if exe.exists():
-                    return str(exe)
-        
+            base = Path(__file__).parent
+
+        candidates = [
+            base / "ScreenSnap.exe",
+            base / "dist" / "ScreenSnap.exe",
+            base / "screensnap-exe.bat",
+        ]
+        for c in candidates:
+            if c.exists():
+                return str(c)
+
+        for parent in base.parents:
+            for name in ("ScreenSnap.exe", "dist/ScreenSnap.exe", "screensnap-exe.bat"):
+                p = parent / name
+                if p.exists():
+                    return str(p)
         return None
     
     def on_printscreen(self, e):
@@ -71,9 +72,17 @@ class PrintScreenMonitor:
                 print(f"Print Screen detected - Launching ScreenSnap (capture #{self.capture_count})")
                 try:
                     # Run in a new process, don't wait for it to finish
+                    if self.screensnap_path.lower().endswith('.bat'):
+                        cmd = ['cmd', '/c', self.screensnap_path, 'region']
+                    else:
+                        cmd = [self.screensnap_path, 'region']
                     subprocess.Popen(
-                        [self.screensnap_path, "region"],
-                        creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0
+                        cmd,
+                        creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if sys.platform == 'win32' else 0,
+                        close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                     )
                 except Exception as ex:
                     print(f"Error launching ScreenSnap: {ex}")
@@ -139,8 +148,6 @@ class PrintScreenMonitor:
         
         # Register Print Screen key handler
         keyboard.hook_key('print screen', self.on_printscreen)
-        keyboard.hook_key('prtscn', self.on_printscreen)
-        keyboard.hook_key('prtsc', self.on_printscreen)
         
         # Create system tray icon
         icon = pystray.Icon(

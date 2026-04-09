@@ -11,21 +11,27 @@ import subprocess
 import time
 from pathlib import Path
 
-try:
-    import keyboard
-except ImportError:
-    print("Installing required dependency: keyboard")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "keyboard"])
-    import keyboard
+def _ensure(pkg, import_name=None):
+    name = import_name or pkg
+    try:
+        return __import__(name)
+    except ImportError:
+        if getattr(sys, 'frozen', False):
+            raise RuntimeError(
+                f"Missing bundled dependency '{pkg}'. Rebuild ScreenSnapMonitor.exe "
+                f"after running: pip install {pkg}"
+            )
+        print(f"Installing required dependency: {pkg}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        return __import__(name)
 
-try:
-    import pystray
-    from PIL import Image, ImageDraw
-except ImportError:
-    print("Installing required dependency: pystray, Pillow")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pystray", "Pillow"])
-    import pystray
-    from PIL import Image, ImageDraw
+_ensure("keyboard")
+_ensure("pystray")
+_ensure("Pillow", "PIL")
+
+import keyboard
+import pystray
+from PIL import Image, ImageDraw
 
 
 class PrintScreenMonitor:

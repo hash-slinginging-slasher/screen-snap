@@ -5,6 +5,14 @@ REM Produces dist\ScreenSnap.exe and dist\ScreenSnapMonitor.exe
 echo Building ScreenSnap executables...
 echo.
 
+echo Ensuring build dependencies are installed...
+python -m pip install --quiet pyinstaller Pillow pyperclip keyboard pystray
+if errorlevel 1 (
+    echo Failed to install required Python packages.
+    goto :fail
+)
+echo.
+
 if not exist "screensnap.ico" (
     echo Creating custom icon...
     python create-icon.py

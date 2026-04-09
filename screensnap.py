@@ -450,8 +450,20 @@ class SettingsManager:
 
     @classmethod
     def CONFIG_DIR(cls):
-        """Get the config directory path."""
-        return cls._get_base_dir() / "config"
+        """Get the config directory path.
+
+        When frozen and installed under Program Files (not writable),
+        fall back to %APPDATA%\\ScreenSnap\\config.
+        """
+        base = cls._get_base_dir()
+        candidate = base / "config"
+        if getattr(sys, 'frozen', False):
+            base_str = str(base).lower()
+            if "program files" in base_str:
+                appdata = os.environ.get('APPDATA')
+                if appdata:
+                    return Path(appdata) / "ScreenSnap" / "config"
+        return candidate
 
     @classmethod
     def SETTINGS_FILE(cls):
@@ -475,7 +487,7 @@ class SettingsManager:
 
         # Ensure config directory exists
         config_dir = cls.CONFIG_DIR()
-        config_dir.mkdir(exist_ok=True)
+        config_dir.mkdir(parents=True, exist_ok=True)
 
         # Read existing file if it exists
         settings_file = cls.SETTINGS_FILE()
@@ -505,7 +517,7 @@ class SettingsManager:
         """Save settings to INI file."""
         # Ensure config directory exists
         config_dir = cls.CONFIG_DIR()
-        config_dir.mkdir(exist_ok=True)
+        config_dir.mkdir(parents=True, exist_ok=True)
 
         config = configparser.ConfigParser()
         config['Settings'] = {

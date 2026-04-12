@@ -2695,20 +2695,40 @@ class AnnotationEditor:
         text_h = len(text_lines) * (font_size + 4) + 16
         text_w = max(text_w, 80)
 
-        # Connector arrow (from bubble center to anchor point)
-        line_w = max(1, int(2 * z))
-        elem['canvas_ids']['line'] = self.canvas.create_line(
-            bx + text_w / 2, by + text_h / 2, ax, ay,
-            fill=elem['color'], width=line_w,
-            arrow='last',
-            arrowshape=(line_w * 5, line_w * 4, line_w * 2),
+        # Compute tail triangle from bubble edge toward anchor
+        bcx = bx + text_w / 2
+        bcy = by + text_h / 2
+        dx = ax - bcx
+        dy = ay - bcy
+        tail_w = max(8 * z, min(20 * z, text_w * 0.15))
+
+        tail_pts = []
+        if abs(dx) * text_h > abs(dy) * text_w:
+            # Anchor is more to the left/right
+            if dx > 0:
+                ty = max(by + tail_w, min(by + text_h - tail_w, ay))
+                tail_pts = [bx + text_w, ty - tail_w / 2, ax, ay, bx + text_w, ty + tail_w / 2]
+            else:
+                ty = max(by + tail_w, min(by + text_h - tail_w, ay))
+                tail_pts = [bx, ty - tail_w / 2, ax, ay, bx, ty + tail_w / 2]
+        else:
+            # Anchor is more above/below
+            if dy > 0:
+                tx = max(bx + tail_w, min(bx + text_w - tail_w, ax))
+                tail_pts = [tx - tail_w / 2, by + text_h, ax, ay, tx + tail_w / 2, by + text_h]
+            else:
+                tx = max(bx + tail_w, min(bx + text_w - tail_w, ax))
+                tail_pts = [tx - tail_w / 2, by, ax, ay, tx + tail_w / 2, by]
+
+        # Tail triangle (drawn under the body so edges overlap cleanly)
+        elem['canvas_ids']['tail'] = self.canvas.create_polygon(
+            *tail_pts, fill=elem['color'], outline=elem['color'],
         )
 
         # Background rectangle
         elem['canvas_ids']['bg'] = self.canvas.create_rectangle(
             bx, by, bx + text_w, by + text_h,
             fill=elem['color'], outline=Theme.OUTLINE, width=1,
-            stipple='gray75',
         )
 
         # Text
@@ -4395,30 +4415,37 @@ class AnnotationEditor:
             except:
                 font = ImageFont.load_default()
 
-            # Connector arrow (from bubble center to anchor point)
+            # Compute bubble dimensions
             font_size_b = elem['font_size']
             text_lines_b = elem['text'].split('\n')
             char_w_b = font_size_b * 0.6
             tw_b = max(len(l) for l in text_lines_b) * char_w_b + 20
             th_b = len(text_lines_b) * (font_size_b + 4) + 16
             tw_b = max(tw_b, 80)
-            bcx = elem['x'] + tw_b / 2
-            bcy = elem['y'] + th_b / 2
+            bx_s = elem['x']
+            by_s = elem['y']
+            bcx = bx_s + tw_b / 2
+            bcy = by_s + th_b / 2
             ax_b, ay_b = elem['anchor_x'], elem['anchor_y']
-            # Draw line
-            draw.line([(bcx, bcy), (ax_b, ay_b)], fill=elem['color'], width=2)
-            # Draw arrowhead at anchor
-            import math as _m
-            angle = _m.atan2(ay_b - bcy, ax_b - bcx)
-            arrow_len = 12
-            arrow_w = 6
-            tip_x, tip_y = ax_b, ay_b
-            left_x = tip_x - arrow_len * _m.cos(angle) + arrow_w * _m.sin(angle)
-            left_y = tip_y - arrow_len * _m.sin(angle) - arrow_w * _m.cos(angle)
-            right_x = tip_x - arrow_len * _m.cos(angle) - arrow_w * _m.sin(angle)
-            right_y = tip_y - arrow_len * _m.sin(angle) + arrow_w * _m.cos(angle)
-            draw.polygon([(tip_x, tip_y), (left_x, left_y), (right_x, right_y)],
-                         fill=elem['color'])
+
+            # Tail triangle from bubble edge toward anchor
+            dx_b = ax_b - bcx
+            dy_b = ay_b - bcy
+            tail_w_s = max(8, min(20, tw_b * 0.15))
+            if abs(dx_b) * th_b > abs(dy_b) * tw_b:
+                if dx_b > 0:
+                    ty_s = max(by_s + tail_w_s, min(by_s + th_b - tail_w_s, ay_b))
+                    tail_pts = [(bx_s + tw_b, ty_s - tail_w_s / 2), (ax_b, ay_b), (bx_s + tw_b, ty_s + tail_w_s / 2)]
+                else:
+                    ty_s = max(by_s + tail_w_s, min(by_s + th_b - tail_w_s, ay_b))
+                    tail_pts = [(bx_s, ty_s - tail_w_s / 2), (ax_b, ay_b), (bx_s, ty_s + tail_w_s / 2)]
+            else:
+                if dy_b > 0:
+                    tx_s = max(bx_s + tail_w_s, min(bx_s + tw_b - tail_w_s, ax_b))
+                    tail_pts = [(tx_s - tail_w_s / 2, by_s + th_b), (ax_b, ay_b), (tx_s + tail_w_s / 2, by_s + th_b)]
+                else:
+                    tx_s = max(bx_s + tail_w_s, min(bx_s + tw_b - tail_w_s, ax_b))
+                    tail_pts = [(tx_s - tail_w_s / 2, by_s), (ax_b, ay_b), (tx_s + tail_w_s / 2, by_s)]
 
             # Background rectangle with semi-transparent fill
             text_bbox = draw.textbbox((elem['x'] + 10, elem['y'] + 8), elem['text'], font=font)
@@ -4436,6 +4463,9 @@ class AnnotationEditor:
 
             bg_img = Image.new('RGBA', self.image.size, (0, 0, 0, 0))
             bg_draw = ImageDraw.Draw(bg_img)
+            # Tail triangle
+            bg_draw.polygon(tail_pts, fill=(cr, cg, cb, 204))
+            # Body rectangle
             bg_draw.rectangle(bg_rect, fill=(cr, cg, cb, 204))
             bg_draw.text((elem['x'] + 10, elem['y'] + 8), elem['text'], fill='white', font=font)
 

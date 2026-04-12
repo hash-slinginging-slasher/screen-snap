@@ -39,6 +39,7 @@ Source: "dist\ScreenSnap.exe";         DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\ScreenSnapMonitor.exe";  DestDir: "{app}"; Flags: ignoreversion
 Source: "screensnap.ico";              DestDir: "{app}"; Flags: ignoreversion
 Source: "PRINTSCREEN-SETUP.md";        DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "stamps\*";                    DestDir: "{app}\stamps"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}";          Filename: "{app}\{#MyAppExeName}"
@@ -61,3 +62,4 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyMonitorExe}"; Flags: run
 [UninstallDelete]
 Type: files; Name: "{app}\.printscreen-monitor.lock"
 Type: files; Name: "{app}\settings.ini"
+Type: filesandordirs; Name: "{app}\stamps"

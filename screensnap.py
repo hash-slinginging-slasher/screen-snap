@@ -2092,6 +2092,35 @@ class AnnotationEditor:
             self.arrow_double_btn.config(bg=Theme.PRIMARY, fg="#000000")
             self.arrow_single_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
 
+    def _draw_arrow_on_image(self, draw, x1, y1, x2, y2, color, width, style, heads):
+        """Draw an arrow with arrowhead(s) onto an ImageDraw context."""
+        # Draw the shaft
+        draw.line([(x1, y1), (x2, y2)], fill=color, width=width)
+
+        head_length = width * 4
+        head_width = width * 3
+
+        def _arrowhead(tip_x, tip_y, from_x, from_y):
+            """Draw one arrowhead pointing at (tip_x, tip_y)."""
+            angle = math.atan2(tip_y - from_y, tip_x - from_x)
+            lx = tip_x - head_length * math.cos(angle) + head_width * math.sin(angle) / 2
+            ly = tip_y - head_length * math.sin(angle) - head_width * math.cos(angle) / 2
+            rx = tip_x - head_length * math.cos(angle) - head_width * math.sin(angle) / 2
+            ry = tip_y - head_length * math.sin(angle) + head_width * math.cos(angle) / 2
+
+            if style == 'filled':
+                draw.polygon([(tip_x, tip_y), (lx, ly), (rx, ry)], fill=color)
+            else:
+                draw.line([(lx, ly), (tip_x, tip_y)], fill=color, width=max(1, width // 2))
+                draw.line([(rx, ry), (tip_x, tip_y)], fill=color, width=max(1, width // 2))
+
+        # Head at the end (always)
+        _arrowhead(x2, y2, x1, y1)
+
+        # Head at the start (if double)
+        if heads == 'double':
+            _arrowhead(x1, y1, x2, y2)
+
     def set_color(self, color):
         """Set the current drawing color with modern highlighting."""
         self.current_color = color
@@ -2935,6 +2964,21 @@ class AnnotationEditor:
                 )
             return
 
+        # Draw preview for arrow tool
+        if self.current_tool == 'arrow':
+            self.current_shape = self.canvas.create_line(
+                self.start_x, self.start_y, x, y,
+                fill=self.current_color,
+                width=self.stroke_width,
+                arrow='both' if self.arrow_heads == 'double' else 'last',
+                arrowshape=(
+                    self.stroke_width * 4,
+                    self.stroke_width * 3,
+                    self.stroke_width * 1,
+                ),
+            )
+            return
+
         # Draw preview shape
         if self.current_tool in ['rectangle', 'circle']:
             self.current_shape = self.canvas.create_rectangle(
@@ -2998,6 +3042,24 @@ class AnnotationEditor:
         
         # Save state for undo (and invalidate redo stack)
         self.save_state()
+
+        # Arrow tool — uses directional start->end, not normalized bounds
+        if self.current_tool == 'arrow':
+            z = self.zoom if self.zoom else 1.0
+            ax1, ay1 = self.start_x / z, self.start_y / z
+            ax2, ay2 = x / z, y / z
+            # Skip if arrow is too short
+            length = math.hypot(ax2 - ax1, ay2 - ay1)
+            if length < 5:
+                return
+            draw = ImageDraw.Draw(self.image)
+            self._draw_arrow_on_image(
+                draw, ax1, ay1, ax2, ay2,
+                self.current_color, self.stroke_width,
+                self.arrow_style, self.arrow_heads,
+            )
+            self.refresh_display()
+            return
 
         # Convert canvas coords to image coords (divide by zoom).
         z = self.zoom if self.zoom else 1.0

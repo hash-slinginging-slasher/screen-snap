@@ -1,5 +1,36 @@
 ## 2026-04-12
 
+### Phase 2: Smart Move Tool
+**Files Changed:** `screensnap.py`
+
+- Added Smart Move annotation tool (shortcut V) with two-phase interaction: select a rectangular region, then drag to reposition
+- Selection phase uses normal drawing behavior with green dashed rectangle preview
+- Move phase shows draggable green dashed preview; on release, fills vacated area with clone-stamp border sampling and pastes region at new position
+- Clone-stamp fill samples up to 16px border pixels from all four edges, blending inward with distance-weighted interpolation
+- Immediate rendering: modifies self.image directly with full undo support via save_state()
+- Resets smart_move state when switching tools; enabled 'smart_move' in overflow menu's _implemented_overflow set
+
+**Deployment:** Not deployed
+
+---
+
+### Phase 2: Speech Bubble Annotation Tool
+**Files Changed:** `screensnap.py`
+
+- Added Speech Bubble annotation tool (shortcut B) with deferred rendering pattern (same as text tool)
+- Bubbles consist of an anchor dot, connector line, semi-transparent colored rectangle, and white text
+- Click to place anchor point; bubble body appears offset with editable text via prompt dialog
+- Supports dragging to reposition, double-click to re-edit text, and DELETE button in properties panel
+- Font size configurable via spinbox (8-48px) in bubble properties panel
+- Full undo/redo support via _snapshot_state/_apply_state with bubble_elements and bubble_counter
+- Bubbles rendered to image on save with RGBA alpha compositing for semi-transparent backgrounds
+- Zoom-aware: canvas items re-render correctly at all zoom levels via _sync_overlays_to_zoom
+- Enabled 'bubble' in overflow menu's _implemented_overflow set
+
+**Deployment:** Not deployed
+
+---
+
 ### Phase 2: Stamp Library Tool
 **Files Changed:** `screensnap.py`
 

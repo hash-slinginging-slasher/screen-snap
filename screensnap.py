@@ -2333,26 +2333,143 @@ class AnnotationEditor:
         ext = filepath.suffix.lower()
 
         if ext == '.svg':
-            # Auto-install cairosvg if needed
-            try:
-                import cairosvg
-            except ImportError:
-                subprocess.check_call(
-                    [sys.executable, '-m', 'pip', 'install', '--quiet', 'cairosvg'],
-                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-                )
-                import cairosvg
-            png_data = cairosvg.svg2png(
-                url=str(filepath),
-                output_width=render_size,
-                output_height=render_size,
-            )
-            img = Image.open(io.BytesIO(png_data)).convert('RGBA')
+            img = self._render_svg(filepath, render_size)
         else:
             img = Image.open(filepath).convert('RGBA')
             img = img.resize((render_size, render_size), Image.LANCZOS)
 
         self._stamp_cache[cache_key] = img
+        return img
+
+    @staticmethod
+    def _render_svg(filepath, render_size):
+        """Render a simple SVG to a PIL RGBA Image using xml.etree + ImageDraw.
+
+        Supports: circle, ellipse, rect, line, polyline, polygon, text.
+        This is intentionally minimal — handles the stamp icon SVGs shipped
+        with ScreenSnap, not arbitrary SVGs.
+        """
+        import xml.etree.ElementTree as ET
+
+        ns = '{http://www.w3.org/2000/svg}'
+        tree = ET.parse(filepath)
+        root = tree.getroot()
+
+        # Parse viewBox or width/height for coordinate scaling
+        vb = root.get('viewBox')
+        if vb:
+            parts = vb.replace(',', ' ').split()
+            vb_w, vb_h = float(parts[2]), float(parts[3])
+        else:
+            vb_w = float(root.get('width', '40'))
+            vb_h = float(root.get('height', '40'))
+
+        scale = render_size / max(vb_w, vb_h)
+
+        img = Image.new('RGBA', (render_size, render_size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        def sc(v):
+            """Scale a coordinate value."""
+            return v * scale
+
+        def parse_color(c):
+            """Parse a CSS color string."""
+            if not c or c == 'none':
+                return None
+            return c
+
+        def parse_float(s, default=0):
+            try:
+                return float(s)
+            except (TypeError, ValueError):
+                return default
+
+        for elem in root.iter():
+            tag = elem.tag.replace(ns, '')
+            fill = parse_color(elem.get('fill'))
+            stroke = parse_color(elem.get('stroke'))
+            stroke_w = max(1, int(sc(parse_float(elem.get('stroke-width'), 1))))
+
+            if tag == 'circle':
+                cx = sc(parse_float(elem.get('cx')))
+                cy = sc(parse_float(elem.get('cy')))
+                r = sc(parse_float(elem.get('r')))
+                if fill and fill != 'none':
+                    draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=fill)
+                if stroke and stroke != 'none':
+                    draw.ellipse([cx-r, cy-r, cx+r, cy+r], outline=stroke, width=stroke_w)
+
+            elif tag == 'ellipse':
+                cx = sc(parse_float(elem.get('cx')))
+                cy = sc(parse_float(elem.get('cy')))
+                rx = sc(parse_float(elem.get('rx')))
+                ry = sc(parse_float(elem.get('ry')))
+                if fill and fill != 'none':
+                    draw.ellipse([cx-rx, cy-ry, cx+rx, cy+ry], fill=fill)
+                if stroke and stroke != 'none':
+                    draw.ellipse([cx-rx, cy-ry, cx+rx, cy+ry], outline=stroke, width=stroke_w)
+
+            elif tag == 'rect':
+                x = sc(parse_float(elem.get('x')))
+                y = sc(parse_float(elem.get('y')))
+                w = sc(parse_float(elem.get('width')))
+                h = sc(parse_float(elem.get('height')))
+                if fill and fill != 'none':
+                    draw.rectangle([x, y, x+w, y+h], fill=fill)
+                if stroke and stroke != 'none':
+                    draw.rectangle([x, y, x+w, y+h], outline=stroke, width=stroke_w)
+
+            elif tag == 'line':
+                x1 = sc(parse_float(elem.get('x1')))
+                y1 = sc(parse_float(elem.get('y1')))
+                x2 = sc(parse_float(elem.get('x2')))
+                y2 = sc(parse_float(elem.get('y2')))
+                color = stroke or fill or '#000'
+                draw.line([(x1, y1), (x2, y2)], fill=color, width=stroke_w)
+
+            elif tag in ('polyline', 'polygon'):
+                pts_str = elem.get('points', '')
+                coords = pts_str.replace(',', ' ').split()
+                points = []
+                for i in range(0, len(coords) - 1, 2):
+                    points.append((sc(float(coords[i])), sc(float(coords[i+1]))))
+                if len(points) < 2:
+                    continue
+                if tag == 'polygon':
+                    if fill and fill != 'none':
+                        draw.polygon(points, fill=fill)
+                    if stroke and stroke != 'none':
+                        draw.polygon(points, outline=stroke)
+                else:
+                    # polyline — draw as connected lines
+                    color = stroke or fill or '#000'
+                    for i in range(len(points) - 1):
+                        draw.line([points[i], points[i+1]], fill=color, width=stroke_w)
+
+            elif tag == 'text':
+                x = sc(parse_float(elem.get('x')))
+                y = sc(parse_float(elem.get('y')))
+                text_content = (elem.text or '').strip()
+                if not text_content:
+                    continue
+                color = fill or '#000'
+                font_size = int(sc(parse_float(elem.get('font-size', '16'))))
+                try:
+                    from PIL import ImageFont
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
+                # Handle text-anchor
+                anchor = elem.get('text-anchor', 'start')
+                if anchor == 'middle':
+                    bbox = draw.textbbox((0, 0), text_content, font=font)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    x -= tw / 2
+                    y -= th / 2
+                draw.text((x, y), text_content, fill=color, font=font)
+
         return img
 
     def _update_stamp_buttons(self):

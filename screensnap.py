@@ -1041,7 +1041,6 @@ class LauncherWindow:
 
         if file_path:
             try:
-                # Load image
                 image = Image.open(file_path)
                 # Convert to RGB if necessary
                 if image.mode != 'RGB':
@@ -1631,6 +1630,10 @@ class AnnotationEditor:
         self.drag_step_offset_x = 0
         self.drag_step_offset_y = 0
 
+        # Arrow tool properties
+        self.arrow_style = 'filled'     # 'filled' or 'open'
+        self.arrow_heads = 'single'     # 'single' or 'double'
+
         # Use the shared app root as a Toplevel
         master = _get_root()
         _clear_root(master)
@@ -1723,6 +1726,44 @@ class AnnotationEditor:
         ModernButton(self.step_props_frame, text="↺ RESET", variant="secondary",
                      command=self.reset_step_counter, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
 
+        # Arrow properties panel
+        self.arrow_props_frame = tk.Frame(self.props_container, bg=Theme.SURFACE, padx=15, pady=10)
+        self.arrow_props_frame.pack(side='top', fill='x')
+        self.arrow_props_frame.pack_forget()
+
+        tk.Label(self.arrow_props_frame, text="ARROW TOOL", font=("Segoe UI Bold", 8),
+                 fg=Theme.PRIMARY, bg=Theme.SURFACE).pack(side='left', padx=(0, 20))
+
+        tk.Label(self.arrow_props_frame, text="Style", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+
+        self.arrow_filled_btn = ModernButton(
+            self.arrow_props_frame, text="\u25b6 Filled", variant="primary",
+            command=lambda: self._set_arrow_style('filled'),
+            font=("Segoe UI Bold", 8))
+        self.arrow_filled_btn.pack(side='left', padx=2)
+
+        self.arrow_open_btn = ModernButton(
+            self.arrow_props_frame, text="\u25b7 Open", variant="tool",
+            command=lambda: self._set_arrow_style('open'),
+            font=("Segoe UI Bold", 8))
+        self.arrow_open_btn.pack(side='left', padx=(2, 20))
+
+        tk.Label(self.arrow_props_frame, text="Heads", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+
+        self.arrow_single_btn = ModernButton(
+            self.arrow_props_frame, text="\u2192 Single", variant="primary",
+            command=lambda: self._set_arrow_heads('single'),
+            font=("Segoe UI Bold", 8))
+        self.arrow_single_btn.pack(side='left', padx=2)
+
+        self.arrow_double_btn = ModernButton(
+            self.arrow_props_frame, text="\u2194 Double", variant="tool",
+            command=lambda: self._set_arrow_heads('double'),
+            font=("Segoe UI Bold", 8))
+        self.arrow_double_btn.pack(side='left', padx=2)
+
         # Canvas frame (The "Sunken" Void)
         canvas_container = tk.Frame(main_frame, bg=Theme.BACKGROUND, padx=20, pady=20)
         canvas_container.pack(side='top', fill='both', expand=True)
@@ -1783,6 +1824,15 @@ class AnnotationEditor:
             self.root.bind(f'<{k}>', lambda e, tool=t: self.set_tool(tool))
             self.root.bind(f'<{k.upper()}>', lambda e, tool=t: self.set_tool(tool))
 
+        # Overflow tool shortcuts
+        for k, t in [('a','arrow'), ('m','stamp'), ('b','bubble'), ('v','smart_move'), ('u','blur'), ('h','highlight')]:
+            if t in self._implemented_overflow:
+                self.root.bind(f'<{k}>', lambda e, tool=t: self.set_tool(tool))
+                self.root.bind(f'<{k.upper()}>', lambda e, tool=t: self.set_tool(tool))
+            else:
+                self.root.bind(f'<{k}>', lambda e, tool=t: self.status_var.set(f"{tool.upper()}: Coming soon"))
+                self.root.bind(f'<{k.upper()}>', lambda e, tool=t: self.status_var.set(f"{tool.upper()}: Coming soon"))
+
         # Initial tool and color
         self.root.after(100, lambda: self.set_tool('step'))
         self.root.after(100, lambda: self.set_color(self.COLORS[0]))
@@ -1831,6 +1881,59 @@ class AnnotationEditor:
             btn.pack(side='left', padx=2)
             setattr(self, f'{tool}_btn', btn)
 
+        # Overflow "More" dropdown for additional tools
+        self.overflow_menu_btn = tk.Menubutton(
+            tools_frame,
+            text="More \u25be",
+            font=Theme.FONT_BUTTON,
+            bg=Theme.SURFACE,
+            fg=Theme.ON_SURFACE_VARIANT,
+            activebackground=Theme.SURFACE_BRIGHT,
+            activeforeground=Theme.ON_SURFACE,
+            relief='flat',
+            borderwidth=0,
+            cursor='hand2',
+            padx=15,
+            pady=5,
+        )
+        self.overflow_menu_btn.pack(side='left', padx=2)
+
+        self.overflow_menu = tk.Menu(
+            self.overflow_menu_btn,
+            tearoff=0,
+            bg=Theme.SURFACE,
+            fg=Theme.ON_SURFACE,
+            activebackground=Theme.PRIMARY,
+            activeforeground="#000000",
+            font=Theme.FONT_BUTTON,
+            borderwidth=1,
+            relief='flat',
+        )
+        self.overflow_menu_btn['menu'] = self.overflow_menu
+
+        self.overflow_tools = [
+            ('Arrow', 'arrow', 'A'),
+            ('Stamp', 'stamp', 'M'),
+            ('Bubble', 'bubble', 'B'),
+            ('Smart Move', 'smart_move', 'V'),
+            ('Blur', 'blur', 'U'),
+            ('Highlight', 'highlight', 'H'),
+        ]
+        self._overflow_tool_names = {t[1] for t in self.overflow_tools}
+        self._implemented_overflow = {'arrow'}
+
+        for label, tool, key in self.overflow_tools:
+            if tool in self._implemented_overflow:
+                self.overflow_menu.add_command(
+                    label=f"{label} ({key})",
+                    command=lambda t=tool: self.set_tool(t),
+                )
+            else:
+                self.overflow_menu.add_command(
+                    label=f"{label} ({key}) \u2014 Coming soon",
+                    state='disabled',
+                )
+
         tk.Frame(toolbar, width=1, bg=Theme.OUTLINE).pack(side='left', fill='y', padx=20)
 
         # 1b. History Group (Undo / Redo — Quick Access)
@@ -1874,6 +1977,7 @@ class AnnotationEditor:
         ModernButton(actions_frame, text="✂️ REGION", variant="primary", command=self.capture_new_region).pack(side='right', padx=5)
         ModernButton(actions_frame, text="💾 SAVE & COPY", variant="success", command=self.save_and_copy).pack(side='right', padx=5)
         ModernButton(actions_frame, text="🔗 SHARE", variant="primary", command=self.share_to_imgbb).pack(side='right', padx=5)
+
 
         return toolbar
     def capture_new_full(self):
@@ -1922,7 +2026,7 @@ class AnnotationEditor:
         self.current_tool = tool
         self.status_var.set(f"MODE: {tool.upper()}")
 
-        # Update button states (Capsule highlight)
+        # Update primary button states (Capsule highlight)
         for t in ['rectangle', 'line', 'circle', 'crop', 'text', 'step']:
             btn = getattr(self, f'{t}_btn', None)
             if btn:
@@ -1931,18 +2035,63 @@ class AnnotationEditor:
                 else:
                     btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
 
+        # Update overflow menu button label
+        if tool in self._overflow_tool_names:
+            display = next(
+                (lbl for lbl, t, _ in self.overflow_tools if t == tool),
+                tool.title()
+            )
+            self.overflow_menu_btn.config(
+                text=f"{display} \u25be",
+                bg=Theme.PRIMARY,
+                fg="#000000",
+            )
+        else:
+            self.overflow_menu_btn.config(
+                text="More \u25be",
+                bg=Theme.SURFACE,
+                fg=Theme.ON_SURFACE_VARIANT,
+            )
+
         # Show/hide properties panels
         if tool == 'text':
             self.text_props_frame.pack(side='top', fill='x')
             self.step_props_frame.pack_forget()
+            self.arrow_props_frame.pack_forget()
         elif tool == 'step':
             self.step_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
+            self.arrow_props_frame.pack_forget()
+        elif tool == 'arrow':
+            self.arrow_props_frame.pack(side='top', fill='x')
+            self.text_props_frame.pack_forget()
+            self.step_props_frame.pack_forget()
         else:
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
+            self.arrow_props_frame.pack_forget()
             self.deselect_all()
     
+    def _set_arrow_style(self, style):
+        """Toggle arrow style between filled and open."""
+        self.arrow_style = style
+        if style == 'filled':
+            self.arrow_filled_btn.config(bg=Theme.PRIMARY, fg="#000000")
+            self.arrow_open_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
+        else:
+            self.arrow_open_btn.config(bg=Theme.PRIMARY, fg="#000000")
+            self.arrow_filled_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
+
+    def _set_arrow_heads(self, heads):
+        """Toggle arrow heads between single and double."""
+        self.arrow_heads = heads
+        if heads == 'single':
+            self.arrow_single_btn.config(bg=Theme.PRIMARY, fg="#000000")
+            self.arrow_double_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
+        else:
+            self.arrow_double_btn.config(bg=Theme.PRIMARY, fg="#000000")
+            self.arrow_single_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
+
     def set_color(self, color):
         """Set the current drawing color with modern highlighting."""
         self.current_color = color
@@ -2977,6 +3126,7 @@ class AnnotationEditor:
             new_h = max(1, int(round(self.image.height * self.zoom)))
             resample = Image.LANCZOS if self.zoom < 1.0 else Image.NEAREST
             display_source = self.image.resize((new_w, new_h), resample)
+
         self.display_image = ImageTk.PhotoImage(display_source)
         if getattr(self, 'image_id', None):
             try:

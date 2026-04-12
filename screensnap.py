@@ -2667,6 +2667,7 @@ class AnnotationEditor:
         elem = {
             'id': self.bubble_counter,
             'x': bx, 'y': by,
+            'width': 0, 'height': 0,  # 0 = auto-size from text
             'anchor_x': anchor_x, 'anchor_y': anchor_y,
             'text': 'Type here...',
             'color': self.current_color,
@@ -2677,14 +2678,21 @@ class AnnotationEditor:
         self._render_bubble_canvas(elem)
         self._edit_bubble_text(elem)
 
-    def _bubble_dims(self, elem, z=1.0):
-        """Return (text_w, text_h) for a bubble element at given zoom."""
-        font_size = max(1, int(round(elem['font_size'] * z)))
+    def _bubble_auto_dims(self, elem):
+        """Return auto-sized (w, h) based on text content."""
+        font_size = elem['font_size']
         text_lines = elem['text'].split('\n')
         char_w = font_size * 0.6
         text_w = max(len(line) for line in text_lines) * char_w + 20
         text_h = len(text_lines) * (font_size + 4) + 16
-        return max(text_w, 80), text_h
+        return max(text_w, 80), max(text_h, 30)
+
+    def _bubble_dims(self, elem, z=1.0):
+        """Return (w, h) for a bubble — uses explicit size if set, else auto."""
+        aw, ah = self._bubble_auto_dims(elem)
+        w = elem.get('width', 0) or aw
+        h = elem.get('height', 0) or ah
+        return w, h
 
     def _render_bubble_canvas(self, elem):
         """Create/update canvas items for a bubble element as a single PIL image."""
@@ -2770,6 +2778,16 @@ class AnnotationEditor:
             font = ImageFont.load_default()
         draw.text((bx + 10 * z, by + 8 * z), elem['text'], fill='white', font=font)
 
+        # Anchor handle (small circle at tail tip)
+        handle_r = max(3, int(5 * z))
+        draw.ellipse([ax - handle_r, ay - handle_r, ax + handle_r, ay + handle_r],
+                     fill=(255, 255, 255, 200), outline=(100, 100, 100, 200))
+
+        # Resize handle (bottom-right corner)
+        rx, ry = bx + tw, by + th
+        draw.ellipse([rx - handle_r, ry - handle_r, rx + handle_r, ry + handle_r],
+                     fill=(255, 255, 255, 200), outline=(100, 100, 100, 200))
+
         photo = ImageTk.PhotoImage(tile)
         elem['_bubble_photo'] = photo  # prevent GC
         canvas_x = min_x * z
@@ -2788,14 +2806,27 @@ class AnnotationEditor:
     def _find_bubble_at(self, ix, iy):
         """Find bubble element at image-space position."""
         for elem in reversed(self.bubble_elements):
-            font_size = elem['font_size']
-            text_lines = elem['text'].split('\n')
-            char_w = font_size * 0.6
-            w = max(len(line) for line in text_lines) * char_w + 20
-            h = len(text_lines) * (font_size + 4) + 16
-            w = max(w, 80)
+            w, h = self._bubble_dims(elem)
             if elem['x'] <= ix <= elem['x'] + w and elem['y'] <= iy <= elem['y'] + h:
                 return elem
+        return None
+
+    def _bubble_hit_test(self, ix, iy):
+        """Hit-test bubbles. Returns (elem, zone) or None.
+        zone is 'anchor', 'resize', or 'body'."""
+        grab_r = 10
+        for elem in reversed(self.bubble_elements):
+            # Check anchor point first (tail tip)
+            if math.hypot(ix - elem['anchor_x'], iy - elem['anchor_y']) < grab_r:
+                return (elem, 'anchor')
+            # Check resize handle (bottom-right corner)
+            w, h = self._bubble_dims(elem)
+            brx, bry = elem['x'] + w, elem['y'] + h
+            if math.hypot(ix - brx, iy - bry) < grab_r:
+                return (elem, 'resize')
+            # Check body
+            if elem['x'] <= ix <= elem['x'] + w and elem['y'] <= iy <= elem['y'] + h:
+                return (elem, 'body')
         return None
 
     def _delete_selected_bubble(self):
@@ -3566,13 +3597,19 @@ class AnnotationEditor:
             return
 
         elif self.current_tool == 'bubble':
-            clicked_bubble = self._find_bubble_at(ix, iy)
-            if clicked_bubble:
-                self.selected_bubble_id = clicked_bubble['id']
-                self.dragging_bubble = True
+            hit = self._bubble_hit_test(ix, iy)
+            if hit:
+                elem_b, zone = hit
+                self.selected_bubble_id = elem_b['id']
                 self._drag_snapshot_taken = False
-                self.drag_bubble_offset_x = ix - clicked_bubble['x']
-                self.drag_bubble_offset_y = iy - clicked_bubble['y']
+                if zone == 'anchor':
+                    self.dragging_bubble_anchor = True
+                elif zone == 'resize':
+                    self.dragging_bubble_resize = True
+                else:  # 'body'
+                    self.dragging_bubble = True
+                    self.drag_bubble_offset_x = ix - elem_b['x']
+                    self.drag_bubble_offset_y = iy - elem_b['y']
             else:
                 self.drawing = False
                 self._add_bubble(ix, iy)
@@ -3677,8 +3714,9 @@ class AnnotationEditor:
                     break
             return
 
-        # Handle bubble dragging
-        if self.dragging_bubble and self.selected_bubble_id is not None:
+        # Handle bubble dragging (body, anchor, or resize)
+        if (self.dragging_bubble or self.dragging_bubble_anchor or self.dragging_bubble_resize) \
+                and self.selected_bubble_id is not None:
             if not getattr(self, '_drag_snapshot_taken', False):
                 self.save_state()
                 self._drag_snapshot_taken = True
@@ -3687,8 +3725,17 @@ class AnnotationEditor:
             ix, iy = cx / z, cy / z
             for elem in self.bubble_elements:
                 if elem['id'] == self.selected_bubble_id:
-                    elem['x'] = ix - self.drag_bubble_offset_x
-                    elem['y'] = iy - self.drag_bubble_offset_y
+                    if self.dragging_bubble_anchor:
+                        elem['anchor_x'] = ix
+                        elem['anchor_y'] = iy
+                    elif self.dragging_bubble_resize:
+                        new_w = max(60, ix - elem['x'])
+                        new_h = max(24, iy - elem['y'])
+                        elem['width'] = new_w
+                        elem['height'] = new_h
+                    else:
+                        elem['x'] = ix - self.drag_bubble_offset_x
+                        elem['y'] = iy - self.drag_bubble_offset_y
                     self._render_bubble_canvas(elem)
                     break
             return
@@ -3873,8 +3920,10 @@ class AnnotationEditor:
             self.dragging_step = False
             return
 
-        if self.dragging_bubble:
+        if self.dragging_bubble or self.dragging_bubble_anchor or self.dragging_bubble_resize:
             self.dragging_bubble = False
+            self.dragging_bubble_anchor = False
+            self.dragging_bubble_resize = False
             return
 
         if self.dragging_stamp:
@@ -4452,13 +4501,8 @@ class AnnotationEditor:
             except:
                 font = ImageFont.load_default()
 
-            # Compute bubble dimensions
-            font_size_b = elem['font_size']
-            text_lines_b = elem['text'].split('\n')
-            char_w_b = font_size_b * 0.6
-            tw_b = max(len(l) for l in text_lines_b) * char_w_b + 20
-            th_b = len(text_lines_b) * (font_size_b + 4) + 16
-            tw_b = max(tw_b, 80)
+            # Compute bubble dimensions (respects explicit width/height)
+            tw_b, th_b = self._bubble_dims(elem)
             bx_s = elem['x']
             by_s = elem['y']
             bcx = bx_s + tw_b / 2

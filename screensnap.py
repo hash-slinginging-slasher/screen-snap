@@ -1582,6 +1582,13 @@ class AnnotationEditor:
         '#8B00FF',  # Purple
         '#FFFFFF',  # White
     ]
+
+    STAMP_CATEGORIES = {
+        'status': ['checkmark', 'cross', 'warning', 'info', 'question'],
+        'reaction': ['thumbs_up', 'heart', 'star'],
+        'technical': ['bug', 'lock', 'lightbulb', 'gear'],
+        'emoji': ['happy', 'sad', 'neutral'],
+    }
     
     def __init__(self, image: Image.Image, settings=None, library_path=None):
         self.image = image.copy()
@@ -1637,6 +1644,11 @@ class AnnotationEditor:
         # Blur tool properties
         self.blur_mode = 'pixelate'    # 'pixelate' or 'gaussian'
         self.blur_intensity = 15       # block_size (pixelate) or radius (gaussian)
+
+        # Stamp tool properties
+        self.stamp_category = 'status'
+        self.stamp_selected = 'checkmark'
+        self.stamp_size = 40
 
         # Use the shared app root as a Toplevel
         master = _get_root()
@@ -1805,6 +1817,36 @@ class AnnotationEditor:
         self.blur_intensity_var.trace_add('write', lambda *_: self.blur_intensity_label.config(
             text=str(self.blur_intensity_var.get())))
 
+        # Stamp properties panel
+        self.stamp_props_frame = tk.Frame(self.props_container, bg=Theme.SURFACE, padx=15, pady=10)
+        self.stamp_props_frame.pack(side='top', fill='x')
+        self.stamp_props_frame.pack_forget()
+
+        tk.Label(self.stamp_props_frame, text="STAMP TOOL", font=("Segoe UI Bold", 8),
+                 fg=Theme.PRIMARY, bg=Theme.SURFACE).pack(side='left', padx=(0, 10))
+
+        tk.Label(self.stamp_props_frame, text="Category", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+        self.stamp_category_var = tk.StringVar(value='status')
+        cat_combo = ttk.Combobox(self.stamp_props_frame, textvariable=self.stamp_category_var,
+                                 values=list(self.STAMP_CATEGORIES.keys()),
+                                 state='readonly', width=10)
+        cat_combo.pack(side='left', padx=(0, 10))
+        cat_combo.bind('<<ComboboxSelected>>', lambda e: self._update_stamp_buttons())
+
+        self.stamp_btn_frame = tk.Frame(self.stamp_props_frame, bg=Theme.SURFACE)
+        self.stamp_btn_frame.pack(side='left', padx=(0, 10))
+        self._stamp_buttons = []
+        self._update_stamp_buttons()
+
+        tk.Label(self.stamp_props_frame, text="Size", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+        self.stamp_size_var = tk.IntVar(value=40)
+        stamp_size_spin = ttk.Spinbox(self.stamp_props_frame, from_=20, to=120,
+                                      textvariable=self.stamp_size_var, width=5,
+                                      command=lambda: setattr(self, 'stamp_size', self.stamp_size_var.get()))
+        stamp_size_spin.pack(side='left')
+
         # Canvas frame (The "Sunken" Void)
         canvas_container = tk.Frame(main_frame, bg=Theme.BACKGROUND, padx=20, pady=20)
         canvas_container.pack(side='top', fill='both', expand=True)
@@ -1961,7 +2003,7 @@ class AnnotationEditor:
             ('Highlight', 'highlight', 'H'),
         ]
         self._overflow_tool_names = {t[1] for t in self.overflow_tools}
-        self._implemented_overflow = {'arrow', 'highlight', 'blur'}
+        self._implemented_overflow = {'arrow', 'highlight', 'blur', 'stamp'}
 
         for label, tool, key in self.overflow_tools:
             if tool in self._implemented_overflow:
@@ -2100,26 +2142,37 @@ class AnnotationEditor:
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
+            self.stamp_props_frame.pack_forget()
         elif tool == 'step':
             self.step_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
+            self.stamp_props_frame.pack_forget()
         elif tool == 'arrow':
             self.arrow_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
+            self.stamp_props_frame.pack_forget()
         elif tool == 'blur':
             self.blur_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
+            self.stamp_props_frame.pack_forget()
+        elif tool == 'stamp':
+            self.stamp_props_frame.pack(side='top', fill='x')
+            self.text_props_frame.pack_forget()
+            self.step_props_frame.pack_forget()
+            self.arrow_props_frame.pack_forget()
+            self.blur_props_frame.pack_forget()
         else:
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
+            self.stamp_props_frame.pack_forget()
             self.deselect_all()
     
     def _set_arrow_style(self, style):
@@ -2180,6 +2233,167 @@ class AnnotationEditor:
         else:
             self.blur_gaussian_btn.config(bg=Theme.PRIMARY, fg="#000000")
             self.blur_pixelate_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
+
+    def _update_stamp_buttons(self):
+        """Rebuild stamp selection buttons for the current category."""
+        for btn in self._stamp_buttons:
+            btn.destroy()
+        self._stamp_buttons.clear()
+        category = self.stamp_category_var.get()
+        stamps = self.STAMP_CATEGORIES.get(category, [])
+        for name in stamps:
+            display = name.replace('_', ' ').title()
+            btn = ModernButton(
+                self.stamp_btn_frame,
+                text=display,
+                variant="primary" if name == self.stamp_selected else "tool",
+                command=lambda n=name: self._select_stamp(n),
+                font=("Segoe UI Bold", 8),
+            )
+            btn.pack(side='left', padx=1)
+            self._stamp_buttons.append(btn)
+
+    def _select_stamp(self, name):
+        """Select a stamp from the library."""
+        self.stamp_selected = name
+        self._update_stamp_buttons()
+
+    @staticmethod
+    def _draw_stamp(draw, name, cx, cy, size, color):
+        """Draw a named stamp icon centered at (cx, cy)."""
+        r = size // 2
+        s = size
+
+        if name == 'checkmark':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            lw = max(1, s // 8)
+            draw.line([(cx - r*0.35, cy), (cx - r*0.05, cy + r*0.35)], fill='white', width=lw)
+            draw.line([(cx - r*0.05, cy + r*0.35), (cx + r*0.4, cy - r*0.3)], fill='white', width=lw)
+        elif name == 'cross':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            lw = max(1, s // 8)
+            off = r * 0.35
+            draw.line([(cx-off, cy-off), (cx+off, cy+off)], fill='white', width=lw)
+            draw.line([(cx+off, cy-off), (cx-off, cy+off)], fill='white', width=lw)
+        elif name == 'warning':
+            pts = [(cx, cy - r), (cx - r, cy + r), (cx + r, cy + r)]
+            draw.polygon(pts, fill=color)
+            lw = max(1, s // 10)
+            draw.line([(cx, cy - r*0.2), (cx, cy + r*0.25)], fill='white', width=lw)
+            draw.ellipse([cx - lw, cy + r*0.4 - lw, cx + lw, cy + r*0.4 + lw], fill='white')
+        elif name == 'info':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            lw = max(1, s // 10)
+            draw.ellipse([cx-lw, cy-r*0.5-lw, cx+lw, cy-r*0.5+lw], fill='white')
+            draw.line([(cx, cy - r*0.15), (cx, cy + r*0.5)], fill='white', width=lw)
+        elif name == 'question':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            lw = max(1, s // 10)
+            draw.arc([cx-r*0.3, cy-r*0.6, cx+r*0.3, cy+r*0.05], 200, 440, fill='white', width=lw)
+            draw.ellipse([cx-lw, cy+r*0.3-lw, cx+lw, cy+r*0.3+lw], fill='white')
+        elif name == 'thumbs_up':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            draw.rectangle([cx-r*0.35, cy-r*0.1, cx+r*0.15, cy+r*0.5], fill='white')
+            draw.ellipse([cx-r*0.15, cy-r*0.55, cx+r*0.25, cy-r*0.05], fill='white')
+        elif name == 'heart':
+            hr = r * 0.45
+            draw.ellipse([cx - r*0.6, cy - r*0.4, cx, cy + r*0.15], fill=color)
+            draw.ellipse([cx, cy - r*0.4, cx + r*0.6, cy + r*0.15], fill=color)
+            draw.polygon([(cx - r*0.6, cy), (cx + r*0.6, cy), (cx, cy + r*0.7)], fill=color)
+        elif name == 'star':
+            pts = []
+            for i in range(10):
+                angle = math.radians(i * 36 - 90)
+                rad = r if i % 2 == 0 else r * 0.4
+                pts.append((cx + rad * math.cos(angle), cy + rad * math.sin(angle)))
+            draw.polygon(pts, fill=color)
+        elif name == 'bug':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            lw = max(1, s // 10)
+            draw.ellipse([cx-r*0.3, cy-r*0.15, cx+r*0.3, cy+r*0.5], fill='white')
+            draw.ellipse([cx-r*0.15, cy-r*0.4, cx+r*0.15, cy-r*0.1], fill='white')
+            draw.line([(cx-r*0.1, cy-r*0.35), (cx-r*0.3, cy-r*0.55)], fill='white', width=lw)
+            draw.line([(cx+r*0.1, cy-r*0.35), (cx+r*0.3, cy-r*0.55)], fill='white', width=lw)
+        elif name == 'lock':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            draw.rectangle([cx-r*0.3, cy-r*0.05, cx+r*0.3, cy+r*0.45], fill='white')
+            lw = max(1, s // 10)
+            draw.arc([cx-r*0.2, cy-r*0.45, cx+r*0.2, cy+r*0.05], 180, 360, fill='white', width=lw)
+        elif name == 'lightbulb':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            draw.ellipse([cx-r*0.3, cy-r*0.5, cx+r*0.3, cy+r*0.15], fill='white')
+            draw.rectangle([cx-r*0.15, cy+r*0.15, cx+r*0.15, cy+r*0.35], fill='white')
+        elif name == 'gear':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            draw.ellipse([cx-r*0.25, cy-r*0.25, cx+r*0.25, cy+r*0.25], fill='white')
+            lw = max(2, s // 8)
+            for i in range(6):
+                angle = math.radians(i * 60)
+                dx, dy = r * 0.4 * math.cos(angle), r * 0.4 * math.sin(angle)
+                draw.rectangle([cx+dx-lw//2, cy+dy-lw//2, cx+dx+lw//2, cy+dy+lw//2], fill='white')
+        elif name == 'happy':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            ew = max(2, s // 10)
+            draw.ellipse([cx-r*0.3-ew, cy-r*0.2-ew, cx-r*0.3+ew, cy-r*0.2+ew], fill='white')
+            draw.ellipse([cx+r*0.3-ew, cy-r*0.2-ew, cx+r*0.3+ew, cy-r*0.2+ew], fill='white')
+            draw.arc([cx-r*0.4, cy-r*0.1, cx+r*0.4, cy+r*0.45], 10, 170, fill='white', width=ew)
+        elif name == 'sad':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            ew = max(2, s // 10)
+            draw.ellipse([cx-r*0.3-ew, cy-r*0.2-ew, cx-r*0.3+ew, cy-r*0.2+ew], fill='white')
+            draw.ellipse([cx+r*0.3-ew, cy-r*0.2-ew, cx+r*0.3+ew, cy-r*0.2+ew], fill='white')
+            draw.arc([cx-r*0.4, cy+r*0.15, cx+r*0.4, cy+r*0.65], 190, 350, fill='white', width=ew)
+        elif name == 'neutral':
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+            ew = max(2, s // 10)
+            draw.ellipse([cx-r*0.3-ew, cy-r*0.2-ew, cx-r*0.3+ew, cy-r*0.2+ew], fill='white')
+            draw.ellipse([cx+r*0.3-ew, cy-r*0.2-ew, cx+r*0.3+ew, cy-r*0.2+ew], fill='white')
+            draw.line([(cx-r*0.3, cy+r*0.25), (cx+r*0.3, cy+r*0.25)], fill='white', width=ew)
+        else:
+            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+
+    def _place_stamp(self, ix, iy):
+        """Place the selected stamp at image coordinates using 4x supersampling."""
+        SS = 4
+        size = self.stamp_size
+        big_size = size * SS
+
+        # Create supersampled stamp tile
+        tile = Image.new('RGBA', (big_size, big_size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(tile)
+
+        # Draw shadow
+        shadow_off = max(1, SS)
+        shadow_tile = Image.new('RGBA', (big_size, big_size), (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow_tile)
+        self._draw_stamp(shadow_draw, self.stamp_selected,
+                         big_size // 2 + shadow_off, big_size // 2 + shadow_off * 2,
+                         big_size - shadow_off * 4, '#000000')
+        from PIL import ImageFilter
+        shadow_tile = shadow_tile.filter(ImageFilter.GaussianBlur(radius=SS * 2))
+        shadow_data = shadow_tile.split()
+        shadow_tile.putalpha(shadow_data[3].point(lambda a: a * 140 // 255))
+
+        # Draw stamp
+        self._draw_stamp(draw, self.stamp_selected,
+                         big_size // 2, big_size // 2,
+                         big_size - shadow_off * 4, self.current_color)
+
+        # Composite shadow under stamp, downsample
+        final = Image.alpha_composite(shadow_tile, tile)
+        final = final.resize((size, size), Image.LANCZOS)
+
+        # Paste onto image
+        paste_x = int(ix - size // 2)
+        paste_y = int(iy - size // 2)
+
+        if self.image.mode != 'RGBA':
+            self.image = self.image.convert('RGBA')
+        base = self.image.copy()
+        base.paste(final, (paste_x, paste_y), final)
+        self.image = base.convert('RGB')
+
+        self.refresh_display()
 
     def set_color(self, color):
         """Set the current drawing color with modern highlighting."""
@@ -2917,7 +3131,13 @@ class AnnotationEditor:
                 # Add new step (pass image-space coordinates)
                 self.drawing = False
                 self.add_step_element(ix, iy)
-    
+
+        elif self.current_tool == 'stamp':
+            self.drawing = False
+            self.save_state()
+            self._place_stamp(ix, iy)
+            return
+
     def on_canvas_drag(self, event):
         """Handle canvas mouse drag."""
         # Handle text dragging (elem['x']/['y'] are stored in IMAGE space,

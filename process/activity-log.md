@@ -1,5 +1,19 @@
 ## 2026-04-12
 
+### Phase 2: Stamp Library Tool
+**Files Changed:** `screensnap.py`
+
+- Added Stamp Library annotation tool (shortcut M) with 14 vector icons across 4 categories (status, reaction, technical, emoji)
+- Stamps rendered using 4x supersampled tiles with drop shadow, same technique as existing step tool
+- Properties panel with category combobox, stamp selection buttons, and size spinbox (20-120px)
+- Stamp icons: checkmark, cross, warning, info, question, thumbs_up, heart, star, bug, lock, lightbulb, gear, happy, sad, neutral
+- Added STAMP_CATEGORIES class constant and _draw_stamp static method for vector icon rendering
+- Enabled 'stamp' in overflow menu
+
+**Deployment:** Not deployed
+
+---
+
 ### Phase 2: Highlight and Blur/Pixelate Tools
 **Files Changed:** `screensnap.py`
 

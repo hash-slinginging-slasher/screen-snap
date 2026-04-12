@@ -1634,6 +1634,10 @@ class AnnotationEditor:
         self.arrow_style = 'filled'     # 'filled' or 'open'
         self.arrow_heads = 'single'     # 'single' or 'double'
 
+        # Blur tool properties
+        self.blur_mode = 'pixelate'    # 'pixelate' or 'gaussian'
+        self.blur_intensity = 15       # block_size (pixelate) or radius (gaussian)
+
         # Use the shared app root as a Toplevel
         master = _get_root()
         _clear_root(master)
@@ -1763,6 +1767,43 @@ class AnnotationEditor:
             command=lambda: self._set_arrow_heads('double'),
             font=("Segoe UI Bold", 8))
         self.arrow_double_btn.pack(side='left', padx=2)
+
+        # Blur properties panel
+        self.blur_props_frame = tk.Frame(self.props_container, bg=Theme.SURFACE, padx=15, pady=10)
+        self.blur_props_frame.pack(side='top', fill='x')
+        self.blur_props_frame.pack_forget()
+
+        tk.Label(self.blur_props_frame, text="BLUR TOOL", font=("Segoe UI Bold", 8),
+                 fg=Theme.PRIMARY, bg=Theme.SURFACE).pack(side='left', padx=(0, 20))
+
+        tk.Label(self.blur_props_frame, text="Mode", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+
+        self.blur_pixelate_btn = ModernButton(
+            self.blur_props_frame, text="\u25a6 Pixelate", variant="primary",
+            command=lambda: self._set_blur_mode('pixelate'),
+            font=("Segoe UI Bold", 8))
+        self.blur_pixelate_btn.pack(side='left', padx=2)
+
+        self.blur_gaussian_btn = ModernButton(
+            self.blur_props_frame, text="\u25cc Blur", variant="tool",
+            command=lambda: self._set_blur_mode('gaussian'),
+            font=("Segoe UI Bold", 8))
+        self.blur_gaussian_btn.pack(side='left', padx=(2, 20))
+
+        tk.Label(self.blur_props_frame, text="Intensity", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+        self.blur_intensity_var = tk.IntVar(value=15)
+        blur_slider = ttk.Scale(self.blur_props_frame, from_=5, to=30,
+                                variable=self.blur_intensity_var, orient='horizontal', length=120,
+                                command=lambda v: setattr(self, 'blur_intensity', int(float(v))))
+        blur_slider.pack(side='left', padx=(0, 5))
+        self.blur_intensity_label = tk.Label(self.blur_props_frame, text="15",
+                                             font=Theme.FONT_LABEL, fg=Theme.ON_SURFACE_VARIANT,
+                                             bg=Theme.SURFACE, width=3)
+        self.blur_intensity_label.pack(side='left')
+        self.blur_intensity_var.trace_add('write', lambda *_: self.blur_intensity_label.config(
+            text=str(self.blur_intensity_var.get())))
 
         # Canvas frame (The "Sunken" Void)
         canvas_container = tk.Frame(main_frame, bg=Theme.BACKGROUND, padx=20, pady=20)
@@ -1920,7 +1961,7 @@ class AnnotationEditor:
             ('Highlight', 'highlight', 'H'),
         ]
         self._overflow_tool_names = {t[1] for t in self.overflow_tools}
-        self._implemented_overflow = {'arrow'}
+        self._implemented_overflow = {'arrow', 'highlight', 'blur'}
 
         for label, tool, key in self.overflow_tools:
             if tool in self._implemented_overflow:
@@ -2058,18 +2099,27 @@ class AnnotationEditor:
             self.text_props_frame.pack(side='top', fill='x')
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
+            self.blur_props_frame.pack_forget()
         elif tool == 'step':
             self.step_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
+            self.blur_props_frame.pack_forget()
         elif tool == 'arrow':
             self.arrow_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
+            self.blur_props_frame.pack_forget()
+        elif tool == 'blur':
+            self.blur_props_frame.pack(side='top', fill='x')
+            self.text_props_frame.pack_forget()
+            self.step_props_frame.pack_forget()
+            self.arrow_props_frame.pack_forget()
         else:
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
+            self.blur_props_frame.pack_forget()
             self.deselect_all()
     
     def _set_arrow_style(self, style):
@@ -2120,6 +2170,16 @@ class AnnotationEditor:
         # Head at the start (if double)
         if heads == 'double':
             _arrowhead(x1, y1, x2, y2)
+
+    def _set_blur_mode(self, mode):
+        """Toggle blur mode between pixelate and gaussian."""
+        self.blur_mode = mode
+        if mode == 'pixelate':
+            self.blur_pixelate_btn.config(bg=Theme.PRIMARY, fg="#000000")
+            self.blur_gaussian_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
+        else:
+            self.blur_gaussian_btn.config(bg=Theme.PRIMARY, fg="#000000")
+            self.blur_pixelate_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
 
     def set_color(self, color):
         """Set the current drawing color with modern highlighting."""
@@ -2979,6 +3039,27 @@ class AnnotationEditor:
             )
             return
 
+        # Draw preview for highlight tool
+        if self.current_tool == 'highlight':
+            self.current_shape = self.canvas.create_rectangle(
+                self.start_x, self.start_y, x, y,
+                outline=self.current_color,
+                fill=self.current_color,
+                stipple='gray25',
+                width=1,
+            )
+            return
+
+        # Draw preview for blur tool
+        if self.current_tool == 'blur':
+            self.current_shape = self.canvas.create_rectangle(
+                self.start_x, self.start_y, x, y,
+                outline='#FF9800',
+                width=2,
+                dash=(5, 5),
+            )
+            return
+
         # Draw preview shape
         if self.current_tool in ['rectangle', 'circle']:
             self.current_shape = self.canvas.create_rectangle(
@@ -3092,6 +3173,26 @@ class AnnotationEditor:
             self.image = self.image.crop((int(ix1), int(iy1), int(ix2), int(iy2)))
             self.refresh_display()
             return
+        elif self.current_tool == 'highlight':
+            region = self.image.crop((int(ix1), int(iy1), int(ix2), int(iy2)))
+            overlay = Image.new('RGBA', region.size, self.current_color)
+            overlay.putalpha(89)
+            if region.mode != 'RGBA':
+                region = region.convert('RGBA')
+            region = Image.alpha_composite(region, overlay)
+            self.image.paste(region.convert('RGB'), (int(ix1), int(iy1)))
+        elif self.current_tool == 'blur':
+            region = self.image.crop((int(ix1), int(iy1), int(ix2), int(iy2)))
+            if self.blur_mode == 'pixelate':
+                bs = max(1, self.blur_intensity)
+                small_w = max(1, region.width // bs)
+                small_h = max(1, region.height // bs)
+                region = region.resize((small_w, small_h), Image.NEAREST)
+                region = region.resize((int(ix2) - int(ix1), int(iy2) - int(iy1)), Image.NEAREST)
+            else:
+                from PIL import ImageFilter
+                region = region.filter(ImageFilter.GaussianBlur(radius=self.blur_intensity))
+            self.image.paste(region, (int(ix1), int(iy1)))
 
         self.refresh_display()
 

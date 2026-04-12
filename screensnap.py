@@ -1581,6 +1581,7 @@ class AnnotationEditor:
         '#0000FF',  # Blue
         '#8B00FF',  # Purple
         '#FFFFFF',  # White
+        '#000000',  # Black
     ]
 
     def __init__(self, image: Image.Image, settings=None, library_path=None):
@@ -2093,6 +2094,15 @@ class AnnotationEditor:
                             command=lambda c=color: self.set_color(c))
             btn.pack(side='left', padx=2)
             self.color_buttons.append(btn)
+
+        # Custom color picker button
+        self._custom_color_btn = tk.Button(
+            toolbar, text="+", width=3, height=1, relief='flat', borderwidth=1,
+            bg=Theme.SURFACE, fg=Theme.ON_SURFACE, cursor='hand2',
+            font=("Segoe UI Bold", 9),
+            command=self._pick_custom_color,
+        )
+        self._custom_color_btn.pack(side='left', padx=2)
 
         tk.Frame(toolbar, width=1, bg=Theme.OUTLINE).pack(side='left', fill='y', padx=20)
 
@@ -2845,16 +2855,29 @@ class AnnotationEditor:
                 break
         self.selected_bubble_id = None
 
+    def _pick_custom_color(self):
+        """Open the system color chooser for a custom hex color."""
+        from tkinter import colorchooser
+        result = colorchooser.askcolor(
+            initialcolor=self.current_color,
+            title="Choose Color",
+        )
+        if result and result[1]:
+            self.set_color(result[1])
+
     def set_color(self, color):
         """Set the current drawing color with modern highlighting."""
         self.current_color = color
-        
-        # Update button states
+
+        # Update swatch highlights
         for btn in self.color_buttons:
             if btn.cget('bg') == color.lower():
                 btn.config(highlightthickness=2, highlightbackground=Theme.PRIMARY)
             else:
                 btn.config(highlightthickness=0)
+
+        # Show chosen color on the "+" button
+        self._custom_color_btn.config(bg=color)
     
     def update_stroke(self):
         """Update stroke width from spinner."""

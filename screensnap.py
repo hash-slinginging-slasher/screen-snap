@@ -2695,17 +2695,13 @@ class AnnotationEditor:
         text_h = len(text_lines) * (font_size + 4) + 16
         text_w = max(text_w, 80)
 
-        # Connector line
+        # Connector arrow (from bubble center to anchor point)
+        line_w = max(1, int(2 * z))
         elem['canvas_ids']['line'] = self.canvas.create_line(
-            ax, ay, bx + text_w / 2, by + text_h / 2,
-            fill=elem['color'], width=max(1, int(1.5 * z)),
-        )
-
-        # Anchor dot
-        dot_r = max(3, int(4 * z))
-        elem['canvas_ids']['anchor'] = self.canvas.create_oval(
-            ax - dot_r, ay - dot_r, ax + dot_r, ay + dot_r,
-            fill=elem['color'], outline='',
+            bx + text_w / 2, by + text_h / 2, ax, ay,
+            fill=elem['color'], width=line_w,
+            arrow='last',
+            arrowshape=(line_w * 5, line_w * 4, line_w * 2),
         )
 
         # Background rectangle
@@ -4399,15 +4395,29 @@ class AnnotationEditor:
             except:
                 font = ImageFont.load_default()
 
-            # Connector line
-            draw.line([(elem['anchor_x'], elem['anchor_y']),
-                       (elem['x'] + 40, elem['y'] + 20)],
-                      fill=elem['color'], width=2)
-
-            # Anchor dot
-            dot_r = 4
-            draw.ellipse([elem['anchor_x'] - dot_r, elem['anchor_y'] - dot_r,
-                          elem['anchor_x'] + dot_r, elem['anchor_y'] + dot_r],
+            # Connector arrow (from bubble center to anchor point)
+            font_size_b = elem['font_size']
+            text_lines_b = elem['text'].split('\n')
+            char_w_b = font_size_b * 0.6
+            tw_b = max(len(l) for l in text_lines_b) * char_w_b + 20
+            th_b = len(text_lines_b) * (font_size_b + 4) + 16
+            tw_b = max(tw_b, 80)
+            bcx = elem['x'] + tw_b / 2
+            bcy = elem['y'] + th_b / 2
+            ax_b, ay_b = elem['anchor_x'], elem['anchor_y']
+            # Draw line
+            draw.line([(bcx, bcy), (ax_b, ay_b)], fill=elem['color'], width=2)
+            # Draw arrowhead at anchor
+            import math as _m
+            angle = _m.atan2(ay_b - bcy, ax_b - bcx)
+            arrow_len = 12
+            arrow_w = 6
+            tip_x, tip_y = ax_b, ay_b
+            left_x = tip_x - arrow_len * _m.cos(angle) + arrow_w * _m.sin(angle)
+            left_y = tip_y - arrow_len * _m.sin(angle) - arrow_w * _m.cos(angle)
+            right_x = tip_x - arrow_len * _m.cos(angle) - arrow_w * _m.sin(angle)
+            right_y = tip_y - arrow_len * _m.sin(angle) + arrow_w * _m.cos(angle)
+            draw.polygon([(tip_x, tip_y), (left_x, left_y), (right_x, right_y)],
                          fill=elem['color'])
 
             # Background rectangle with semi-transparent fill

@@ -1658,6 +1658,15 @@ class AnnotationEditor:
         self.drag_bubble_offset_y = 0
         self.bubble_counter = 0
 
+        # Smart move tool state
+        self.smart_move_phase = 'select'  # 'select' or 'move'
+        self.smart_move_region = None     # (x1, y1, x2, y2) image coords
+        self.smart_move_snapshot = None   # Image copy of selected region
+        self.smart_move_preview_ids = []  # Canvas item IDs for preview
+        self.dragging_smart_move = False
+        self.smart_move_drag_start_x = 0
+        self.smart_move_drag_start_y = 0
+
         # Use the shared app root as a Toplevel
         master = _get_root()
         _clear_root(master)
@@ -2028,7 +2037,7 @@ class AnnotationEditor:
             ('Highlight', 'highlight', 'H'),
         ]
         self._overflow_tool_names = {t[1] for t in self.overflow_tools}
-        self._implemented_overflow = {'arrow', 'highlight', 'blur', 'stamp', 'bubble'}
+        self._implemented_overflow = {'arrow', 'highlight', 'blur', 'stamp', 'bubble', 'smart_move'}
 
         for label, tool, key in self.overflow_tools:
             if tool in self._implemented_overflow:
@@ -2131,6 +2140,18 @@ class AnnotationEditor:
     
     def set_tool(self, tool):
         """Set the current drawing tool with Midnight Architect styling."""
+        # Reset smart_move state when switching away
+        if hasattr(self, 'smart_move_phase') and self.current_tool == 'smart_move' and tool != 'smart_move':
+            self.smart_move_phase = 'select'
+            self.smart_move_region = None
+            self.smart_move_snapshot = None
+            for cid in getattr(self, 'smart_move_preview_ids', []):
+                try:
+                    self.canvas.delete(cid)
+                except:
+                    pass
+            self.smart_move_preview_ids = []
+
         self.current_tool = tool
         self.status_var.set(f"MODE: {tool.upper()}")
 
@@ -3297,6 +3318,16 @@ class AnnotationEditor:
                 self._add_bubble(ix, iy)
             return
 
+        elif self.current_tool == 'smart_move':
+            if self.smart_move_phase == 'move' and self.smart_move_region:
+                self.dragging_smart_move = True
+                self._drag_snapshot_taken = False
+                self.smart_move_drag_start_x = ix
+                self.smart_move_drag_start_y = iy
+                self.drawing = False
+            # else: selection phase — let normal drawing behavior handle it
+            return
+
     def on_canvas_drag(self, event):
         """Handle canvas mouse drag."""
         # Handle text dragging (elem['x']/['y'] are stored in IMAGE space,
@@ -3389,6 +3420,28 @@ class AnnotationEditor:
                     break
             return
 
+        # Handle smart move dragging
+        if self.dragging_smart_move:
+            cx, cy = self.get_canvas_coords(event)
+            z = self.zoom if self.zoom else 1.0
+            ix, iy = cx / z, cy / z
+            dx = ix - self.smart_move_drag_start_x
+            dy = iy - self.smart_move_drag_start_y
+            for cid in self.smart_move_preview_ids:
+                try:
+                    self.canvas.delete(cid)
+                except:
+                    pass
+            self.smart_move_preview_ids.clear()
+            r = self.smart_move_region
+            nx1, ny1 = (r[0] + dx) * z, (r[1] + dy) * z
+            nx2, ny2 = (r[2] + dx) * z, (r[3] + dy) * z
+            self.smart_move_preview_ids.append(
+                self.canvas.create_rectangle(nx1, ny1, nx2, ny2,
+                                             outline='#00FF00', width=2, dash=(5, 5))
+            )
+            return
+
         if not self.drawing or not self.current_tool:
             return
 
@@ -3455,6 +3508,16 @@ class AnnotationEditor:
             )
             return
 
+        # Draw preview for smart_move selection
+        if self.current_tool == 'smart_move' and self.smart_move_phase == 'select':
+            self.current_shape = self.canvas.create_rectangle(
+                self.start_x, self.start_y, x, y,
+                outline='#00FF00',
+                width=2,
+                dash=(5, 5),
+            )
+            return
+
         # Draw preview shape
         if self.current_tool in ['rectangle', 'circle']:
             self.current_shape = self.canvas.create_rectangle(
@@ -3498,6 +3561,71 @@ class AnnotationEditor:
         if self.dragging_bubble:
             self.dragging_bubble = False
             return
+
+        # Handle smart move release
+        if self.current_tool == 'smart_move':
+            if self.dragging_smart_move:
+                self.dragging_smart_move = False
+                cx, cy = self.get_canvas_coords(event)
+                z = self.zoom if self.zoom else 1.0
+                ix, iy = cx / z, cy / z
+                dx = ix - self.smart_move_drag_start_x
+                dy = iy - self.smart_move_drag_start_y
+
+                self.save_state()
+                r = self.smart_move_region
+                # Fill vacated area
+                self._fill_vacated_region(int(r[0]), int(r[1]), int(r[2]), int(r[3]))
+                # Paste at new position
+                new_x = int(r[0] + dx)
+                new_y = int(r[1] + dy)
+                self.image.paste(self.smart_move_snapshot, (new_x, new_y))
+
+                # Clean up
+                for cid in self.smart_move_preview_ids:
+                    try:
+                        self.canvas.delete(cid)
+                    except:
+                        pass
+                self.smart_move_preview_ids.clear()
+                self.smart_move_phase = 'select'
+                self.smart_move_region = None
+                self.smart_move_snapshot = None
+                self.refresh_display()
+                return
+
+            elif self.smart_move_phase == 'select' and self.drawing:
+                # Region selection complete — enter move phase
+                self.drawing = False
+                x, y = self.get_canvas_coords(event)
+                if self.current_shape:
+                    self.canvas.delete(self.current_shape)
+                    self.current_shape = None
+
+                z = self.zoom if self.zoom else 1.0
+                ix1 = min(self.start_x, x) / z
+                iy1 = min(self.start_y, y) / z
+                ix2 = max(self.start_x, x) / z
+                iy2 = max(self.start_y, y) / z
+
+                if ix2 - ix1 < 5 or iy2 - iy1 < 5:
+                    return
+
+                self.smart_move_region = (ix1, iy1, ix2, iy2)
+                self.smart_move_snapshot = self.image.crop(
+                    (int(ix1), int(iy1), int(ix2), int(iy2))
+                ).copy()
+                self.smart_move_phase = 'move'
+
+                # Show dashed selection on canvas
+                self.smart_move_preview_ids.append(
+                    self.canvas.create_rectangle(
+                        ix1 * z, iy1 * z, ix2 * z, iy2 * z,
+                        outline='#00FF00', width=2, dash=(5, 5)
+                    )
+                )
+                self.status_var.set("SMART MOVE: Drag selection to new position")
+                return
 
         if not self.drawing or not self.current_tool:
             return
@@ -3594,6 +3722,55 @@ class AnnotationEditor:
             self.image.paste(region, (int(ix1), int(iy1)))
 
         self.refresh_display()
+
+    def _fill_vacated_region(self, x1, y1, x2, y2):
+        """Fill a vacated rectangle by sampling border pixels and blending inward."""
+        img = self.image
+        w, h = img.size
+        border = min(16, (x2 - x1) // 2, (y2 - y1) // 2)
+        if border < 1:
+            border = 1
+
+        for y in range(max(0, y1), min(h, y2)):
+            for x in range(max(0, x1), min(w, x2)):
+                dl = x - x1
+                dr = x2 - 1 - x
+                dt = y - y1
+                db = y2 - 1 - y
+
+                samples = []
+                weights = []
+
+                if dl < border and x1 > 0:
+                    src_x = max(0, x1 - 1)
+                    w_val = 1.0 - (dl / border)
+                    samples.append(img.getpixel((src_x, min(y, h - 1))))
+                    weights.append(w_val)
+
+                if dr < border and x2 < w:
+                    src_x = min(w - 1, x2)
+                    w_val = 1.0 - (dr / border)
+                    samples.append(img.getpixel((src_x, min(y, h - 1))))
+                    weights.append(w_val)
+
+                if dt < border and y1 > 0:
+                    src_y = max(0, y1 - 1)
+                    w_val = 1.0 - (dt / border)
+                    samples.append(img.getpixel((min(x, w - 1), src_y)))
+                    weights.append(w_val)
+
+                if db < border and y2 < h:
+                    src_y = min(h - 1, y2)
+                    w_val = 1.0 - (db / border)
+                    samples.append(img.getpixel((min(x, w - 1), src_y)))
+                    weights.append(w_val)
+
+                if samples and weights:
+                    total_w = sum(weights)
+                    r = sum(s[0] * wt for s, wt in zip(samples, weights)) / total_w
+                    g = sum(s[1] * wt for s, wt in zip(samples, weights)) / total_w
+                    b = sum(s[2] * wt for s, wt in zip(samples, weights)) / total_w
+                    img.putpixel((x, y), (int(r), int(g), int(b)))
 
     def on_canvas_motion(self, event):
         """Handle mouse motion for hover cursor feedback."""

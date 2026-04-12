@@ -1644,6 +1644,20 @@ class AnnotationEditor:
         self.stamp_categories = {}       # {category_name: [filepath, ...]}
         self._stamp_cache = {}           # {(filepath, render_size): PIL.Image}
         self._stamps_dir = self._get_stamps_dir()
+        self.stamp_elements = []
+        self.stamp_counter = 0
+        self.selected_stamp_id = None
+        self.dragging_stamp = False
+        self.drag_stamp_offset_x = 0
+        self.drag_stamp_offset_y = 0
+
+        # Shape elements (deferred rendering for rectangle, circle, line, arrow, highlight)
+        self.shape_elements = []
+        self.shape_counter = 0
+        self.selected_shape_id = None
+        self.dragging_shape = False
+        self.drag_shape_offset_x = 0
+        self.drag_shape_offset_y = 0
 
         # Bubble tool properties
         self.bubble_elements = []
@@ -2503,7 +2517,7 @@ class AnnotationEditor:
         self._update_stamp_buttons()
 
     def _place_stamp(self, ix, iy):
-        """Place the selected stamp at image coordinates with shadow."""
+        """Place the selected stamp at image coordinates with shadow (deferred rendering)."""
         if self.stamp_selected is None:
             self.status_var.set("No stamp selected")
             return
@@ -2512,16 +2526,12 @@ class AnnotationEditor:
         SS = 4
         big_size = size * SS
 
-        # Load stamp at supersampled size
         stamp_img = self._load_stamp_image(self.stamp_selected, big_size)
 
-        # Create shadow from stamp silhouette
         from PIL import ImageFilter
         shadow_off = max(1, SS)
         shadow_tile = Image.new('RGBA', (big_size, big_size), (0, 0, 0, 0))
-        # Use stamp alpha as shadow shape
         shadow_shape = stamp_img.copy()
-        # Make shadow black with original alpha
         r, g, b, a = shadow_shape.split()
         shadow_shape = Image.merge('RGBA', (
             a.point(lambda _: 0),
@@ -2532,25 +2542,116 @@ class AnnotationEditor:
         shadow_tile.paste(shadow_shape, (shadow_off, shadow_off * 2), shadow_shape)
         shadow_tile = shadow_tile.filter(ImageFilter.GaussianBlur(radius=SS * 2))
 
-        # Composite: shadow under stamp
         tile = Image.new('RGBA', (big_size, big_size), (0, 0, 0, 0))
         tile = Image.alpha_composite(tile, shadow_tile)
         tile.paste(stamp_img, (0, 0), stamp_img)
 
-        # Downsample
         final = tile.resize((size, size), Image.LANCZOS)
 
-        # Paste onto image
-        paste_x = int(ix - size // 2)
-        paste_y = int(iy - size // 2)
-
-        if self.image.mode != 'RGBA':
-            self.image = self.image.convert('RGBA')
-        base = self.image.copy()
-        base.paste(final, (paste_x, paste_y), final)
-        self.image = base.convert('RGB')
-
+        self.stamp_counter += 1
+        elem = {
+            'id': self.stamp_counter,
+            'x': ix,
+            'y': iy,
+            'filepath': str(self.stamp_selected),
+            'size': size,
+            'tile': final,
+            'canvas_id': None,
+            'photo': None,
+        }
+        self.stamp_elements.append(elem)
+        self._render_stamp_canvas(elem)
         self.refresh_display()
+
+    def _render_stamp_canvas(self, elem):
+        z = self.zoom if self.zoom else 1.0
+        if elem.get('canvas_id'):
+            try:
+                self.canvas.delete(elem['canvas_id'])
+            except Exception:
+                pass
+        tile = elem['tile']
+        display_size = max(1, int(elem['size'] * z))
+        display_tile = tile.resize((display_size, display_size), Image.LANCZOS) if abs(z - 1.0) > 0.01 else tile
+        photo = ImageTk.PhotoImage(display_tile)
+        elem['photo'] = photo
+        cx = (elem['x'] - elem['size'] // 2) * z
+        cy = (elem['y'] - elem['size'] // 2) * z
+        elem['canvas_id'] = self.canvas.create_image(cx, cy, image=photo, anchor='nw')
+
+    def _find_stamp_at(self, x, y):
+        for elem in reversed(self.stamp_elements):
+            half = elem['size'] // 2
+            if (elem['x'] - half <= x <= elem['x'] + half and
+                elem['y'] - half <= y <= elem['y'] + half):
+                return elem
+        return None
+
+    def _render_shape_canvas(self, elem):
+        z = self.zoom if self.zoom else 1.0
+        if elem.get('canvas_id'):
+            try:
+                self.canvas.delete(elem['canvas_id'])
+            except Exception:
+                pass
+        t = elem['type']
+        if t == 'rectangle':
+            elem['canvas_id'] = self.canvas.create_rectangle(
+                elem['x1']*z, elem['y1']*z, elem['x2']*z, elem['y2']*z,
+                outline=elem['color'], width=elem['stroke_width'])
+        elif t == 'circle':
+            elem['canvas_id'] = self.canvas.create_oval(
+                elem['x1']*z, elem['y1']*z, elem['x2']*z, elem['y2']*z,
+                outline=elem['color'], width=elem['stroke_width'])
+        elif t == 'line':
+            elem['canvas_id'] = self.canvas.create_line(
+                elem['x1']*z, elem['y1']*z, elem['x2']*z, elem['y2']*z,
+                fill=elem['color'], width=elem['stroke_width'])
+        elif t == 'arrow':
+            elem['canvas_id'] = self.canvas.create_line(
+                elem['x1']*z, elem['y1']*z, elem['x2']*z, elem['y2']*z,
+                fill=elem['color'], width=elem['stroke_width'],
+                arrow='both' if elem.get('arrow_heads') == 'double' else 'last',
+                arrowshape=(elem['stroke_width']*4, elem['stroke_width']*3, elem['stroke_width']*1))
+        elif t == 'highlight':
+            elem['canvas_id'] = self.canvas.create_rectangle(
+                elem['x1']*z, elem['y1']*z, elem['x2']*z, elem['y2']*z,
+                outline=elem['color'], fill=elem['color'], stipple='gray25', width=1)
+
+    def _find_shape_at(self, x, y):
+        for elem in reversed(self.shape_elements):
+            x1, y1, x2, y2 = elem['x1'], elem['y1'], elem['x2'], elem['y2']
+            nx1, ny1 = min(x1, x2), min(y1, y2)
+            nx2, ny2 = max(x1, x2), max(y1, y2)
+            margin = max(8, elem.get('stroke_width', 3) * 2)
+            if elem['type'] in ('rectangle', 'circle', 'highlight'):
+                if elem['type'] == 'highlight':
+                    if nx1 <= x <= nx2 and ny1 <= y <= ny2:
+                        return elem
+                else:
+                    if (nx1 - margin <= x <= nx2 + margin and ny1 - margin <= y <= ny2 + margin):
+                        near_left = abs(x - nx1) < margin
+                        near_right = abs(x - nx2) < margin
+                        near_top = abs(y - ny1) < margin
+                        near_bottom = abs(y - ny2) < margin
+                        inside_x = nx1 <= x <= nx2
+                        inside_y = ny1 <= y <= ny2
+                        if (near_left and inside_y) or (near_right and inside_y) or \
+                           (near_top and inside_x) or (near_bottom and inside_x):
+                            return elem
+            elif elem['type'] in ('line', 'arrow'):
+                dx, dy = x2 - x1, y2 - y1
+                length_sq = dx*dx + dy*dy
+                if length_sq == 0:
+                    dist = math.hypot(x - x1, y - y1)
+                else:
+                    t = max(0, min(1, ((x - x1)*dx + (y - y1)*dy) / length_sq))
+                    proj_x = x1 + t * dx
+                    proj_y = y1 + t * dy
+                    dist = math.hypot(x - proj_x, y - proj_y)
+                if dist < margin:
+                    return elem
+        return None
 
     def _add_bubble(self, anchor_x, anchor_y):
         """Create a new speech bubble at the given anchor point."""
@@ -3398,9 +3499,17 @@ class AnnotationEditor:
                 self.add_step_element(ix, iy)
 
         elif self.current_tool == 'stamp':
-            self.drawing = False
-            self.save_state()
-            self._place_stamp(ix, iy)
+            clicked_stamp = self._find_stamp_at(ix, iy)
+            if clicked_stamp:
+                self.selected_stamp_id = clicked_stamp['id']
+                self.dragging_stamp = True
+                self._drag_snapshot_taken = False
+                self.drag_stamp_offset_x = ix - clicked_stamp['x']
+                self.drag_stamp_offset_y = iy - clicked_stamp['y']
+            else:
+                self.drawing = False
+                self.save_state()
+                self._place_stamp(ix, iy)
             return
 
         elif self.current_tool == 'bubble':
@@ -3425,6 +3534,19 @@ class AnnotationEditor:
                 self.drawing = False
             # else: selection phase — let normal drawing behavior handle it
             return
+
+        if self.current_tool in ('rectangle', 'circle', 'line', 'arrow', 'highlight'):
+            clicked_shape = self._find_shape_at(ix, iy)
+            if clicked_shape:
+                self.selected_shape_id = clicked_shape['id']
+                self.dragging_shape = True
+                self._drag_snapshot_taken = False
+                mid_x = (clicked_shape['x1'] + clicked_shape['x2']) / 2
+                mid_y = (clicked_shape['y1'] + clicked_shape['y2']) / 2
+                self.drag_shape_offset_x = ix - mid_x
+                self.drag_shape_offset_y = iy - mid_y
+                self.drawing = False
+                return
 
     def on_canvas_drag(self, event):
         """Handle canvas mouse drag."""
@@ -3515,6 +3637,48 @@ class AnnotationEditor:
                     elem['x'] = ix - self.drag_bubble_offset_x
                     elem['y'] = iy - self.drag_bubble_offset_y
                     self._render_bubble_canvas(elem)
+                    break
+            return
+
+        # Handle stamp dragging
+        if self.dragging_stamp and self.selected_stamp_id is not None:
+            if not getattr(self, '_drag_snapshot_taken', False):
+                self.save_state()
+                self._drag_snapshot_taken = True
+            cx, cy = self.get_canvas_coords(event)
+            z = self.zoom if self.zoom else 1.0
+            ix, iy = cx / z, cy / z
+            for elem in self.stamp_elements:
+                if elem['id'] == self.selected_stamp_id:
+                    new_x = ix - self.drag_stamp_offset_x
+                    new_y = iy - self.drag_stamp_offset_y
+                    elem['x'] = new_x
+                    elem['y'] = new_y
+                    self._render_stamp_canvas(elem)
+                    break
+            return
+
+        # Handle shape dragging
+        if self.dragging_shape and self.selected_shape_id is not None:
+            if not getattr(self, '_drag_snapshot_taken', False):
+                self.save_state()
+                self._drag_snapshot_taken = True
+            cx, cy = self.get_canvas_coords(event)
+            z = self.zoom if self.zoom else 1.0
+            ix, iy = cx / z, cy / z
+            for elem in self.shape_elements:
+                if elem['id'] == self.selected_shape_id:
+                    mid_x = (elem['x1'] + elem['x2']) / 2
+                    mid_y = (elem['y1'] + elem['y2']) / 2
+                    new_mid_x = ix - self.drag_shape_offset_x
+                    new_mid_y = iy - self.drag_shape_offset_y
+                    dx = new_mid_x - mid_x
+                    dy = new_mid_y - mid_y
+                    elem['x1'] += dx
+                    elem['y1'] += dy
+                    elem['x2'] += dx
+                    elem['y2'] += dy
+                    self._render_shape_canvas(elem)
                     break
             return
 
@@ -3660,6 +3824,14 @@ class AnnotationEditor:
             self.dragging_bubble = False
             return
 
+        if self.dragging_stamp:
+            self.dragging_stamp = False
+            return
+
+        if self.dragging_shape:
+            self.dragging_shape = False
+            return
+
         # Handle smart move release
         if self.current_tool == 'smart_move':
             if self.dragging_smart_move:
@@ -3749,21 +3921,27 @@ class AnnotationEditor:
         # Save state for undo (and invalidate redo stack)
         self.save_state()
 
-        # Arrow tool — uses directional start->end, not normalized bounds
+        # Arrow tool — deferred rendering as shape element
         if self.current_tool == 'arrow':
             z = self.zoom if self.zoom else 1.0
             ax1, ay1 = self.start_x / z, self.start_y / z
             ax2, ay2 = x / z, y / z
-            # Skip if arrow is too short
             length = math.hypot(ax2 - ax1, ay2 - ay1)
             if length < 5:
                 return
-            draw = ImageDraw.Draw(self.image)
-            self._draw_arrow_on_image(
-                draw, ax1, ay1, ax2, ay2,
-                self.current_color, self.stroke_width,
-                self.arrow_style, self.arrow_heads,
-            )
+            self.shape_counter += 1
+            elem = {
+                'id': self.shape_counter,
+                'type': 'arrow',
+                'x1': ax1, 'y1': ay1, 'x2': ax2, 'y2': ay2,
+                'color': self.current_color,
+                'stroke_width': self.stroke_width,
+                'arrow_style': self.arrow_style,
+                'arrow_heads': self.arrow_heads,
+                'canvas_id': None,
+            }
+            self.shape_elements.append(elem)
+            self._render_shape_canvas(elem)
             self.refresh_display()
             return
 
@@ -3772,40 +3950,60 @@ class AnnotationEditor:
         ix1, iy1 = x1 / z, y1 / z
         ix2, iy2 = x2 / z, y2 / z
 
-        # Draw shape on image
-        draw = ImageDraw.Draw(self.image)
-
         if self.current_tool == 'rectangle':
-            draw.rectangle(
-                [ix1, iy1, ix2, iy2],
-                outline=self.current_color,
-                width=self.stroke_width
-            )
+            self.shape_counter += 1
+            elem = {
+                'id': self.shape_counter,
+                'type': 'rectangle',
+                'x1': ix1, 'y1': iy1, 'x2': ix2, 'y2': iy2,
+                'color': self.current_color,
+                'stroke_width': self.stroke_width,
+                'canvas_id': None,
+            }
+            self.shape_elements.append(elem)
+            self._render_shape_canvas(elem)
         elif self.current_tool == 'line':
-            draw.line(
-                [(ix1, iy1), (ix2, iy2)],
-                fill=self.current_color,
-                width=self.stroke_width
-            )
+            lx1, ly1 = self.start_x / z, self.start_y / z
+            lx2, ly2 = x / z, y / z
+            self.shape_counter += 1
+            elem = {
+                'id': self.shape_counter,
+                'type': 'line',
+                'x1': lx1, 'y1': ly1, 'x2': lx2, 'y2': ly2,
+                'color': self.current_color,
+                'stroke_width': self.stroke_width,
+                'canvas_id': None,
+            }
+            self.shape_elements.append(elem)
+            self._render_shape_canvas(elem)
         elif self.current_tool == 'circle':
-            draw.ellipse(
-                [ix1, iy1, ix2, iy2],
-                outline=self.current_color,
-                width=self.stroke_width
-            )
+            self.shape_counter += 1
+            elem = {
+                'id': self.shape_counter,
+                'type': 'circle',
+                'x1': ix1, 'y1': iy1, 'x2': ix2, 'y2': iy2,
+                'color': self.current_color,
+                'stroke_width': self.stroke_width,
+                'canvas_id': None,
+            }
+            self.shape_elements.append(elem)
+            self._render_shape_canvas(elem)
         elif self.current_tool == 'crop':
-            # Crop the image
             self.image = self.image.crop((int(ix1), int(iy1), int(ix2), int(iy2)))
             self.refresh_display()
             return
         elif self.current_tool == 'highlight':
-            region = self.image.crop((int(ix1), int(iy1), int(ix2), int(iy2)))
-            overlay = Image.new('RGBA', region.size, self.current_color)
-            overlay.putalpha(89)
-            if region.mode != 'RGBA':
-                region = region.convert('RGBA')
-            region = Image.alpha_composite(region, overlay)
-            self.image.paste(region.convert('RGB'), (int(ix1), int(iy1)))
+            self.shape_counter += 1
+            elem = {
+                'id': self.shape_counter,
+                'type': 'highlight',
+                'x1': ix1, 'y1': iy1, 'x2': ix2, 'y2': iy2,
+                'color': self.current_color,
+                'stroke_width': 1,
+                'canvas_id': None,
+            }
+            self.shape_elements.append(elem)
+            self._render_shape_canvas(elem)
         elif self.current_tool == 'blur':
             region = self.image.crop((int(ix1), int(iy1), int(ix2), int(iy2)))
             if self.blur_mode == 'pixelate':
@@ -3872,15 +4070,26 @@ class AnnotationEditor:
 
     def on_canvas_motion(self, event):
         """Handle mouse motion for hover cursor feedback."""
-        if self.dragging_text or self.dragging_step or self.drawing:
+        if self.dragging_text or self.dragging_step or self.dragging_stamp or self.dragging_shape or self.drawing:
             return
 
         x, y = self.get_canvas_coords(event)
+        z = self.zoom if self.zoom else 1.0
+        ix, iy = x / z, y / z
 
-        # Check if hovering over a step
         if self.current_tool == 'step':
             hovered = self.find_step_at_position(x, y)
             if hovered:
+                self.canvas.config(cursor="hand2")
+            else:
+                self.canvas.config(cursor="")
+        elif self.current_tool == 'stamp':
+            if self._find_stamp_at(ix, iy):
+                self.canvas.config(cursor="hand2")
+            else:
+                self.canvas.config(cursor="")
+        elif self.current_tool in ('rectangle', 'circle', 'line', 'arrow', 'highlight'):
+            if self._find_shape_at(ix, iy):
                 self.canvas.config(cursor="hand2")
             else:
                 self.canvas.config(cursor="")
@@ -4066,6 +4275,14 @@ class AnnotationEditor:
         for elem in self.bubble_elements:
             self._render_bubble_canvas(elem)
 
+        # Stamps: re-render at the current zoom.
+        for elem in self.stamp_elements:
+            self._render_stamp_canvas(elem)
+
+        # Shapes: re-render at the current zoom.
+        for elem in self.shape_elements:
+            self._render_shape_canvas(elem)
+
     def on_scroll_vertical(self, event):
         """Plain wheel pans the canvas vertically. Never zooms."""
         if getattr(event, 'delta', 0) == 0:
@@ -4117,8 +4334,49 @@ class AnnotationEditor:
     
     def render_annotations_to_image(self):
         """Render all text and step elements to the image before saving."""
-        # Deselect all text first to remove selection boxes
         self.deselect_all()
+
+        # Render shape elements first
+        draw = ImageDraw.Draw(self.image)
+        for elem in self.shape_elements:
+            t = elem['type']
+            if t == 'rectangle':
+                draw.rectangle([elem['x1'], elem['y1'], elem['x2'], elem['y2']],
+                               outline=elem['color'], width=elem['stroke_width'])
+            elif t == 'circle':
+                draw.ellipse([elem['x1'], elem['y1'], elem['x2'], elem['y2']],
+                             outline=elem['color'], width=elem['stroke_width'])
+            elif t == 'line':
+                draw.line([(elem['x1'], elem['y1']), (elem['x2'], elem['y2'])],
+                          fill=elem['color'], width=elem['stroke_width'])
+            elif t == 'arrow':
+                self._draw_arrow_on_image(draw, elem['x1'], elem['y1'], elem['x2'], elem['y2'],
+                                          elem['color'], elem['stroke_width'],
+                                          elem.get('arrow_style', 'filled'), elem.get('arrow_heads', 'single'))
+            elif t == 'highlight':
+                hx1, hy1 = int(min(elem['x1'], elem['x2'])), int(min(elem['y1'], elem['y2']))
+                hx2, hy2 = int(max(elem['x1'], elem['x2'])), int(max(elem['y1'], elem['y2']))
+                if hx2 > hx1 and hy2 > hy1:
+                    region = self.image.crop((hx1, hy1, hx2, hy2))
+                    overlay = Image.new('RGBA', region.size, elem['color'])
+                    overlay.putalpha(89)
+                    if region.mode != 'RGBA':
+                        region = region.convert('RGBA')
+                    region = Image.alpha_composite(region, overlay)
+                    self.image.paste(region.convert('RGB'), (hx1, hy1))
+                    draw = ImageDraw.Draw(self.image)
+
+        # Render stamp elements
+        for elem in self.stamp_elements:
+            tile = elem['tile']
+            paste_x = int(elem['x'] - elem['size'] // 2)
+            paste_y = int(elem['y'] - elem['size'] // 2)
+            if self.image.mode != 'RGBA':
+                self.image = self.image.convert('RGBA')
+            base = self.image.copy()
+            base.paste(tile, (paste_x, paste_y), tile)
+            self.image = base.convert('RGB')
+            draw = ImageDraw.Draw(self.image)
 
         # Render text elements
         draw = ImageDraw.Draw(self.image)
@@ -4370,6 +4628,10 @@ class AnnotationEditor:
             'step_counter': self.step_counter,
             'bubble_elements': [dict(e, canvas_ids={}) for e in self.bubble_elements],
             'bubble_counter': self.bubble_counter,
+            'stamp_elements': [dict(e, canvas_id=None, photo=None, tile=e['tile'].copy()) for e in self.stamp_elements],
+            'stamp_counter': self.stamp_counter,
+            'shape_elements': [dict(e, canvas_id=None) for e in self.shape_elements],
+            'shape_counter': self.shape_counter,
         }
 
     def save_state(self):
@@ -4421,6 +4683,21 @@ class AnnotationEditor:
                 except Exception:
                     pass
             elem['canvas_ids'] = {}
+        for elem in self.stamp_elements:
+            if elem.get('canvas_id'):
+                try:
+                    self.canvas.delete(elem['canvas_id'])
+                except Exception:
+                    pass
+                elem['canvas_id'] = None
+            elem.pop('photo', None)
+        for elem in self.shape_elements:
+            if elem.get('canvas_id'):
+                try:
+                    self.canvas.delete(elem['canvas_id'])
+                except Exception:
+                    pass
+                elem['canvas_id'] = None
         # Remove any leftover selection visuals (cursors / dashed borders).
         try:
             self.canvas.delete('selection')
@@ -4456,6 +4733,16 @@ class AnnotationEditor:
         for elem in self.bubble_elements:
             elem['canvas_ids'] = {}
             self._render_bubble_canvas(elem)
+
+        # Restore stamps
+        self.stamp_elements = [dict(e, canvas_id=None, photo=None, tile=e['tile'].copy()) for e in state.get('stamp_elements', [])]
+        self.stamp_counter = state.get('stamp_counter', 0)
+        self.selected_stamp_id = None
+
+        # Restore shapes
+        self.shape_elements = [dict(e, canvas_id=None) for e in state.get('shape_elements', [])]
+        self.shape_counter = state.get('shape_counter', 0)
+        self.selected_shape_id = None
 
         # Redraw the background image at the current zoom and force a
         # rebuild of every text / step overlay from the restored lists.

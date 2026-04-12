@@ -2460,15 +2460,15 @@ class AnnotationEditor:
                     font = ImageFont.truetype("arial.ttf", font_size)
                 except:
                     font = ImageFont.load_default()
-                # Handle text-anchor
-                anchor = elem.get('text-anchor', 'start')
-                if anchor == 'middle':
-                    bbox = draw.textbbox((0, 0), text_content, font=font)
-                    tw = bbox[2] - bbox[0]
-                    th = bbox[3] - bbox[1]
-                    x -= tw / 2
-                    y -= th / 2
-                draw.text((x, y), text_content, fill=color, font=font)
+                # Handle text-anchor: SVG y is the baseline, not top
+                text_anchor = elem.get('text-anchor', 'start')
+                if text_anchor == 'middle':
+                    # anchor="ms" = middle-x, baseline-y (matches SVG semantics)
+                    draw.text((x, y), text_content, fill=color, font=font, anchor="ms")
+                elif text_anchor == 'end':
+                    draw.text((x, y), text_content, fill=color, font=font, anchor="rs")
+                else:
+                    draw.text((x, y), text_content, fill=color, font=font, anchor="ls")
 
         return img
 

@@ -1583,13 +1583,6 @@ class AnnotationEditor:
         '#FFFFFF',  # White
     ]
 
-    STAMP_CATEGORIES = {
-        'status': ['checkmark', 'cross', 'warning', 'info', 'question'],
-        'reaction': ['thumbs_up', 'heart', 'star'],
-        'technical': ['bug', 'lock', 'lightbulb', 'gear'],
-        'emoji': ['happy', 'sad', 'neutral'],
-    }
-    
     def __init__(self, image: Image.Image, settings=None, library_path=None):
         self.image = image.copy()
         self.original_image = image.copy()
@@ -1646,9 +1639,11 @@ class AnnotationEditor:
         self.blur_intensity = 15       # block_size (pixelate) or radius (gaussian)
 
         # Stamp tool properties
-        self.stamp_category = 'status'
-        self.stamp_selected = 'checkmark'
         self.stamp_size = 40
+        self.stamp_selected = None       # filepath of selected stamp
+        self.stamp_categories = {}       # {category_name: [filepath, ...]}
+        self._stamp_cache = {}           # {(filepath, render_size): PIL.Image}
+        self._stamps_dir = self._get_stamps_dir()
 
         # Bubble tool properties
         self.bubble_elements = []
@@ -1844,17 +1839,15 @@ class AnnotationEditor:
 
         tk.Label(self.stamp_props_frame, text="Category", font=Theme.FONT_LABEL,
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
-        self.stamp_category_var = tk.StringVar(value='status')
-        cat_combo = ttk.Combobox(self.stamp_props_frame, textvariable=self.stamp_category_var,
-                                 values=list(self.STAMP_CATEGORIES.keys()),
-                                 state='readonly', width=10)
-        cat_combo.pack(side='left', padx=(0, 10))
-        cat_combo.bind('<<ComboboxSelected>>', lambda e: self._update_stamp_buttons())
+        self.stamp_category_var = tk.StringVar(value='')
+        self.stamp_cat_combo = ttk.Combobox(self.stamp_props_frame, textvariable=self.stamp_category_var,
+                                            values=[], state='readonly', width=10)
+        self.stamp_cat_combo.pack(side='left', padx=(0, 10))
+        self.stamp_cat_combo.bind('<<ComboboxSelected>>', lambda e: self._update_stamp_buttons())
 
         self.stamp_btn_frame = tk.Frame(self.stamp_props_frame, bg=Theme.SURFACE)
         self.stamp_btn_frame.pack(side='left', padx=(0, 10))
         self._stamp_buttons = []
-        self._update_stamp_buttons()
 
         tk.Label(self.stamp_props_frame, text="Size", font=Theme.FONT_LABEL,
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
@@ -2218,6 +2211,16 @@ class AnnotationEditor:
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
             self.bubble_props_frame.pack_forget()
+            # Scan stamps folder and populate category dropdown
+            self._scan_stamps()
+            categories = list(self.stamp_categories.keys())
+            self.stamp_cat_combo['values'] = categories
+            if categories:
+                if self.stamp_category_var.get() not in categories:
+                    self.stamp_category_var.set(categories[0])
+                self._update_stamp_buttons()
+            else:
+                self.status_var.set("No stamps found — add .svg/.png files to stamps/ subfolders")
         elif tool == 'bubble':
             self.bubble_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
@@ -2293,154 +2296,132 @@ class AnnotationEditor:
             self.blur_gaussian_btn.config(bg=Theme.PRIMARY, fg="#000000")
             self.blur_pixelate_btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
 
+    @staticmethod
+    def _get_stamps_dir():
+        """Return the stamps directory path (next to script or EXE)."""
+        if getattr(sys, 'frozen', False):
+            base = Path(sys.executable).parent
+        else:
+            base = Path(__file__).parent
+        return base / 'stamps'
+
+    def _scan_stamps(self):
+        """Scan the stamps directory and populate self.stamp_categories."""
+        self.stamp_categories.clear()
+        stamps_dir = self._stamps_dir
+        if not stamps_dir.is_dir():
+            return
+
+        valid_exts = {'.svg', '.png', '.jpg', '.jpeg', '.bmp', '.gif'}
+        for subdir in sorted(stamps_dir.iterdir()):
+            if not subdir.is_dir():
+                continue
+            files = []
+            for f in sorted(subdir.iterdir()):
+                if f.suffix.lower() in valid_exts:
+                    files.append(f)
+            if files:
+                self.stamp_categories[subdir.name] = files
+
+    def _load_stamp_image(self, filepath, render_size):
+        """Load a stamp file as a PIL RGBA Image at the given size. Cached."""
+        cache_key = (str(filepath), render_size)
+        if cache_key in self._stamp_cache:
+            return self._stamp_cache[cache_key]
+
+        filepath = Path(filepath)
+        ext = filepath.suffix.lower()
+
+        if ext == '.svg':
+            # Auto-install cairosvg if needed
+            try:
+                import cairosvg
+            except ImportError:
+                subprocess.check_call(
+                    [sys.executable, '-m', 'pip', 'install', '--quiet', 'cairosvg'],
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+                )
+                import cairosvg
+            png_data = cairosvg.svg2png(
+                url=str(filepath),
+                output_width=render_size,
+                output_height=render_size,
+            )
+            img = Image.open(io.BytesIO(png_data)).convert('RGBA')
+        else:
+            img = Image.open(filepath).convert('RGBA')
+            img = img.resize((render_size, render_size), Image.LANCZOS)
+
+        self._stamp_cache[cache_key] = img
+        return img
+
     def _update_stamp_buttons(self):
         """Rebuild stamp selection buttons for the current category."""
         for btn in self._stamp_buttons:
             btn.destroy()
         self._stamp_buttons.clear()
+
         category = self.stamp_category_var.get()
-        stamps = self.STAMP_CATEGORIES.get(category, [])
-        for name in stamps:
-            display = name.replace('_', ' ').title()
+        files = self.stamp_categories.get(category, [])
+        for filepath in files:
+            display = filepath.stem.replace('-', ' ').replace('_', ' ').title()
             btn = ModernButton(
                 self.stamp_btn_frame,
                 text=display,
-                variant="primary" if name == self.stamp_selected else "tool",
-                command=lambda n=name: self._select_stamp(n),
+                variant="primary" if filepath == self.stamp_selected else "tool",
+                command=lambda f=filepath: self._select_stamp(f),
                 font=("Segoe UI Bold", 8),
             )
             btn.pack(side='left', padx=1)
             self._stamp_buttons.append(btn)
 
-    def _select_stamp(self, name):
-        """Select a stamp from the library."""
-        self.stamp_selected = name
+        # Auto-select first stamp if none selected
+        if files and (self.stamp_selected is None or self.stamp_selected not in files):
+            self.stamp_selected = files[0]
+            self._update_stamp_buttons()
+
+    def _select_stamp(self, filepath):
+        """Select a stamp file from the library."""
+        self.stamp_selected = filepath
         self._update_stamp_buttons()
 
-    @staticmethod
-    def _draw_stamp(draw, name, cx, cy, size, color):
-        """Draw a named stamp icon centered at (cx, cy)."""
-        r = size // 2
-        s = size
-
-        if name == 'checkmark':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            lw = max(1, s // 8)
-            draw.line([(cx - r*0.35, cy), (cx - r*0.05, cy + r*0.35)], fill='white', width=lw)
-            draw.line([(cx - r*0.05, cy + r*0.35), (cx + r*0.4, cy - r*0.3)], fill='white', width=lw)
-        elif name == 'cross':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            lw = max(1, s // 8)
-            off = r * 0.35
-            draw.line([(cx-off, cy-off), (cx+off, cy+off)], fill='white', width=lw)
-            draw.line([(cx+off, cy-off), (cx-off, cy+off)], fill='white', width=lw)
-        elif name == 'warning':
-            pts = [(cx, cy - r), (cx - r, cy + r), (cx + r, cy + r)]
-            draw.polygon(pts, fill=color)
-            lw = max(1, s // 10)
-            draw.line([(cx, cy - r*0.2), (cx, cy + r*0.25)], fill='white', width=lw)
-            draw.ellipse([cx - lw, cy + r*0.4 - lw, cx + lw, cy + r*0.4 + lw], fill='white')
-        elif name == 'info':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            lw = max(1, s // 10)
-            draw.ellipse([cx-lw, cy-r*0.5-lw, cx+lw, cy-r*0.5+lw], fill='white')
-            draw.line([(cx, cy - r*0.15), (cx, cy + r*0.5)], fill='white', width=lw)
-        elif name == 'question':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            lw = max(1, s // 10)
-            draw.arc([cx-r*0.3, cy-r*0.6, cx+r*0.3, cy+r*0.05], 200, 440, fill='white', width=lw)
-            draw.ellipse([cx-lw, cy+r*0.3-lw, cx+lw, cy+r*0.3+lw], fill='white')
-        elif name == 'thumbs_up':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            draw.rectangle([cx-r*0.35, cy-r*0.1, cx+r*0.15, cy+r*0.5], fill='white')
-            draw.ellipse([cx-r*0.15, cy-r*0.55, cx+r*0.25, cy-r*0.05], fill='white')
-        elif name == 'heart':
-            hr = r * 0.45
-            draw.ellipse([cx - r*0.6, cy - r*0.4, cx, cy + r*0.15], fill=color)
-            draw.ellipse([cx, cy - r*0.4, cx + r*0.6, cy + r*0.15], fill=color)
-            draw.polygon([(cx - r*0.6, cy), (cx + r*0.6, cy), (cx, cy + r*0.7)], fill=color)
-        elif name == 'star':
-            pts = []
-            for i in range(10):
-                angle = math.radians(i * 36 - 90)
-                rad = r if i % 2 == 0 else r * 0.4
-                pts.append((cx + rad * math.cos(angle), cy + rad * math.sin(angle)))
-            draw.polygon(pts, fill=color)
-        elif name == 'bug':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            lw = max(1, s // 10)
-            draw.ellipse([cx-r*0.3, cy-r*0.15, cx+r*0.3, cy+r*0.5], fill='white')
-            draw.ellipse([cx-r*0.15, cy-r*0.4, cx+r*0.15, cy-r*0.1], fill='white')
-            draw.line([(cx-r*0.1, cy-r*0.35), (cx-r*0.3, cy-r*0.55)], fill='white', width=lw)
-            draw.line([(cx+r*0.1, cy-r*0.35), (cx+r*0.3, cy-r*0.55)], fill='white', width=lw)
-        elif name == 'lock':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            draw.rectangle([cx-r*0.3, cy-r*0.05, cx+r*0.3, cy+r*0.45], fill='white')
-            lw = max(1, s // 10)
-            draw.arc([cx-r*0.2, cy-r*0.45, cx+r*0.2, cy+r*0.05], 180, 360, fill='white', width=lw)
-        elif name == 'lightbulb':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            draw.ellipse([cx-r*0.3, cy-r*0.5, cx+r*0.3, cy+r*0.15], fill='white')
-            draw.rectangle([cx-r*0.15, cy+r*0.15, cx+r*0.15, cy+r*0.35], fill='white')
-        elif name == 'gear':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            draw.ellipse([cx-r*0.25, cy-r*0.25, cx+r*0.25, cy+r*0.25], fill='white')
-            lw = max(2, s // 8)
-            for i in range(6):
-                angle = math.radians(i * 60)
-                dx, dy = r * 0.4 * math.cos(angle), r * 0.4 * math.sin(angle)
-                draw.rectangle([cx+dx-lw//2, cy+dy-lw//2, cx+dx+lw//2, cy+dy+lw//2], fill='white')
-        elif name == 'happy':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            ew = max(2, s // 10)
-            draw.ellipse([cx-r*0.3-ew, cy-r*0.2-ew, cx-r*0.3+ew, cy-r*0.2+ew], fill='white')
-            draw.ellipse([cx+r*0.3-ew, cy-r*0.2-ew, cx+r*0.3+ew, cy-r*0.2+ew], fill='white')
-            draw.arc([cx-r*0.4, cy-r*0.1, cx+r*0.4, cy+r*0.45], 10, 170, fill='white', width=ew)
-        elif name == 'sad':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            ew = max(2, s // 10)
-            draw.ellipse([cx-r*0.3-ew, cy-r*0.2-ew, cx-r*0.3+ew, cy-r*0.2+ew], fill='white')
-            draw.ellipse([cx+r*0.3-ew, cy-r*0.2-ew, cx+r*0.3+ew, cy-r*0.2+ew], fill='white')
-            draw.arc([cx-r*0.4, cy+r*0.15, cx+r*0.4, cy+r*0.65], 190, 350, fill='white', width=ew)
-        elif name == 'neutral':
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-            ew = max(2, s // 10)
-            draw.ellipse([cx-r*0.3-ew, cy-r*0.2-ew, cx-r*0.3+ew, cy-r*0.2+ew], fill='white')
-            draw.ellipse([cx+r*0.3-ew, cy-r*0.2-ew, cx+r*0.3+ew, cy-r*0.2+ew], fill='white')
-            draw.line([(cx-r*0.3, cy+r*0.25), (cx+r*0.3, cy+r*0.25)], fill='white', width=ew)
-        else:
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
-
     def _place_stamp(self, ix, iy):
-        """Place the selected stamp at image coordinates using 4x supersampling."""
-        SS = 4
+        """Place the selected stamp at image coordinates with shadow."""
+        if self.stamp_selected is None:
+            self.status_var.set("No stamp selected")
+            return
+
         size = self.stamp_size
+        SS = 4
         big_size = size * SS
 
-        # Create supersampled stamp tile
-        tile = Image.new('RGBA', (big_size, big_size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(tile)
+        # Load stamp at supersampled size
+        stamp_img = self._load_stamp_image(self.stamp_selected, big_size)
 
-        # Draw shadow
+        # Create shadow from stamp silhouette
+        from PIL import ImageFilter
         shadow_off = max(1, SS)
         shadow_tile = Image.new('RGBA', (big_size, big_size), (0, 0, 0, 0))
-        shadow_draw = ImageDraw.Draw(shadow_tile)
-        self._draw_stamp(shadow_draw, self.stamp_selected,
-                         big_size // 2 + shadow_off, big_size // 2 + shadow_off * 2,
-                         big_size - shadow_off * 4, '#000000')
-        from PIL import ImageFilter
+        # Use stamp alpha as shadow shape
+        shadow_shape = stamp_img.copy()
+        # Make shadow black with original alpha
+        r, g, b, a = shadow_shape.split()
+        shadow_shape = Image.merge('RGBA', (
+            a.point(lambda _: 0),
+            a.point(lambda _: 0),
+            a.point(lambda _: 0),
+            a.point(lambda x: x * 140 // 255),
+        ))
+        shadow_tile.paste(shadow_shape, (shadow_off, shadow_off * 2), shadow_shape)
         shadow_tile = shadow_tile.filter(ImageFilter.GaussianBlur(radius=SS * 2))
-        shadow_data = shadow_tile.split()
-        shadow_tile.putalpha(shadow_data[3].point(lambda a: a * 140 // 255))
 
-        # Draw stamp
-        self._draw_stamp(draw, self.stamp_selected,
-                         big_size // 2, big_size // 2,
-                         big_size - shadow_off * 4, self.current_color)
+        # Composite: shadow under stamp
+        tile = Image.new('RGBA', (big_size, big_size), (0, 0, 0, 0))
+        tile = Image.alpha_composite(tile, shadow_tile)
+        tile.paste(stamp_img, (0, 0), stamp_img)
 
-        # Composite shadow under stamp, downsample
-        final = Image.alpha_composite(shadow_tile, tile)
-        final = final.resize((size, size), Image.LANCZOS)
+        # Downsample
+        final = tile.resize((size, size), Image.LANCZOS)
 
         # Paste onto image
         paste_x = int(ix - size // 2)

@@ -281,19 +281,39 @@ def capture_all_screens():
         width = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
         height = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
         try:
-            return _bitblt_capture(left, top, width, height)
+            img = _bitblt_capture(left, top, width, height)
         except Exception:
             # Fall back to Pillow if GDI path fails.
-            return ImageGrab.grab(
+            img = ImageGrab.grab(
                 bbox=(left, top, left + width, top + height),
                 all_screens=True,
             )
+        return _autocrop_black(img)
     finally:
         if old_ctx and set_thread_ctx is not None:
             try:
                 set_thread_ctx(ctypes.c_void_p(old_ctx))
             except Exception:
                 pass
+
+
+def _autocrop_black(img):
+    """Trim fully-black borders from a screenshot (virtual screen dead zones)."""
+    import numpy as np
+    arr = np.asarray(img.convert('RGB'))
+    # A row/col is "black" if every pixel is below threshold
+    threshold = 5
+    row_max = arr.max(axis=(1, 2))  # max brightness per row
+    col_max = arr.max(axis=(0, 2))  # max brightness per col
+    rows = np.where(row_max > threshold)[0]
+    cols = np.where(col_max > threshold)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return img  # entirely black — don't crop to nothing
+    top, bottom = rows[0], rows[-1] + 1
+    left, right = cols[0], cols[-1] + 1
+    if top == 0 and bottom == arr.shape[0] and left == 0 and right == arr.shape[1]:
+        return img  # nothing to crop
+    return img.crop((left, top, right, bottom))
 
 
 # ── Global hotkey (Print Screen) ───────────────────────────────────

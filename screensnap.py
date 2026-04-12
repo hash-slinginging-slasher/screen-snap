@@ -1665,6 +1665,9 @@ class AnnotationEditor:
         self.dragging_bubble = False
         self.drag_bubble_offset_x = 0
         self.drag_bubble_offset_y = 0
+        self.dragging_bubble_anchor = False
+        self.dragging_bubble_resize = False
+        self.bubble_resize_corner = None  # 'br', 'bl', 'tr', 'tl'
         self.bubble_counter = 0
 
         # Smart move tool state
@@ -2674,8 +2677,17 @@ class AnnotationEditor:
         self._render_bubble_canvas(elem)
         self._edit_bubble_text(elem)
 
+    def _bubble_dims(self, elem, z=1.0):
+        """Return (text_w, text_h) for a bubble element at given zoom."""
+        font_size = max(1, int(round(elem['font_size'] * z)))
+        text_lines = elem['text'].split('\n')
+        char_w = font_size * 0.6
+        text_w = max(len(line) for line in text_lines) * char_w + 20
+        text_h = len(text_lines) * (font_size + 4) + 16
+        return max(text_w, 80), text_h
+
     def _render_bubble_canvas(self, elem):
-        """Create/update canvas items for a bubble element."""
+        """Create/update canvas items for a bubble element as a single PIL image."""
         z = self.zoom if self.zoom else 1.0
 
         for key, cid in elem.get('canvas_ids', {}).items():
@@ -2685,60 +2697,85 @@ class AnnotationEditor:
                 pass
         elem['canvas_ids'] = {}
 
-        bx, by = elem['x'] * z, elem['y'] * z
-        ax, ay = elem['anchor_x'] * z, elem['anchor_y'] * z
+        bx_img, by_img = elem['x'], elem['y']
+        ax_img, ay_img = elem['anchor_x'], elem['anchor_y']
+        text_w, text_h = self._bubble_dims(elem, z=1.0)
 
-        font_size = max(1, int(round(elem['font_size'] * z)))
-        text_lines = elem['text'].split('\n')
-        char_w = font_size * 0.6
-        text_w = max(len(line) for line in text_lines) * char_w + 20
-        text_h = len(text_lines) * (font_size + 4) + 16
-        text_w = max(text_w, 80)
+        # Bounding box covering body + anchor (image space)
+        margin = 4
+        min_x = min(bx_img, ax_img) - margin
+        min_y = min(by_img, ay_img) - margin
+        max_x = max(bx_img + text_w, ax_img) + margin
+        max_y = max(by_img + text_h, ay_img) + margin
+        tile_w = max(1, int((max_x - min_x) * z))
+        tile_h = max(1, int((max_y - min_y) * z))
 
-        # Compute tail triangle from bubble edge toward anchor
-        bcx = bx + text_w / 2
-        bcy = by + text_h / 2
+        # Positions relative to tile origin (in canvas-pixel space)
+        bx = (bx_img - min_x) * z
+        by = (by_img - min_y) * z
+        ax = (ax_img - min_x) * z
+        ay = (ay_img - min_y) * z
+        tw = text_w * z
+        th = text_h * z
+        radius = max(4, int(8 * z))
+
+        # Parse fill color
+        color = elem['color']
+        try:
+            cr = int(color[1:3], 16)
+            cg = int(color[3:5], 16)
+            cb = int(color[5:7], 16)
+        except Exception:
+            cr, cg, cb = 128, 128, 128
+        fill_rgba = (cr, cg, cb, 210)
+
+        tile = Image.new('RGBA', (tile_w, tile_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(tile)
+
+        # Tail triangle
+        bcx = bx + tw / 2
+        bcy = by + th / 2
         dx = ax - bcx
         dy = ay - bcy
-        tail_w = max(8 * z, min(20 * z, text_w * 0.15))
+        tail_w = max(8 * z, min(20 * z, tw * 0.15))
 
-        tail_pts = []
-        if abs(dx) * text_h > abs(dy) * text_w:
-            # Anchor is more to the left/right
+        if abs(dx) * th > abs(dy) * tw:
             if dx > 0:
-                ty = max(by + tail_w, min(by + text_h - tail_w, ay))
-                tail_pts = [bx + text_w, ty - tail_w / 2, ax, ay, bx + text_w, ty + tail_w / 2]
+                ty = max(by + tail_w, min(by + th - tail_w, ay))
+                tail_pts = [(bx + tw, ty - tail_w / 2), (ax, ay), (bx + tw, ty + tail_w / 2)]
             else:
-                ty = max(by + tail_w, min(by + text_h - tail_w, ay))
-                tail_pts = [bx, ty - tail_w / 2, ax, ay, bx, ty + tail_w / 2]
+                ty = max(by + tail_w, min(by + th - tail_w, ay))
+                tail_pts = [(bx, ty - tail_w / 2), (ax, ay), (bx, ty + tail_w / 2)]
         else:
-            # Anchor is more above/below
             if dy > 0:
-                tx = max(bx + tail_w, min(bx + text_w - tail_w, ax))
-                tail_pts = [tx - tail_w / 2, by + text_h, ax, ay, tx + tail_w / 2, by + text_h]
+                tx = max(bx + tail_w, min(bx + tw - tail_w, ax))
+                tail_pts = [(tx - tail_w / 2, by + th), (ax, ay), (tx + tail_w / 2, by + th)]
             else:
-                tx = max(bx + tail_w, min(bx + text_w - tail_w, ax))
-                tail_pts = [tx - tail_w / 2, by, ax, ay, tx + tail_w / 2, by]
+                tx = max(bx + tail_w, min(bx + tw - tail_w, ax))
+                tail_pts = [(tx - tail_w / 2, by), (ax, ay), (tx + tail_w / 2, by)]
 
-        # Tail triangle (drawn under the body so edges overlap cleanly)
-        elem['canvas_ids']['tail'] = self.canvas.create_polygon(
-            *tail_pts, fill=elem['color'], outline=elem['color'],
-        )
+        draw.polygon(tail_pts, fill=fill_rgba)
 
-        # Background rectangle
-        elem['canvas_ids']['bg'] = self.canvas.create_rectangle(
-            bx, by, bx + text_w, by + text_h,
-            fill=elem['color'], outline=Theme.OUTLINE, width=1,
+        # Rounded rectangle body (drawn on top of tail so it overlaps seamlessly)
+        draw.rounded_rectangle(
+            [bx, by, bx + tw, by + th], radius=radius, fill=fill_rgba,
         )
 
         # Text
-        elem['canvas_ids']['text'] = self.canvas.create_text(
-            bx + 10, by + 8,
-            text=elem['text'],
-            fill='white',
-            font=('Segoe UI', font_size),
-            anchor='nw',
-            width=int(text_w - 20),
+        font_size_px = max(1, int(round(elem['font_size'] * z)))
+        try:
+            from PIL import ImageFont
+            font = ImageFont.truetype("arial.ttf", font_size_px)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((bx + 10 * z, by + 8 * z), elem['text'], fill='white', font=font)
+
+        photo = ImageTk.PhotoImage(tile)
+        elem['_bubble_photo'] = photo  # prevent GC
+        canvas_x = min_x * z
+        canvas_y = min_y * z
+        elem['canvas_ids']['img'] = self.canvas.create_image(
+            canvas_x, canvas_y, image=photo, anchor='nw',
         )
 
     def _edit_bubble_text(self, elem):
@@ -4447,12 +4484,6 @@ class AnnotationEditor:
                     tx_s = max(bx_s + tail_w_s, min(bx_s + tw_b - tail_w_s, ax_b))
                     tail_pts = [(tx_s - tail_w_s / 2, by_s), (ax_b, ay_b), (tx_s + tail_w_s / 2, by_s)]
 
-            # Background rectangle with semi-transparent fill
-            text_bbox = draw.textbbox((elem['x'] + 10, elem['y'] + 8), elem['text'], font=font)
-            pad = 10
-            bg_rect = [text_bbox[0] - pad, text_bbox[1] - pad,
-                       text_bbox[2] + pad, text_bbox[3] + pad]
-
             # Parse hex color for RGBA overlay
             try:
                 cr = int(elem['color'][1:3], 16)
@@ -4460,13 +4491,17 @@ class AnnotationEditor:
                 cb = int(elem['color'][5:7], 16)
             except:
                 cr, cg, cb = 128, 128, 128
+            fill_rgba = (cr, cg, cb, 210)
 
             bg_img = Image.new('RGBA', self.image.size, (0, 0, 0, 0))
             bg_draw = ImageDraw.Draw(bg_img)
             # Tail triangle
-            bg_draw.polygon(tail_pts, fill=(cr, cg, cb, 204))
-            # Body rectangle
-            bg_draw.rectangle(bg_rect, fill=(cr, cg, cb, 204))
+            bg_draw.polygon(tail_pts, fill=fill_rgba)
+            # Rounded rectangle body
+            bg_draw.rounded_rectangle(
+                [bx_s, by_s, bx_s + tw_b, by_s + th_b],
+                radius=8, fill=fill_rgba,
+            )
             bg_draw.text((elem['x'] + 10, elem['y'] + 8), elem['text'], fill='white', font=font)
 
             if self.image.mode != 'RGBA':

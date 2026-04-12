@@ -1,5 +1,49 @@
 ## 2026-04-12
 
+### Speech Bubble Improvements
+**Files Changed:** `screensnap.py`
+
+- Replaced plain connector line+dot with proper speech bubble shape: rounded rectangle body + triangular tail
+- Bubble rendered as single PIL RGBA image (no seam between tail and body)
+- Tail direction adapts automatically based on anchor position relative to body
+- Added bubble resize: drag bottom-right handle to change width/height
+- Added anchor repositioning: drag tail tip handle to repoint the arrow
+- Added explicit width/height fields to bubble elements (0 = auto-size from text)
+- Three drag modes: body (move), anchor (repoint), resize (corner handle)
+
+**Deployment:** Not deployed
+
+---
+
+### SVG Renderer Fix + Question Mark Centering
+**Files Changed:** `screensnap.py`
+
+- Replaced cairosvg dependency with built-in `_render_svg()` using xml.etree + ImageDraw (zero external deps)
+- Handles circle, ellipse, rect, line, polyline, polygon, text with viewBox scaling
+- Fixed SVG text positioning: use Pillow anchor parameter ("ms"/"rs"/"ls") for correct baseline handling
+- All 5 stamp SVGs (check, x, warn, info, question) render correctly
+
+**Deployment:** Not deployed
+
+---
+
+### Make Stamps and Shapes Draggable (Deferred Rendering)
+**Files Changed:** `screensnap.py`
+
+- Converted stamp tool from eager rendering (baked into image on place) to deferred rendering with `stamp_elements` list and canvas overlays
+- Converted shape tools (rectangle, circle, line, arrow, highlight) from eager rendering to deferred rendering with `shape_elements` list
+- All deferred elements are now draggable: click existing element to drag, click empty space to create new
+- Added `_render_stamp_canvas()`, `_render_shape_canvas()`, `_find_stamp_at()`, `_find_shape_at()` methods
+- Elements rendered to image on save via `render_annotations_to_image()` in correct z-order: shapes, stamps, text, bubbles, steps
+- Full undo/redo support: stamp and shape elements included in `_snapshot_state()`/`_apply_state()`
+- Zoom-aware: canvas overlays rebuild correctly via `_sync_overlays_to_zoom()`
+- Hover cursor shows hand2 when over draggable stamps or shapes
+- Blur tool remains eager-rendered (not draggable) since it transforms underlying pixels
+
+**Deployment:** Not deployed
+
+---
+
 ### Phase 2: Smart Move Tool
 **Files Changed:** `screensnap.py`
 

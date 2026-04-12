@@ -1650,6 +1650,14 @@ class AnnotationEditor:
         self.stamp_selected = 'checkmark'
         self.stamp_size = 40
 
+        # Bubble tool properties
+        self.bubble_elements = []
+        self.selected_bubble_id = None
+        self.dragging_bubble = False
+        self.drag_bubble_offset_x = 0
+        self.drag_bubble_offset_y = 0
+        self.bubble_counter = 0
+
         # Use the shared app root as a Toplevel
         master = _get_root()
         _clear_root(master)
@@ -1847,6 +1855,23 @@ class AnnotationEditor:
                                       command=lambda: setattr(self, 'stamp_size', self.stamp_size_var.get()))
         stamp_size_spin.pack(side='left')
 
+        # Bubble properties panel
+        self.bubble_props_frame = tk.Frame(self.props_container, bg=Theme.SURFACE, padx=15, pady=10)
+        self.bubble_props_frame.pack(side='top', fill='x')
+        self.bubble_props_frame.pack_forget()
+
+        tk.Label(self.bubble_props_frame, text="BUBBLE TOOL", font=("Segoe UI Bold", 8),
+                 fg=Theme.PRIMARY, bg=Theme.SURFACE).pack(side='left', padx=(0, 20))
+
+        tk.Label(self.bubble_props_frame, text="Font Size", font=Theme.FONT_LABEL,
+                 fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
+        self.bubble_font_size_var = tk.IntVar(value=14)
+        ttk.Spinbox(self.bubble_props_frame, from_=8, to=48,
+                    textvariable=self.bubble_font_size_var, width=5).pack(side='left', padx=(0, 20))
+
+        ModernButton(self.bubble_props_frame, text="\U0001f5d1 DELETE", variant="danger",
+                     command=self._delete_selected_bubble, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
+
         # Canvas frame (The "Sunken" Void)
         canvas_container = tk.Frame(main_frame, bg=Theme.BACKGROUND, padx=20, pady=20)
         canvas_container.pack(side='top', fill='both', expand=True)
@@ -2003,7 +2028,7 @@ class AnnotationEditor:
             ('Highlight', 'highlight', 'H'),
         ]
         self._overflow_tool_names = {t[1] for t in self.overflow_tools}
-        self._implemented_overflow = {'arrow', 'highlight', 'blur', 'stamp'}
+        self._implemented_overflow = {'arrow', 'highlight', 'blur', 'stamp', 'bubble'}
 
         for label, tool, key in self.overflow_tools:
             if tool in self._implemented_overflow:
@@ -2143,36 +2168,49 @@ class AnnotationEditor:
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
             self.stamp_props_frame.pack_forget()
+            self.bubble_props_frame.pack_forget()
         elif tool == 'step':
             self.step_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
             self.stamp_props_frame.pack_forget()
+            self.bubble_props_frame.pack_forget()
         elif tool == 'arrow':
             self.arrow_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
             self.stamp_props_frame.pack_forget()
+            self.bubble_props_frame.pack_forget()
         elif tool == 'blur':
             self.blur_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
             self.stamp_props_frame.pack_forget()
+            self.bubble_props_frame.pack_forget()
         elif tool == 'stamp':
             self.stamp_props_frame.pack(side='top', fill='x')
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
+            self.bubble_props_frame.pack_forget()
+        elif tool == 'bubble':
+            self.bubble_props_frame.pack(side='top', fill='x')
+            self.text_props_frame.pack_forget()
+            self.step_props_frame.pack_forget()
+            self.arrow_props_frame.pack_forget()
+            self.blur_props_frame.pack_forget()
+            self.stamp_props_frame.pack_forget()
         else:
             self.text_props_frame.pack_forget()
             self.step_props_frame.pack_forget()
             self.arrow_props_frame.pack_forget()
             self.blur_props_frame.pack_forget()
             self.stamp_props_frame.pack_forget()
+            self.bubble_props_frame.pack_forget()
             self.deselect_all()
     
     def _set_arrow_style(self, style):
@@ -2394,6 +2432,114 @@ class AnnotationEditor:
         self.image = base.convert('RGB')
 
         self.refresh_display()
+
+    def _add_bubble(self, anchor_x, anchor_y):
+        """Create a new speech bubble at the given anchor point."""
+        self.save_state()
+        self.bubble_counter += 1
+        bx = anchor_x + 60
+        by = anchor_y - 50
+        font_size = self.bubble_font_size_var.get()
+
+        elem = {
+            'id': self.bubble_counter,
+            'x': bx, 'y': by,
+            'anchor_x': anchor_x, 'anchor_y': anchor_y,
+            'text': 'Type here...',
+            'color': self.current_color,
+            'font_size': font_size,
+            'canvas_ids': {},
+        }
+        self.bubble_elements.append(elem)
+        self._render_bubble_canvas(elem)
+        self._edit_bubble_text(elem)
+
+    def _render_bubble_canvas(self, elem):
+        """Create/update canvas items for a bubble element."""
+        z = self.zoom if self.zoom else 1.0
+
+        for key, cid in elem.get('canvas_ids', {}).items():
+            try:
+                self.canvas.delete(cid)
+            except Exception:
+                pass
+        elem['canvas_ids'] = {}
+
+        bx, by = elem['x'] * z, elem['y'] * z
+        ax, ay = elem['anchor_x'] * z, elem['anchor_y'] * z
+
+        font_size = max(1, int(round(elem['font_size'] * z)))
+        text_lines = elem['text'].split('\n')
+        char_w = font_size * 0.6
+        text_w = max(len(line) for line in text_lines) * char_w + 20
+        text_h = len(text_lines) * (font_size + 4) + 16
+        text_w = max(text_w, 80)
+
+        # Connector line
+        elem['canvas_ids']['line'] = self.canvas.create_line(
+            ax, ay, bx + text_w / 2, by + text_h / 2,
+            fill=elem['color'], width=max(1, int(1.5 * z)),
+        )
+
+        # Anchor dot
+        dot_r = max(3, int(4 * z))
+        elem['canvas_ids']['anchor'] = self.canvas.create_oval(
+            ax - dot_r, ay - dot_r, ax + dot_r, ay + dot_r,
+            fill=elem['color'], outline='',
+        )
+
+        # Background rectangle
+        elem['canvas_ids']['bg'] = self.canvas.create_rectangle(
+            bx, by, bx + text_w, by + text_h,
+            fill=elem['color'], outline=Theme.OUTLINE, width=1,
+            stipple='gray75',
+        )
+
+        # Text
+        elem['canvas_ids']['text'] = self.canvas.create_text(
+            bx + 10, by + 8,
+            text=elem['text'],
+            fill='white',
+            font=('Segoe UI', font_size),
+            anchor='nw',
+            width=int(text_w - 20),
+        )
+
+    def _edit_bubble_text(self, elem):
+        """Open text editing for a bubble."""
+        new_text = self.prompt_text(elem['text'])
+        if new_text and new_text != elem['text']:
+            elem['text'] = new_text
+            self._render_bubble_canvas(elem)
+
+    def _find_bubble_at(self, ix, iy):
+        """Find bubble element at image-space position."""
+        for elem in reversed(self.bubble_elements):
+            font_size = elem['font_size']
+            text_lines = elem['text'].split('\n')
+            char_w = font_size * 0.6
+            w = max(len(line) for line in text_lines) * char_w + 20
+            h = len(text_lines) * (font_size + 4) + 16
+            w = max(w, 80)
+            if elem['x'] <= ix <= elem['x'] + w and elem['y'] <= iy <= elem['y'] + h:
+                return elem
+        return None
+
+    def _delete_selected_bubble(self):
+        """Delete the currently selected bubble."""
+        if self.selected_bubble_id is None:
+            return
+        self.save_state()
+        for elem in self.bubble_elements:
+            if elem['id'] == self.selected_bubble_id:
+                for cid in elem.get('canvas_ids', {}).values():
+                    try:
+                        self.canvas.delete(cid)
+                    except Exception:
+                        pass
+                self.bubble_elements.remove(elem)
+                break
+        self.selected_bubble_id = None
 
     def set_color(self, color):
         """Set the current drawing color with modern highlighting."""
@@ -3138,6 +3284,19 @@ class AnnotationEditor:
             self._place_stamp(ix, iy)
             return
 
+        elif self.current_tool == 'bubble':
+            clicked_bubble = self._find_bubble_at(ix, iy)
+            if clicked_bubble:
+                self.selected_bubble_id = clicked_bubble['id']
+                self.dragging_bubble = True
+                self._drag_snapshot_taken = False
+                self.drag_bubble_offset_x = ix - clicked_bubble['x']
+                self.drag_bubble_offset_y = iy - clicked_bubble['y']
+            else:
+                self.drawing = False
+                self._add_bubble(ix, iy)
+            return
+
     def on_canvas_drag(self, event):
         """Handle canvas mouse drag."""
         # Handle text dragging (elem['x']/['y'] are stored in IMAGE space,
@@ -3211,6 +3370,22 @@ class AnnotationEditor:
 
                     elem['x'] = new_x
                     elem['y'] = new_y
+                    break
+            return
+
+        # Handle bubble dragging
+        if self.dragging_bubble and self.selected_bubble_id is not None:
+            if not getattr(self, '_drag_snapshot_taken', False):
+                self.save_state()
+                self._drag_snapshot_taken = True
+            cx, cy = self.get_canvas_coords(event)
+            z = self.zoom if self.zoom else 1.0
+            ix, iy = cx / z, cy / z
+            for elem in self.bubble_elements:
+                if elem['id'] == self.selected_bubble_id:
+                    elem['x'] = ix - self.drag_bubble_offset_x
+                    elem['y'] = iy - self.drag_bubble_offset_y
+                    self._render_bubble_canvas(elem)
                     break
             return
 
@@ -3318,6 +3493,10 @@ class AnnotationEditor:
         # Handle step release
         if self.dragging_step:
             self.dragging_step = False
+            return
+
+        if self.dragging_bubble:
+            self.dragging_bubble = False
             return
 
         if not self.drawing or not self.current_tool:
@@ -3438,7 +3617,18 @@ class AnnotationEditor:
         cx, cy = self.get_canvas_coords(event)
         z = self.zoom if self.zoom else 1.0
         x, y = cx / z, cy / z
-        
+
+        # Check for bubble double-click
+        if self.current_tool == 'bubble':
+            clicked_bubble = self._find_bubble_at(x, y)
+            if clicked_bubble:
+                new_text = self.prompt_text(clicked_bubble['text'])
+                if new_text and new_text != clicked_bubble['text']:
+                    self.save_state()
+                    clicked_bubble['text'] = new_text
+                    self._render_bubble_canvas(clicked_bubble)
+                return
+
         # Find text at position
         clicked_text = self.find_text_at_position(x, y)
         if clicked_text:
@@ -3597,6 +3787,10 @@ class AnnotationEditor:
                     fill='#2196F3', width=2, tags='selection'
                 )
 
+        # Bubbles: re-render canvas items at the current zoom.
+        for elem in self.bubble_elements:
+            self._render_bubble_canvas(elem)
+
     def on_scroll_vertical(self, event):
         """Plain wheel pans the canvas vertically. Never zooms."""
         if getattr(event, 'delta', 0) == 0:
@@ -3663,6 +3857,50 @@ class AnnotationEditor:
                 except:
                     font = ImageFont.load_default()
             draw.text((elem['x'], elem['y']), elem['text'], fill=elem['color'], font=font)
+
+        # Render bubble elements
+        for elem in self.bubble_elements:
+            try:
+                from PIL import ImageFont
+                font = ImageFont.truetype("arial.ttf", elem['font_size'])
+            except:
+                font = ImageFont.load_default()
+
+            # Connector line
+            draw.line([(elem['anchor_x'], elem['anchor_y']),
+                       (elem['x'] + 40, elem['y'] + 20)],
+                      fill=elem['color'], width=2)
+
+            # Anchor dot
+            dot_r = 4
+            draw.ellipse([elem['anchor_x'] - dot_r, elem['anchor_y'] - dot_r,
+                          elem['anchor_x'] + dot_r, elem['anchor_y'] + dot_r],
+                         fill=elem['color'])
+
+            # Background rectangle with semi-transparent fill
+            text_bbox = draw.textbbox((elem['x'] + 10, elem['y'] + 8), elem['text'], font=font)
+            pad = 10
+            bg_rect = [text_bbox[0] - pad, text_bbox[1] - pad,
+                       text_bbox[2] + pad, text_bbox[3] + pad]
+
+            # Parse hex color for RGBA overlay
+            try:
+                cr = int(elem['color'][1:3], 16)
+                cg = int(elem['color'][3:5], 16)
+                cb = int(elem['color'][5:7], 16)
+            except:
+                cr, cg, cb = 128, 128, 128
+
+            bg_img = Image.new('RGBA', self.image.size, (0, 0, 0, 0))
+            bg_draw = ImageDraw.Draw(bg_img)
+            bg_draw.rectangle(bg_rect, fill=(cr, cg, cb, 204))
+            bg_draw.text((elem['x'] + 10, elem['y'] + 8), elem['text'], fill='white', font=font)
+
+            if self.image.mode != 'RGBA':
+                self.image = self.image.convert('RGBA')
+            self.image = Image.alpha_composite(self.image, bg_img)
+            self.image = self.image.convert('RGB')
+            draw = ImageDraw.Draw(self.image)  # Refresh draw context after mode change
 
         # Render step elements with supersampled quality
         if not self.step_elements:
@@ -3855,6 +4093,8 @@ class AnnotationEditor:
             'text_elements': self._snapshot_text_elements(),
             'step_elements': self._snapshot_step_elements(),
             'step_counter': self.step_counter,
+            'bubble_elements': [dict(e, canvas_ids={}) for e in self.bubble_elements],
+            'bubble_counter': self.bubble_counter,
         }
 
     def save_state(self):
@@ -3899,6 +4139,13 @@ class AnnotationEditor:
                 del elem['selection_id']
             if 'photo' in elem:
                 del elem['photo']
+        for elem in self.bubble_elements:
+            for cid in elem.get('canvas_ids', {}).values():
+                try:
+                    self.canvas.delete(cid)
+                except Exception:
+                    pass
+            elem['canvas_ids'] = {}
         # Remove any leftover selection visuals (cursors / dashed borders).
         try:
             self.canvas.delete('selection')
@@ -3920,6 +4167,20 @@ class AnnotationEditor:
             e['canvas_id'] = None
         self.step_elements = [dict(e) for e in state['step_elements']]
         self.step_counter = state['step_counter']
+
+        # Restore bubbles
+        for elem in self.bubble_elements:
+            for cid in elem.get('canvas_ids', {}).values():
+                try:
+                    self.canvas.delete(cid)
+                except Exception:
+                    pass
+        self.bubble_elements = [dict(e) for e in state.get('bubble_elements', [])]
+        self.bubble_counter = state.get('bubble_counter', 0)
+        self.selected_bubble_id = None
+        for elem in self.bubble_elements:
+            elem['canvas_ids'] = {}
+            self._render_bubble_canvas(elem)
 
         # Redraw the background image at the current zoom and force a
         # rebuild of every text / step overlay from the restored lists.

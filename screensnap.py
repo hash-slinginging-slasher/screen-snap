@@ -1705,7 +1705,7 @@ class AnnotationEditor:
         _clear_root(master)
         self.root = tk.Toplevel(master)
         self.root.title("ScreenSnap - Annotation Editor")
-        self.root.geometry("1600x850")
+        self.root.state('zoomed')
         self.root.config(bg=Theme.BACKGROUND)
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._closed = False
@@ -2132,6 +2132,7 @@ class AnnotationEditor:
 
         ModernButton(actions_frame, text="🏠 LAUNCHER", variant="secondary", command=self.back_to_launcher).pack(side='right', padx=5)
         ModernButton(actions_frame, text="✂️ REGION", variant="primary", command=self.capture_new_region).pack(side='right', padx=5)
+        ModernButton(actions_frame, text="📋 COPY IMAGE", variant="primary", command=self.copy_image_to_clipboard).pack(side='right', padx=5)
         ModernButton(actions_frame, text="💾 SAVE & COPY", variant="success", command=self.save_and_copy).pack(side='right', padx=5)
         ModernButton(actions_frame, text="🔗 SHARE", variant="primary", command=self.share_to_imgbb).pack(side='right', padx=5)
 
@@ -5018,6 +5019,43 @@ class AnnotationEditor:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save file: {e}")
     
+    def copy_image_to_clipboard(self):
+        """Copy the current image to the Windows clipboard as a bitmap."""
+        import io
+        import ctypes
+        import ctypes.wintypes as w
+        self.render_annotations_to_image()
+        try:
+            img = self.image.convert('RGB')
+            buf = io.BytesIO()
+            img.save(buf, format='BMP')
+            dib_data = buf.getvalue()[14:]  # skip BITMAPFILEHEADER
+
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+
+            # Set proper return types for 64-bit pointer safety
+            kernel32.GlobalAlloc.restype = w.HGLOBAL
+            kernel32.GlobalAlloc.argtypes = [w.UINT, ctypes.c_size_t]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [w.HGLOBAL]
+            kernel32.GlobalUnlock.argtypes = [w.HGLOBAL]
+            user32.OpenClipboard.argtypes = [w.HWND]
+            user32.SetClipboardData.restype = w.HANDLE
+            user32.SetClipboardData.argtypes = [w.UINT, w.HANDLE]
+
+            user32.OpenClipboard(None)
+            user32.EmptyClipboard()
+            hmem = kernel32.GlobalAlloc(0x0042, ctypes.c_size_t(len(dib_data)))
+            ptr = kernel32.GlobalLock(hmem)
+            ctypes.memmove(ptr, dib_data, len(dib_data))
+            kernel32.GlobalUnlock(hmem)
+            user32.SetClipboardData(8, hmem)  # CF_DIB = 8
+            user32.CloseClipboard()
+            self.status_var.set("Image copied to clipboard!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy image: {e}")
+
     def save_and_copy(self):
         """Save the image and copy path to clipboard."""
         # Render text elements to image before saving
@@ -5265,6 +5303,28 @@ def headless_save(mode, save_path):
         sys.exit(1)
 
 
+def _kill_previous_instances():
+    """Kill any existing ScreenSnap GUI processes (not this one)."""
+    my_pid = os.getpid()
+    try:
+        # Use tasklist + taskkill to find and kill other ScreenSnap processes
+        result = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq ScreenSnap.exe', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.strip('"').split('","')
+            if len(parts) >= 2:
+                pid = int(parts[1])
+                if pid != my_pid:
+                    subprocess.run(
+                        ['taskkill', '/F', '/PID', str(pid)],
+                        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+    except Exception:
+        pass
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -5301,7 +5361,8 @@ Examples:
             sys.exit(1)
         headless_save(args.mode, args.save)
     else:
-        # GUI mode
+        # GUI mode — kill any previous instance, then start fresh
+        _kill_previous_instances()
         launcher = LauncherWindow(mode=args.mode)
         launcher.run()
 

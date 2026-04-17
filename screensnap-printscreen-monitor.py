@@ -170,8 +170,30 @@ class PrintScreenMonitor:
         icon.run()
 
 
+def _kill_previous_monitors():
+    """Kill any existing ScreenSnapMonitor processes (not this one)."""
+    my_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq ScreenSnapMonitor.exe', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.strip('"').split('","')
+            if len(parts) >= 2:
+                pid = int(parts[1])
+                if pid != my_pid:
+                    subprocess.run(
+                        ['taskkill', '/F', '/PID', str(pid)],
+                        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+    except Exception:
+        pass
+
+
 def main():
     """Main entry point."""
+    _kill_previous_monitors()
     monitor = PrintScreenMonitor()
     monitor.run()
 

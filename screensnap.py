@@ -666,8 +666,9 @@ def upload_to_imgbb(image: Image.Image, api_key: str, auto_delete_seconds: int =
 
 
 # ── OCR helpers ────────────────────────────────────────────────────
-# Tesseract is an external binary the user installs separately. We try a
-# user-configured path first, then well-known install locations, then PATH.
+# The installer ships a portable Tesseract under <app>/tesseract/. When
+# running from source or the system has Tesseract installed elsewhere, we
+# fall back through common locations and PATH.
 import shutil
 
 
@@ -675,19 +676,33 @@ class TesseractNotFoundError(RuntimeError):
     """Raised when the Tesseract binary cannot be located."""
 
 
+def _bundled_tesseract_path():
+    """Path to Tesseract shipped next to ScreenSnap.exe (or the .py file)."""
+    if getattr(sys, 'frozen', False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    return base / "tesseract" / "tesseract.exe"
+
+
 def find_tesseract(settings=None):
     """Return the absolute path to tesseract.exe, or None if not found.
 
     Resolution order:
       1. settings['tesseract_path'] if set and pointing to an existing file
-      2. C:\\Program Files\\Tesseract-OCR\\tesseract.exe
-      3. C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe
-      4. shutil.which('tesseract') (PATH)
+      2. <app dir>/tesseract/tesseract.exe (bundled by the installer)
+      3. C:\\Program Files\\Tesseract-OCR\\tesseract.exe
+      4. C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe
+      5. shutil.which('tesseract') (PATH)
     """
     if settings:
         configured = (settings.get('tesseract_path') or '').strip()
         if configured and os.path.isfile(configured):
             return configured
+
+    bundled = _bundled_tesseract_path()
+    if bundled.is_file():
+        return str(bundled)
 
     candidates = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",

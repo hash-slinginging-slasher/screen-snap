@@ -6,7 +6,7 @@ echo Building ScreenSnap executables...
 echo.
 
 echo Ensuring build dependencies are installed...
-python -m pip install --quiet pyinstaller Pillow pyperclip keyboard pystray
+python -m pip install --quiet pyinstaller Pillow pyperclip keyboard pystray pytesseract
 if errorlevel 1 (
     echo Failed to install required Python packages.
     goto :fail
@@ -22,6 +22,7 @@ if not exist "screensnap.ico" (
 echo [1/2] Building ScreenSnap.exe...
 pyinstaller --onefile --windowed --name ScreenSnap --icon=screensnap.ico ^
     --hidden-import PIL --hidden-import pyperclip --hidden-import tkinter ^
+    --hidden-import pytesseract ^
     --clean screensnap.py
 if errorlevel 1 goto :fail
 

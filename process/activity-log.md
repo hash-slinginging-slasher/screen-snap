@@ -1,5 +1,19 @@
 ## 2026-04-22
 
+### Bundle Tesseract in portable installer
+**Files Changed:** `fetch-tesseract.bat` (new), `build-exe.bat`, `build-installer.bat`, `installer.iss`, `screensnap.py`, `.gitignore`
+
+- Added `fetch-tesseract.bat` to download Tesseract 5.5.0 from UB-Mannheim, silent-install into `build-cache/tesseract-install/`, then stage `tesseract.exe` + DLLs + `tessdata/eng.traineddata` into `tesseract/` at project root.
+- `build-installer.bat` now runs `fetch-tesseract.bat` first and aborts if staging fails.
+- `build-exe.bat` pip-installs `pytesseract` and passes `--hidden-import pytesseract` to PyInstaller.
+- `installer.iss` ships `tesseract\*` into `{app}\tesseract\` with `recursesubdirs createallsubdirs`.
+- `find_tesseract()` now checks `<app dir>/tesseract/tesseract.exe` (via new `_bundled_tesseract_path()` helper) ahead of Program Files / PATH, so the bundled binary is preferred when installed via the installer.
+- `.gitignore` excludes `tesseract/` and `build-cache/`.
+
+**Deployment:** Not deployed
+
+---
+
 ### Image-to-Text (OCR) — Tasks 1-3 (setup)
 **Files Changed:** `screensnap.py`
 

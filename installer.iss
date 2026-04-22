@@ -40,6 +40,7 @@ Source: "dist\ScreenSnapMonitor.exe";  DestDir: "{app}"; Flags: ignoreversion
 Source: "screensnap.ico";              DestDir: "{app}"; Flags: ignoreversion
 Source: "PRINTSCREEN-SETUP.md";        DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "stamps\*";                    DestDir: "{app}\stamps"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "tesseract\*";                 DestDir: "{app}\tesseract"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}";          Filename: "{app}\{#MyAppExeName}"

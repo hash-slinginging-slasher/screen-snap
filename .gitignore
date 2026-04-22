@@ -29,3 +29,7 @@ settings.ini
 # Locally-installed Inno Setup + installer build output
 inno/Inno Setup 6/
 installer-output/
+
+# Bundled Tesseract (fetched by fetch-tesseract.bat)
+tesseract/
+build-cache/

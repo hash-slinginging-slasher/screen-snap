@@ -7,7 +7,19 @@ echo  ScreenSnap Installer Build
 echo ============================================
 echo.
 
-REM 1. Build the executables (always rebuild to avoid stale exes)
+REM 1. Stage Tesseract binaries (downloads from UB-Mannheim on first run)
+echo Staging Tesseract OCR binaries...
+call fetch-tesseract.bat
+if errorlevel 1 (
+    echo ERROR: Failed to stage Tesseract. See fetch-tesseract.bat output above.
+    pause & exit /b 1
+)
+if not exist "tesseract\tesseract.exe" (
+    echo ERROR: tesseract\tesseract.exe missing after fetch.
+    pause & exit /b 1
+)
+
+REM 2. Build the executables (always rebuild to avoid stale exes)
 if exist "dist\ScreenSnap.exe"        del /q "dist\ScreenSnap.exe"
 if exist "dist\ScreenSnapMonitor.exe" del /q "dist\ScreenSnapMonitor.exe"
 if exist "build" rmdir /s /q "build"
@@ -22,7 +34,7 @@ if not exist "dist\ScreenSnapMonitor.exe" (
     pause & exit /b 1
 )
 
-REM 2. Locate Inno Setup compiler
+REM 3. Locate Inno Setup compiler
 set "ISCC="
 if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe"      set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
@@ -46,7 +58,7 @@ if "%ISCC%"=="" (
     pause & exit /b 1
 )
 
-REM 3. Build the installer
+REM 4. Build the installer
 echo Compiling installer with: %ISCC%
 "%ISCC%" installer.iss
 if errorlevel 1 (

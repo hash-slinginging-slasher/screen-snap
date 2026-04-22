@@ -1,5 +1,16 @@
 ## 2026-04-22
 
+### Image-to-Text (OCR) — Tasks 1-3 (setup)
+**Files Changed:** `screensnap.py`
+
+- Task 1: Added `pytesseract` to `ensure_dependencies()` so it auto-installs on first run.
+- Task 2: Added module-level OCR helpers — `TesseractNotFoundError`, `find_tesseract(settings)` (resolves via user-configured path → common install dirs → PATH), and `run_ocr(image, settings)` (English-only `pytesseract.image_to_string`).
+- Task 3: Added `tesseract_path` key to `SettingsManager.load`/`save` so the optional override persists in `config/settings.ini`.
+
+**Deployment:** Not deployed
+
+---
+
 ### Task 7: Add launcher Capture Text button
 **Files Changed:** `screensnap.py`
 

@@ -1,5 +1,17 @@
 ## 2026-04-22
 
+### Task 6: Add editor OCR button
+**Files Changed:** `screensnap.py`
+
+- Added `🔤 OCR` button to the `AnnotationEditor` toolbar actions_frame between COPY IMAGE and SAVE & COPY (insertion order — visual order on screen is SHARE / SAVE & COPY / OCR / COPY IMAGE / REGION / LAUNCHER because all pack `side='right'`).
+- Added `AnnotationEditor.ocr_current_image` — bakes annotations via `render_annotations_to_image()`, shows a watch cursor, calls the module-level `run_ocr(self.image.copy(), self.settings)`, auto-copies extracted text to the clipboard, and presents the result in `OCRResultDialog`. Surfaces `TesseractNotFoundError` to a dedicated install prompt and any other exception as a messagebox plus status-bar error.
+- Added `AnnotationEditor._prompt_install_tesseract` — yes/no messagebox pointing to the UB-Mannheim install page. "No" opens the URL via `os.startfile`; "Yes" opens a file dialog filtered for `tesseract.exe`, persists the chosen path to settings via `SettingsManager.save`, and retries the OCR call.
+- Verified headlessly: `ast.parse` clean; importing the module confirms both new methods exist on `AnnotationEditor` and `run_ocr` / `TesseractNotFoundError` / `OCRResultDialog` resolve at module scope. GUI launcher launches without error (smoke-tested with a timed spawn).
+
+**Deployment:** Not deployed
+
+---
+
 ### Task 5: Add OCRResultDialog preview modal
 **Files Changed:** `screensnap.py`
 

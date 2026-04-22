@@ -2234,6 +2234,7 @@ class AnnotationEditor:
         ModernButton(actions_frame, text="🏠 LAUNCHER", variant="secondary", command=self.back_to_launcher).pack(side='right', padx=5)
         ModernButton(actions_frame, text="✂️ REGION", variant="primary", command=self.capture_new_region).pack(side='right', padx=5)
         ModernButton(actions_frame, text="📋 COPY IMAGE", variant="primary", command=self.copy_image_to_clipboard).pack(side='right', padx=5)
+        ModernButton(actions_frame, text="🔤 OCR", variant="primary", command=self.ocr_current_image).pack(side='right', padx=5)
         ModernButton(actions_frame, text="💾 SAVE & COPY", variant="success", command=self.save_and_copy).pack(side='right', padx=5)
         ModernButton(actions_frame, text="🔗 SHARE", variant="primary", command=self.share_to_imgbb).pack(side='right', padx=5)
 
@@ -5156,6 +5157,68 @@ class AnnotationEditor:
             self.status_var.set("Image copied to clipboard!")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to copy image: {e}")
+
+    def ocr_current_image(self):
+        """Extract text from current image via Tesseract and show preview dialog."""
+        # Bake annotations into self.image, matching Copy Image / Save behavior.
+        self.render_annotations_to_image()
+
+        self.status_var.set("Running OCR...")
+        self.root.config(cursor="watch")
+        self.root.update()
+        try:
+            text = run_ocr(self.image.copy(), self.settings)
+        except TesseractNotFoundError:
+            self.root.config(cursor="")
+            self.status_var.set("OCR failed: Tesseract not found")
+            self._prompt_install_tesseract()
+            return
+        except Exception as e:
+            self.root.config(cursor="")
+            self.status_var.set(f"OCR failed: {e}")
+            messagebox.showerror("OCR Error", f"Tesseract failed:\n{e}")
+            return
+        finally:
+            self.root.config(cursor="")
+
+        copied = False
+        if text:
+            try:
+                pyperclip.copy(text)
+                copied = True
+            except Exception:
+                pass
+            self.status_var.set(f"OCR: extracted {len(text)} characters")
+        else:
+            self.status_var.set("OCR: no text detected")
+
+        OCRResultDialog(self.root, text, copied=copied)
+
+    def _prompt_install_tesseract(self):
+        """Show an error dialog with install link and Browse fallback."""
+        INSTALL_URL = "https://github.com/UB-Mannheim/tesseract/wiki"
+        answer = messagebox.askyesno(
+            "Tesseract Not Installed",
+            "Tesseract is required for OCR but was not found on this machine.\n\n"
+            f"Install it from:\n{INSTALL_URL}\n\n"
+            "Would you like to browse for an existing tesseract.exe now?"
+        )
+        if not answer:
+            try:
+                os.startfile(INSTALL_URL)
+            except Exception:
+                pass
+            return
+
+        path = filedialog.askopenfilename(
+            title="Select tesseract.exe",
+            filetypes=[("tesseract.exe", "tesseract.exe"), ("All files", "*.*")],
+        )
+        if path and os.path.isfile(path):
+            self.settings['tesseract_path'] = path
+            SettingsManager.save(self.settings)
+            # Retry
+            self.ocr_current_image()
 
     def save_and_copy(self):
         """Save the image and copy path to clipboard."""

@@ -663,6 +663,63 @@ def upload_to_imgbb(image: Image.Image, api_key: str, auto_delete_seconds: int =
         return {'error': f'Upload failed: {e}'}
 
 
+# ── OCR helpers ────────────────────────────────────────────────────
+# Tesseract is an external binary the user installs separately. We try a
+# user-configured path first, then well-known install locations, then PATH.
+import shutil
+
+
+class TesseractNotFoundError(RuntimeError):
+    """Raised when the Tesseract binary cannot be located."""
+
+
+def find_tesseract(settings=None):
+    """Return the absolute path to tesseract.exe, or None if not found.
+
+    Resolution order:
+      1. settings['tesseract_path'] if set and pointing to an existing file
+      2. C:\\Program Files\\Tesseract-OCR\\tesseract.exe
+      3. C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe
+      4. shutil.which('tesseract') (PATH)
+    """
+    if settings:
+        configured = (settings.get('tesseract_path') or '').strip()
+        if configured and os.path.isfile(configured):
+            return configured
+
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+
+    on_path = shutil.which('tesseract')
+    if on_path:
+        return on_path
+
+    return None
+
+
+def run_ocr(image: Image.Image, settings=None) -> str:
+    """Run Tesseract OCR on a PIL image. Returns stripped text.
+
+    Raises TesseractNotFoundError if the binary cannot be located.
+    Raises pytesseract.TesseractError on runtime failure.
+    """
+    import pytesseract
+
+    binary = find_tesseract(settings)
+    if not binary:
+        raise TesseractNotFoundError(
+            "Tesseract is not installed or could not be located."
+        )
+    pytesseract.pytesseract.tesseract_cmd = binary
+    text = pytesseract.image_to_string(image, lang='eng')
+    return text.strip()
+
+
 class LauncherWindow:
     """Initial launcher window with Full Screen and Region buttons."""
 

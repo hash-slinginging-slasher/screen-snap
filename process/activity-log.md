@@ -1,5 +1,16 @@
 ## 2026-04-22
 
+### Task 5: Add OCRResultDialog preview modal
+**Files Changed:** `screensnap.py`
+
+- Added top-level `OCRResultDialog` class immediately before `LibraryBrowser` — centered 600x500 modal Toplevel with a read-only Text widget and ttk scrollbar showing the extracted OCR text.
+- Status line shows "No text detected.", "Copied N characters to clipboard" (SUCCESS color when `copied=True`), or "N characters" depending on state; Copy/Save-as-.txt buttons are suppressed when the text is empty, leaving only a CLOSE button.
+- Smoke-tested in-process: populated and empty cases both construct, render, and close via an `after` callback; `ast.parse` clean.
+
+**Deployment:** Not deployed
+
+---
+
 ### Task 4: Add Tesseract path row to SettingsDialog (OCR feature)
 **Files Changed:** `screensnap.py`
 

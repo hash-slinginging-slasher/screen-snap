@@ -5235,6 +5235,95 @@ class AnnotationEditor:
             self.root.config(cursor="")
 
 
+class OCRResultDialog:
+    """Modal dialog showing OCR extracted text with Copy / Save / Close."""
+
+    def __init__(self, parent, text, copied=False):
+        self.parent = parent
+        self.text = text or ""
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Extracted Text")
+        self.dialog.geometry("600x500")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        self.dialog.config(bg=Theme.BACKGROUND)
+
+        # Center
+        self.dialog.update_idletasks()
+        w, h = 600, 500
+        x = (self.dialog.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (h // 2)
+        self.dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+        main = tk.Frame(self.dialog, bg=Theme.BACKGROUND, padx=20, pady=20)
+        main.pack(fill='both', expand=True)
+
+        # Status line
+        if not self.text:
+            status_text = "No text detected."
+            status_color = Theme.ON_SURFACE_VARIANT
+        elif copied:
+            status_text = f"Copied {len(self.text)} characters to clipboard"
+            status_color = Theme.SUCCESS
+        else:
+            status_text = f"{len(self.text)} characters"
+            status_color = Theme.ON_SURFACE_VARIANT
+        tk.Label(main, text=status_text, font=("Segoe UI Bold", 10),
+                 fg=status_color, bg=Theme.BACKGROUND).pack(anchor='w', pady=(0, 10))
+
+        # Text area (read-only)
+        text_frame = tk.Frame(main, bg=Theme.SURFACE_LOW, padx=2, pady=2)
+        text_frame.pack(fill='both', expand=True)
+
+        self.text_widget = tk.Text(
+            text_frame, wrap='word', font=("Consolas", 10),
+            bg=Theme.SURFACE_LOW, fg=Theme.ON_SURFACE,
+            insertbackground=Theme.PRIMARY, relief='flat', borderwidth=8,
+        )
+        self.text_widget.insert('1.0', self.text)
+        self.text_widget.config(state='disabled')
+        scrollbar = ttk.Scrollbar(text_frame, orient='vertical',
+                                  command=self.text_widget.yview)
+        self.text_widget.config(yscrollcommand=scrollbar.set)
+        self.text_widget.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # Buttons
+        btn_f = tk.Frame(main, bg=Theme.BACKGROUND)
+        btn_f.pack(fill='x', pady=(15, 0))
+
+        ModernButton(btn_f, text="CLOSE", variant="secondary",
+                     command=self.dialog.destroy, width=10).pack(side='right', padx=5)
+
+        if self.text:
+            ModernButton(btn_f, text="💾 SAVE AS .TXT", variant="secondary",
+                         command=self.save_to_file, width=16).pack(side='right', padx=5)
+            ModernButton(btn_f, text="📋 COPY", variant="primary",
+                         command=self.copy_to_clipboard, width=10).pack(side='right', padx=5)
+
+        self.dialog.wait_window()
+
+    def copy_to_clipboard(self):
+        try:
+            pyperclip.copy(self.text)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy: {e}")
+
+    def save_to_file(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Extracted Text",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(self.text)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save: {e}")
+
+
 class LibraryBrowser:
     """Browser window for viewing and managing library screenshots with Midnight Architect styling."""
 

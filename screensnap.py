@@ -1368,6 +1368,33 @@ class SettingsDialog:
         tk.Label(printscreen_f, text="Requires: keyboard, pystray packages (auto-installed)",
                  font=("Segoe UI", 7), fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(anchor='w', pady=(10, 0))
 
+        # 6. OCR Section
+        ocr_f = create_section(scrollable_frame, "OCR (Image-to-Text)")
+        tk.Label(ocr_f,
+                 text="Tesseract path (leave blank to auto-detect)",
+                 font=Theme.FONT_LABEL, fg=Theme.ON_SURFACE_VARIANT,
+                 bg=Theme.SURFACE).pack(anchor='w', pady=(0, 5))
+
+        self.tesseract_path_var = tk.StringVar(
+            value=settings.get('tesseract_path', '')
+        )
+        tess_entry_f = tk.Frame(ocr_f, bg=Theme.SURFACE_LOW, padx=2, pady=2)
+        tess_entry_f.pack(fill='x', pady=(0, 10))
+        tk.Entry(tess_entry_f, textvariable=self.tesseract_path_var,
+                 font=("Consolas", 9),
+                 bg=Theme.SURFACE_LOW, fg=Theme.ON_SURFACE,
+                 insertbackground=Theme.PRIMARY,
+                 relief='flat', borderwidth=8).pack(side='left', fill='x', expand=True)
+
+        ModernButton(ocr_f, text="BROWSE tesseract.exe", variant="secondary",
+                     command=self.browse_tesseract,
+                     font=("Segoe UI Bold", 8)).pack(anchor='e')
+
+        tk.Label(ocr_f,
+                 text="Install Tesseract from github.com/UB-Mannheim/tesseract/wiki",
+                 font=("Segoe UI", 7), fg=Theme.ON_SURFACE_VARIANT,
+                 bg=Theme.SURFACE).pack(anchor='w', pady=(10, 0))
+
         # Bottom Buttons
         btn_f = tk.Frame(scrollable_frame, bg=Theme.BACKGROUND)
         btn_f.pack(side='bottom', fill='x', pady=(10, 0))
@@ -1380,6 +1407,15 @@ class SettingsDialog:
         folder = filedialog.askdirectory(title="Select Default Save Folder")
         if folder:
             self.path_var.set(folder)
+
+    def browse_tesseract(self):
+        """Browse for the tesseract.exe binary."""
+        file = filedialog.askopenfilename(
+            title="Select tesseract.exe",
+            filetypes=[("tesseract.exe", "tesseract.exe"), ("All files", "*.*")],
+        )
+        if file:
+            self.tesseract_path_var.set(file)
 
     def _check_monitor_status(self):
         """Check if the Print Screen monitor is currently running."""
@@ -1503,6 +1539,7 @@ class SettingsDialog:
         self.settings['auto_copy_path'] = self.auto_copy_var.get()
         self.settings['image_format'] = self.format_var.get()
         self.settings['imbb_api_key'] = self.imbb_key_var.get()
+        self.settings['tesseract_path'] = self.tesseract_path_var.get()
         self.settings['printscreen_monitor'] = self.printscreen_var.get()
 
         # Validate path if auto-save is enabled

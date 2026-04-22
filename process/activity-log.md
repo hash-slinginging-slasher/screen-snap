@@ -1,3 +1,17 @@
+## 2026-04-22
+
+### Task 4: Add Tesseract path row to SettingsDialog (OCR feature)
+**Files Changed:** `screensnap.py`
+
+- Added "OCR (Image-to-Text)" section (numbered section 6) to `SettingsDialog` between the Print Screen Integration section and the Bottom Buttons block — includes a path entry bound to `self.tesseract_path_var`, a BROWSE tesseract.exe button, and an install hint label pointing to the UB-Mannheim Tesseract build wiki.
+- Added `browse_tesseract` method on `SettingsDialog` adjacent to `browse_path`; opens a file dialog filtered for `tesseract.exe` and writes the chosen path back into the StringVar.
+- Persisted `tesseract_path` in `SettingsDialog.save_settings` alongside the other setting writes so the value round-trips through `config/settings.ini`.
+- Verified headlessly: AST parses; `SettingsDialog` constructs with `tesseract_path_var` wired; `SettingsManager` round-trips `tesseract_path` through the INI file.
+
+**Deployment:** Not deployed
+
+---
+
 ## 2026-04-12
 
 ### Speech Bubble Improvements

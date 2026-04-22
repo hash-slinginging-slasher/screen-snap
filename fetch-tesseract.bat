@@ -11,7 +11,9 @@ setlocal
 
 REM ── Configuration ─────────────────────────────────────────────────
 set "TESS_VERSION=5.5.0.20241111"
-set "TESS_URL=https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-%TESS_VERSION%.exe"
+REM GitHub releases is the authoritative source — UB-Mannheim mirror
+REM (digi.bib.uni-mannheim.de) can 403 on default User-Agents.
+set "TESS_URL=https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-%TESS_VERSION%.exe"
 set "CACHE_DIR=build-cache"
 set "INSTALLER=%CACHE_DIR%\tesseract-installer-%TESS_VERSION%.exe"
 set "STAGING=%CD%\%CACHE_DIR%\tesseract-install"
@@ -35,9 +37,9 @@ if not exist "%OUT_DIR%"   mkdir "%OUT_DIR%"
 
 REM ── Download installer (cached) ───────────────────────────────────
 if not exist "%INSTALLER%" (
-    echo Downloading Tesseract %TESS_VERSION% from UB-Mannheim...
+    echo Downloading Tesseract %TESS_VERSION% from GitHub releases...
     echo   %TESS_URL%
-    powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%TESS_URL%' -OutFile '%INSTALLER%' -UseBasicParsing } catch { Write-Error $_; exit 1 }"
+    powershell -NoProfile -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%TESS_URL%' -OutFile '%INSTALLER%' -UseBasicParsing -UserAgent 'Mozilla/5.0 ScreenSnap-Installer' -MaximumRedirection 10 } catch { Write-Error $_; exit 1 }"
     if errorlevel 1 (
         echo ERROR: Download failed. Check your network and the URL above.
         if exist "%INSTALLER%" del /q "%INSTALLER%"

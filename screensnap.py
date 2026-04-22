@@ -24,7 +24,12 @@ def ensure_dependencies():
         import pyperclip
     except ImportError:
         missing.append('pyperclip')
-    
+
+    try:
+        import pytesseract
+    except ImportError:
+        missing.append('pytesseract')
+
     if missing:
         print(f"Installing dependencies: {', '.join(missing)}...")
         subprocess.check_call(

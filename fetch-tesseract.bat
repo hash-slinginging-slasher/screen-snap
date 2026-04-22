@@ -49,18 +49,35 @@ if not exist "%INSTALLER%" (
     echo Using cached installer: %INSTALLER%
 )
 
-REM ── Silent install into staging dir ───────────────────────────────
+REM ── Extract installer via 7-Zip ───────────────────────────────────
+REM The Tesseract installer is NSIS. Running /S can silently fail when
+REM UAC elevation is denied. 7-Zip can read NSIS archives directly, so
+REM we extract without ever executing the installer.
+set "SEVENZIP="
+if exist "%ProgramFiles%\7-Zip\7z.exe"      set "SEVENZIP=%ProgramFiles%\7-Zip\7z.exe"
+if exist "%ProgramFiles(x86)%\7-Zip\7z.exe" set "SEVENZIP=%ProgramFiles(x86)%\7-Zip\7z.exe"
+if "%SEVENZIP%"=="" (
+    where 7z >nul 2>&1 && set "SEVENZIP=7z"
+)
+if "%SEVENZIP%"=="" (
+    echo ERROR: 7-Zip not found. Install from https://www.7-zip.org/
+    echo        (needed to extract the Tesseract NSIS installer without UAC.)
+    exit /b 1
+)
+
 echo.
-echo Extracting Tesseract into staging dir...
+echo Extracting Tesseract into staging dir via 7-Zip...
 if exist "%STAGING%" rmdir /s /q "%STAGING%"
-REM NSIS installer: /S silent, /D=<path> must be LAST arg, NO quotes.
-"%INSTALLER%" /S /D=%STAGING%
+mkdir "%STAGING%"
+"%SEVENZIP%" x "%INSTALLER%" -o"%STAGING%" -y >nul
 if errorlevel 1 (
-    echo ERROR: Silent install failed.
+    echo ERROR: 7-Zip extraction failed.
     exit /b 1
 )
 if not exist "%STAGING%\tesseract.exe" (
-    echo ERROR: %STAGING%\tesseract.exe not found after install.
+    echo ERROR: tesseract.exe not found after 7-Zip extraction.
+    echo Contents of %STAGING%:
+    dir /b "%STAGING%"
     exit /b 1
 )
 

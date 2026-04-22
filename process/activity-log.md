@@ -1,5 +1,17 @@
 ## 2026-04-22
 
+### Task 7: Add launcher Capture Text button
+**Files Changed:** `screensnap.py`
+
+- Added a `🔤  CAPTURE TEXT` `ModernButton` (variant `action`) in `LauncherWindow.__init__` directly under the REGION SELECT button (~line 788) so the new button is present on initial launcher load.
+- Added a matching `🔤 Capture Text` `tk.Button` (bg `#9C27B0` purple to distinguish it from the green/blue capture siblings) in `LauncherWindow._build_launcher_ui` (~line 1049) directly under its region button. Both locations updated because `_build_launcher_ui` is invoked after every capture flow (`execute_region_capture`, `_do_open_file`, etc.) — omitting it would cause the button to vanish after the first capture.
+- Added three new `LauncherWindow` methods after `execute_region_capture` (~lines 1201, 1206, 1240): `capture_text` (hides the launcher and schedules `_execute_text_capture` via `after`), `_execute_text_capture` (runs `RegionSelector`, calls module-level `run_ocr`, auto-copies extracted text via `pyperclip`, presents `OCRResultDialog`, and handles `TesseractNotFoundError` via the install prompt — always restores the launcher via `_clear_root` / `deiconify` / `_build_launcher_ui` in a `finally`), and `_prompt_install_tesseract_launcher` (yes/no messagebox → URL open or file dialog → persists `tesseract_path` to settings).
+- Smoke-tested: `ast.parse` clean; module launches without crash (timed subprocess confirmed the GUI stayed up until the timeout hit).
+
+**Deployment:** Not deployed
+
+---
+
 ### Task 6: Add editor OCR button
 **Files Changed:** `screensnap.py`
 

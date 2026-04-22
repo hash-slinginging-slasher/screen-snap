@@ -785,6 +785,15 @@ class LauncherWindow:
         )
         region_btn.pack(fill='x', pady=8)
 
+        text_btn = ModernButton(
+            main_container,
+            variant="action",
+            text="🔤  CAPTURE TEXT",
+            command=self.capture_text,
+            font=("Segoe UI Bold", 11)
+        )
+        text_btn.pack(fill='x', pady=8)
+
         # Action buttons row
         row_frame = tk.Frame(main_container, bg=Theme.BACKGROUND)
         row_frame.pack(fill='x', pady=20)
@@ -1037,6 +1046,20 @@ class LauncherWindow:
         )
         region_btn.pack(fill='x', pady=5)
 
+        text_btn = tk.Button(
+            main_container,
+            text="🔤 Capture Text",
+            font=("Segoe UI", 13, "bold"),
+            command=self.capture_text,
+            bg="#9C27B0",
+            fg="white",
+            relief="flat",
+            cursor="hand2",
+            padx=15,
+            pady=10
+        )
+        text_btn.pack(fill='x', pady=5)
+
         # Library button
         library_btn = tk.Button(
             main_container,
@@ -1174,6 +1197,68 @@ class LauncherWindow:
             _clear_root(self.root)
             self.root.deiconify()
             self._build_launcher_ui()
+
+    def capture_text(self):
+        """Capture a region → run OCR → show preview. Editor is skipped."""
+        self.root.withdraw()
+        self.root.after(200, self._execute_text_capture)
+
+    def _execute_text_capture(self):
+        try:
+            selector = RegionSelector(self.root)
+            if selector.result:
+                self.root.config(cursor="watch")
+                self.root.update()
+                try:
+                    text = run_ocr(selector.result, self.settings)
+                except TesseractNotFoundError:
+                    self.root.config(cursor="")
+                    self._prompt_install_tesseract_launcher()
+                    return
+                except Exception as e:
+                    self.root.config(cursor="")
+                    messagebox.showerror("OCR Error", f"Tesseract failed:\n{e}")
+                    return
+                finally:
+                    self.root.config(cursor="")
+
+                copied = False
+                if text:
+                    try:
+                        pyperclip.copy(text)
+                        copied = True
+                    except Exception:
+                        pass
+                OCRResultDialog(self.root, text, copied=copied)
+        except Exception as e:
+            messagebox.showerror("Error", f"Text capture failed: {e}")
+        finally:
+            _clear_root(self.root)
+            self.root.deiconify()
+            self._build_launcher_ui()
+
+    def _prompt_install_tesseract_launcher(self):
+        """Tesseract-missing prompt from the launcher context."""
+        INSTALL_URL = "https://github.com/UB-Mannheim/tesseract/wiki"
+        answer = messagebox.askyesno(
+            "Tesseract Not Installed",
+            "Tesseract is required for OCR but was not found on this machine.\n\n"
+            f"Install it from:\n{INSTALL_URL}\n\n"
+            "Would you like to browse for an existing tesseract.exe now?"
+        )
+        if not answer:
+            try:
+                os.startfile(INSTALL_URL)
+            except Exception:
+                pass
+            return
+        path = filedialog.askopenfilename(
+            title="Select tesseract.exe",
+            filetypes=[("tesseract.exe", "tesseract.exe"), ("All files", "*.*")],
+        )
+        if path and os.path.isfile(path):
+            self.settings['tesseract_path'] = path
+            SettingsManager.save(self.settings)
 
     def open_library(self):
         """Open the library browser."""

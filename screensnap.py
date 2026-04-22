@@ -507,7 +507,8 @@ class SettingsManager:
             'auto_copy_path': 'true',
             'image_format': 'png',
             'imbb_api_key': '',
-            'printscreen_monitor': 'false'
+            'printscreen_monitor': 'false',
+            'tesseract_path': '',
         }
 
         # Ensure config directory exists
@@ -551,7 +552,8 @@ class SettingsManager:
             'auto_copy_path': str(settings.get('auto_copy_path', True)).lower(),
             'image_format': settings.get('image_format', 'png'),
             'imbb_api_key': settings.get('imbb_api_key', ''),
-            'printscreen_monitor': str(settings.get('printscreen_monitor', False)).lower()
+            'printscreen_monitor': str(settings.get('printscreen_monitor', False)).lower(),
+            'tesseract_path': settings.get('tesseract_path', ''),
         }
 
         try:

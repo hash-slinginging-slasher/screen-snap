@@ -5272,13 +5272,12 @@ class AnnotationEditor:
             # Copy path to clipboard if enabled
             if self.settings.get('auto_copy_path', True):
                 abs_path = os.path.abspath(file_path)
-                try:
-                    pyperclip.copy(abs_path)
+                if self._set_clipboard_text(abs_path):
                     self.status_var.set(f"✓ Auto-saved & path copied to clipboard")
                     print(f"Path copied to clipboard: {abs_path}")
-                except Exception as clip_error:
-                    self.status_var.set(f"✓ Auto-saved (clipboard failed: {clip_error})")
-                    print(f"Failed to copy to clipboard: {clip_error}")
+                else:
+                    self.status_var.set(f"✓ Auto-saved (clipboard busy — path not copied)")
+                    print(f"Failed to copy to clipboard: clipboard busy after retries")
             else:
                 self.status_var.set(f"✓ Auto-saved: {file_path}")
             
@@ -5321,6 +5320,53 @@ class AnnotationEditor:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save file: {e}")
     
+    def _open_clipboard_with_retry(self, user32, attempts=10, delay_s=0.03):
+        """OpenClipboard fails (returns 0) when another process briefly holds
+        the clipboard — common with Win+V history, browsers, password
+        managers, and clipboard tools. Retry a handful of times before
+        giving up so users don't see silent no-ops on Save & Copy / Copy
+        Image. Returns True on success."""
+        import time
+        for _ in range(attempts):
+            if user32.OpenClipboard(None):
+                return True
+            time.sleep(delay_s)
+        return False
+
+    def _set_clipboard_text(self, text):
+        """Place a string on the Windows clipboard as CF_UNICODETEXT, with
+        OpenClipboard retries. Returns True on success, False otherwise.
+        Replaces direct pyperclip.copy() calls which were silently failing
+        under clipboard contention."""
+        import ctypes
+        import ctypes.wintypes as w
+
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+
+        kernel32.GlobalAlloc.restype = w.HGLOBAL
+        kernel32.GlobalAlloc.argtypes = [w.UINT, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [w.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [w.HGLOBAL]
+        user32.OpenClipboard.argtypes = [w.HWND]
+        user32.SetClipboardData.restype = w.HANDLE
+        user32.SetClipboardData.argtypes = [w.UINT, w.HANDLE]
+
+        if not self._open_clipboard_with_retry(user32):
+            return False
+        try:
+            user32.EmptyClipboard()
+            buf = (text + '\0').encode('utf-16-le')
+            hmem = kernel32.GlobalAlloc(0x0042, ctypes.c_size_t(len(buf)))
+            ptr = kernel32.GlobalLock(hmem)
+            ctypes.memmove(ptr, buf, len(buf))
+            kernel32.GlobalUnlock(hmem)
+            handle = user32.SetClipboardData(13, hmem)  # CF_UNICODETEXT = 13
+            return bool(handle)
+        finally:
+            user32.CloseClipboard()
+
     def copy_image_to_clipboard(self):
         """Copy the current image to the Windows clipboard as a bitmap."""
         import io
@@ -5346,14 +5392,27 @@ class AnnotationEditor:
             user32.SetClipboardData.restype = w.HANDLE
             user32.SetClipboardData.argtypes = [w.UINT, w.HANDLE]
 
-            user32.OpenClipboard(None)
-            user32.EmptyClipboard()
-            hmem = kernel32.GlobalAlloc(0x0042, ctypes.c_size_t(len(dib_data)))
-            ptr = kernel32.GlobalLock(hmem)
-            ctypes.memmove(ptr, dib_data, len(dib_data))
-            kernel32.GlobalUnlock(hmem)
-            user32.SetClipboardData(8, hmem)  # CF_DIB = 8
-            user32.CloseClipboard()
+            if not self._open_clipboard_with_retry(user32):
+                self.status_var.set("Copy failed: clipboard busy — try again")
+                messagebox.showerror(
+                    "Clipboard Busy",
+                    "Another app is holding the clipboard. Close any clipboard "
+                    "manager / Win+V history pop-up and try again."
+                )
+                return
+            try:
+                user32.EmptyClipboard()
+                hmem = kernel32.GlobalAlloc(0x0042, ctypes.c_size_t(len(dib_data)))
+                ptr = kernel32.GlobalLock(hmem)
+                ctypes.memmove(ptr, dib_data, len(dib_data))
+                kernel32.GlobalUnlock(hmem)
+                handle = user32.SetClipboardData(8, hmem)  # CF_DIB = 8
+            finally:
+                user32.CloseClipboard()
+            if not handle:
+                self.status_var.set("Copy failed: SetClipboardData returned NULL")
+                messagebox.showerror("Error", "Failed to set image on clipboard.")
+                return
             self.status_var.set("Image copied to clipboard!")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to copy image: {e}")
@@ -5383,11 +5442,7 @@ class AnnotationEditor:
 
         copied = False
         if text:
-            try:
-                pyperclip.copy(text)
-                copied = True
-            except Exception:
-                pass
+            copied = self._set_clipboard_text(text)
             self.status_var.set(f"OCR: extracted {len(text)} characters")
         else:
             self.status_var.set("OCR: no text detected")
@@ -5448,11 +5503,21 @@ class AnnotationEditor:
                 export_image.save(file_path)
                 self.last_saved_path = file_path
 
-                # Copy absolute path to clipboard
+                # Copy absolute path to clipboard via retry-aware helper —
+                # pyperclip silently no-ops when the clipboard is briefly
+                # held by another process (Win+V, browsers, etc.).
                 abs_path = os.path.abspath(file_path)
-                pyperclip.copy(abs_path)
-
-                self.status_var.set(f"Saved & copied to clipboard: {abs_path}")
+                if self._set_clipboard_text(abs_path):
+                    self.status_var.set(f"Saved & copied to clipboard: {abs_path}")
+                else:
+                    self.status_var.set(f"Saved (clipboard busy): {abs_path}")
+                    messagebox.showwarning(
+                        "Clipboard Busy",
+                        f"File was saved to:\n{abs_path}\n\n"
+                        "But another app is holding the clipboard, so the path "
+                        "could not be copied. Close any clipboard manager / "
+                        "Win+V history pop-up and try Save & Copy again."
+                    )
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save file: {e}")
 
@@ -5485,14 +5550,19 @@ class AnnotationEditor:
                 messagebox.showerror("Upload Failed", result['error'])
             else:
                 url = result['url']
-                pyperclip.copy(url)
-                self.status_var.set(f"Uploaded to ImgBB — link copied to clipboard")
+                copied = self._set_clipboard_text(url)
+                if copied:
+                    self.status_var.set(f"Uploaded to ImgBB — link copied to clipboard")
+                    clip_line = "Link has been copied to clipboard."
+                else:
+                    self.status_var.set(f"Uploaded to ImgBB (clipboard busy — link not copied)")
+                    clip_line = "Clipboard was busy — copy the link manually."
                 messagebox.showinfo(
                     "Upload Successful",
                     f"Image uploaded to ImgBB!\n\n"
                     f"Link: {url}\n\n"
                     f"Auto-deletes in 24 hours.\n"
-                    f"Link has been copied to clipboard."
+                    f"{clip_line}"
                 )
         finally:
             self.root.config(cursor="")

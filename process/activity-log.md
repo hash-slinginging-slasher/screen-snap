@@ -1,5 +1,17 @@
 ## 2026-05-08
 
+### Fix Save & Copy / Copy Image silently no-op'ing under clipboard contention
+**Files Changed:** `screensnap.py`
+
+- Symptom: pressing Save & Copy or Copy Image often left the OLD clipboard contents in place — pasting still produced previously-copied text/image even after spamming the buttons. The file did get saved to disk, but the clipboard was never updated.
+- Root cause: both code paths called the Win32 clipboard API (`OpenClipboard` for Copy Image, `pyperclip.copy` for Save & Copy) without retry or return-value checking. Whenever another process briefly held the clipboard — Windows clipboard history (Win+V), browsers, password managers, OneDrive, clipboard tools — `OpenClipboard` returned 0 and the rest of the call chain became a silent no-op.
+- Fix: added `_open_clipboard_with_retry()` (10× attempts, 30 ms apart) and `_set_clipboard_text()` helpers on the editor. Rewrote `copy_image_to_clipboard()` to use the retry, check `SetClipboardData`'s handle, and surface a real error dialog when the clipboard is genuinely unavailable. Replaced `pyperclip.copy()` in `save_and_copy()`, `auto_save_to_default()` (auto-copy path), `ocr_current_image()` (OCR text), and `share_to_imgbb()` (ImgBB URL) with the retry-aware helper, so all editor-side clipboard writes either succeed or report a clear "clipboard busy" status.
+- Sites outside `AnnotationEditor` (`LauncherWindow.capture_text_to_clipboard`, `OCRResultDialog.copy_to_clipboard`) still use plain `pyperclip.copy` — same vulnerability exists, but those weren't reported and are in different classes that don't have access to the helper.
+
+**Deployment:** Not deployed
+
+---
+
 ### Fix step tool "mirror image" / ghost duplicates on save
 **Files Changed:** `screensnap.py`
 

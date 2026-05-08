@@ -1675,6 +1675,7 @@ class RegionSelector:
         self.start_x = None
         self.start_y = None
         self.current_rect = None
+        self.current_bright = None
         self.finished = False
 
         # Get all screens bounding box
@@ -1691,11 +1692,50 @@ class RegionSelector:
 
         self.offset_x = x
         self.offset_y = y
+        self.v_width = width
+        self.v_height = height
 
-        # Create full-screen transparent window
+        # Freeze the screen BEFORE showing the overlay so subsequent mouse
+        # movement / animations don't change what the user sees while selecting.
+        # Caller is expected to have hidden the launcher already; give the
+        # compositor a brief moment to repaint before grabbing.
+        try:
+            parent.update_idletasks()
+        except Exception:
+            pass
+        import time as _time
+        _time.sleep(0.05)
+        try:
+            self.frozen = ImageGrab.grab(bbox=(x, y, x2, y2), all_screens=True)
+        except Exception as e:
+            print(f"Failed to capture frozen screen: {e}")
+            self.frozen = None
+
+        # Build a display-sized copy (logical pixels) and a dimmed version for
+        # the overlay background. Track scale so on_release can crop from the
+        # original physical-resolution snapshot.
+        if self.frozen is not None:
+            if self.frozen.size != (width, height):
+                display_src = self.frozen.resize((width, height), Image.LANCZOS)
+                self.scale_x = self.frozen.size[0] / width
+                self.scale_y = self.frozen.size[1] / height
+            else:
+                display_src = self.frozen
+                self.scale_x = 1.0
+                self.scale_y = 1.0
+            self.frozen_display = display_src.convert('RGB')
+            dim_layer = Image.new('RGB', (width, height), (0, 0, 0))
+            self.dimmed_display = Image.blend(self.frozen_display, dim_layer, 0.5)
+        else:
+            self.frozen_display = None
+            self.dimmed_display = None
+            self.scale_x = 1.0
+            self.scale_y = 1.0
+
+        # Create full-screen opaque window (no -alpha so the live screen can't
+        # bleed through the selection overlay).
         self.root = tk.Toplevel(parent)
         self.root.attributes('-topmost', True)
-        self.root.attributes('-alpha', 0.4)
         self.root.configure(bg='#000000')
         self.root.config(cursor="crosshair")
         self.root.overrideredirect(True)
@@ -1704,6 +1744,11 @@ class RegionSelector:
         # Canvas for overlay
         self.canvas = tk.Canvas(self.root, highlightthickness=0, bg='#000000')
         self.canvas.pack(fill='both', expand=True)
+
+        # Paint the dimmed frozen snapshot as the canvas background.
+        if self.dimmed_display is not None:
+            self._dim_tk = ImageTk.PhotoImage(self.dimmed_display)
+            self.canvas.create_image(0, 0, anchor='nw', image=self._dim_tk)
 
         # Dimension label (Midnight styling)
         self.dim_label = tk.Label(
@@ -1715,13 +1760,13 @@ class RegionSelector:
             padx=10,
             pady=5
         )
-        
+
         # Bind events
         self.canvas.bind('<Button-1>', self.on_press)
         self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_release)
         self.root.bind('<Escape>', self.on_escape)
-        
+
         self.root.wait_window()
     
     def on_press(self, event):
@@ -1729,24 +1774,44 @@ class RegionSelector:
         self.start_y = event.y
         if self.current_rect:
             self.canvas.delete(self.current_rect)
-    
+            self.current_rect = None
+        if self.current_bright:
+            self.canvas.delete(self.current_bright)
+            self.current_bright = None
+
     def on_drag(self, event):
         if self.start_x is None: return
         if self.current_rect:
             self.canvas.delete(self.current_rect)
-        
+        if self.current_bright:
+            self.canvas.delete(self.current_bright)
+            self.current_bright = None
+
+        cx1 = max(0, min(self.v_width, min(self.start_x, event.x)))
+        cy1 = max(0, min(self.v_height, min(self.start_y, event.y)))
+        cx2 = max(0, min(self.v_width, max(self.start_x, event.x)))
+        cy2 = max(0, min(self.v_height, max(self.start_y, event.y)))
+
+        # Reveal the un-dimmed patch of the frozen snapshot inside the selection
+        if self.frozen_display is not None and cx2 > cx1 and cy2 > cy1:
+            bright_crop = self.frozen_display.crop((cx1, cy1, cx2, cy2))
+            self._bright_tk = ImageTk.PhotoImage(bright_crop)
+            self.current_bright = self.canvas.create_image(
+                cx1, cy1, anchor='nw', image=self._bright_tk
+            )
+
         # Draw new rectangle with Primary color
         self.current_rect = self.canvas.create_rectangle(
             self.start_x, self.start_y, event.x, event.y,
             outline=Theme.PRIMARY,
             width=2
         )
-        
+
         width = abs(event.x - self.start_x)
         height = abs(event.y - self.start_y)
         self.dim_label.config(text=f"{width} × {height}")
         self.dim_label.place(x=event.x + 10, y=event.y + 10)
-    
+
     def on_release(self, event):
         """Handle mouse release."""
         if self.start_x is None:
@@ -1758,28 +1823,47 @@ class RegionSelector:
         cx2 = max(self.start_x, event.x)
         cy2 = max(self.start_y, event.y)
 
+        # Clamp to the virtual screen
+        cx1 = max(0, min(self.v_width, cx1))
+        cx2 = max(0, min(self.v_width, cx2))
+        cy1 = max(0, min(self.v_height, cy1))
+        cy2 = max(0, min(self.v_height, cy2))
+
         # Minimum size check
         if cx2 - cx1 < 10 or cy2 - cy1 < 10:
             self.root.destroy()
             return
 
-        # Convert canvas coords to absolute screen coords
-        x1 = cx1 + self.offset_x
-        y1 = cy1 + self.offset_y
-        x2 = cx2 + self.offset_x
-        y2 = cy2 + self.offset_y
-
-        # Hide overlay BEFORE capture so it doesn't appear in the screenshot
-        self.root.withdraw()
-        self.root.update_idletasks()
-        import time; time.sleep(0.05)  # brief delay for screen to repaint
-
-        # Capture the region
-        try:
-            screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
-            self.result = screenshot
-        except Exception as e:
-            print(f"Failed to capture region: {e}")
+        # Crop from the frozen snapshot (preserves its physical resolution).
+        # Fall back to a live grab only if the freeze step failed earlier.
+        if self.frozen is not None:
+            fx1 = int(round(cx1 * self.scale_x))
+            fy1 = int(round(cy1 * self.scale_y))
+            fx2 = int(round(cx2 * self.scale_x))
+            fy2 = int(round(cy2 * self.scale_y))
+            fw, fh = self.frozen.size
+            fx1 = max(0, min(fw, fx1))
+            fx2 = max(0, min(fw, fx2))
+            fy1 = max(0, min(fh, fy1))
+            fy2 = max(0, min(fh, fy2))
+            if fx2 > fx1 and fy2 > fy1:
+                try:
+                    self.result = self.frozen.crop((fx1, fy1, fx2, fy2))
+                except Exception as e:
+                    print(f"Failed to crop region: {e}")
+        else:
+            # Fallback: hide overlay and grab the live screen
+            x1 = cx1 + self.offset_x
+            y1 = cy1 + self.offset_y
+            x2 = cx2 + self.offset_x
+            y2 = cy2 + self.offset_y
+            self.root.withdraw()
+            self.root.update_idletasks()
+            import time; time.sleep(0.05)
+            try:
+                self.result = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
+            except Exception as e:
+                print(f"Failed to capture region: {e}")
 
         self.root.destroy()
     
@@ -2204,8 +2288,16 @@ class AnnotationEditor:
         self.canvas.tag_lower("grid")
 
     def create_toolbar(self, parent):
-        """Create the professional Midnight Architect toolbar."""
-        toolbar = tk.Frame(parent, bg=Theme.SURFACE, padx=20, pady=12)
+        """Create the professional Midnight Architect toolbar.
+
+        Two-row layout: tools/colors on top, actions on a dedicated row below
+        so action buttons stay visible on smaller screens where everything
+        wouldn't fit in a single row.
+        """
+        container = tk.Frame(parent, bg=Theme.BACKGROUND)
+
+        toolbar = tk.Frame(container, bg=Theme.SURFACE, padx=20, pady=12)
+        toolbar.pack(side='top', fill='x')
 
         # 1. Tools Group
         tools_frame = tk.Frame(toolbar, bg=Theme.SURFACE)
@@ -2325,11 +2417,12 @@ class AnnotationEditor:
         )
         self._custom_color_btn.pack(side='left', padx=2)
 
-        tk.Frame(toolbar, width=1, bg=Theme.OUTLINE).pack(side='left', fill='y', padx=20)
+        # 3. Actions Group — own row so buttons stay visible on smaller screens
+        actions_bar = tk.Frame(container, bg=Theme.SURFACE, padx=20, pady=8)
+        actions_bar.pack(side='top', fill='x', pady=(2, 0))
 
-        # 3. Actions Group (Right Aligned)
-        actions_frame = tk.Frame(toolbar, bg=Theme.SURFACE)
-        actions_frame.pack(side='right')
+        actions_frame = tk.Frame(actions_bar, bg=Theme.SURFACE)
+        actions_frame.pack(anchor='center')
 
         ModernButton(actions_frame, text="🏠 LAUNCHER", variant="secondary", command=self.back_to_launcher).pack(side='right', padx=5)
         ModernButton(actions_frame, text="✂️ REGION", variant="primary", command=self.capture_new_region).pack(side='right', padx=5)
@@ -2339,7 +2432,7 @@ class AnnotationEditor:
         ModernButton(actions_frame, text="🔗 SHARE", variant="primary", command=self.share_to_imgbb).pack(side='right', padx=5)
 
 
-        return toolbar
+        return container
     def capture_new_full(self):
         """Capture full screen and open in a new editor window."""
         # Destroy current editor and signal replacement
@@ -4681,11 +4774,16 @@ class AnnotationEditor:
         return 'break'
     
     def render_annotations_to_image(self):
-        """Render all text and step elements to the image before saving."""
+        """Compose self.image plus all deferred annotation elements into a
+        fresh PIL.Image and return it. Does NOT mutate self.image — every
+        call starts from a clean copy of the current pristine canvas, so
+        repeated invocations are idempotent and dragged elements no longer
+        leave ghost copies at their previous positions."""
         self.deselect_all()
+        out = self.image.copy()
 
         # Render shape elements first
-        draw = ImageDraw.Draw(self.image)
+        draw = ImageDraw.Draw(out)
         for elem in self.shape_elements:
             t = elem['type']
             if t == 'rectangle':
@@ -4705,29 +4803,29 @@ class AnnotationEditor:
                 hx1, hy1 = int(min(elem['x1'], elem['x2'])), int(min(elem['y1'], elem['y2']))
                 hx2, hy2 = int(max(elem['x1'], elem['x2'])), int(max(elem['y1'], elem['y2']))
                 if hx2 > hx1 and hy2 > hy1:
-                    region = self.image.crop((hx1, hy1, hx2, hy2))
+                    region = out.crop((hx1, hy1, hx2, hy2))
                     overlay = Image.new('RGBA', region.size, elem['color'])
                     overlay.putalpha(89)
                     if region.mode != 'RGBA':
                         region = region.convert('RGBA')
                     region = Image.alpha_composite(region, overlay)
-                    self.image.paste(region.convert('RGB'), (hx1, hy1))
-                    draw = ImageDraw.Draw(self.image)
+                    out.paste(region.convert('RGB'), (hx1, hy1))
+                    draw = ImageDraw.Draw(out)
 
         # Render stamp elements
         for elem in self.stamp_elements:
             tile = elem['tile']
             paste_x = int(elem['x'] - elem['size'] // 2)
             paste_y = int(elem['y'] - elem['size'] // 2)
-            if self.image.mode != 'RGBA':
-                self.image = self.image.convert('RGBA')
-            base = self.image.copy()
+            if out.mode != 'RGBA':
+                out = out.convert('RGBA')
+            base = out.copy()
             base.paste(tile, (paste_x, paste_y), tile)
-            self.image = base.convert('RGB')
-            draw = ImageDraw.Draw(self.image)
+            out = base.convert('RGB')
+            draw = ImageDraw.Draw(out)
 
         # Render text elements
-        draw = ImageDraw.Draw(self.image)
+        draw = ImageDraw.Draw(out)
         for elem in self.text_elements:
             try:
                 from PIL import ImageFont
@@ -4783,7 +4881,7 @@ class AnnotationEditor:
                 cr, cg, cb = 128, 128, 128
             fill_rgba = (cr, cg, cb, 210)
 
-            bg_img = Image.new('RGBA', self.image.size, (0, 0, 0, 0))
+            bg_img = Image.new('RGBA', out.size, (0, 0, 0, 0))
             bg_draw = ImageDraw.Draw(bg_img)
             # Tail triangle
             bg_draw.polygon(tail_pts, fill=fill_rgba)
@@ -4794,15 +4892,15 @@ class AnnotationEditor:
             )
             bg_draw.text((elem['x'] + 10, elem['y'] + 8), elem['text'], fill='white', font=font)
 
-            if self.image.mode != 'RGBA':
-                self.image = self.image.convert('RGBA')
-            self.image = Image.alpha_composite(self.image, bg_img)
-            self.image = self.image.convert('RGB')
-            draw = ImageDraw.Draw(self.image)  # Refresh draw context after mode change
+            if out.mode != 'RGBA':
+                out = out.convert('RGBA')
+            out = Image.alpha_composite(out, bg_img)
+            out = out.convert('RGB')
+            draw = ImageDraw.Draw(out)  # Refresh draw context after mode change
 
         # Render step elements with supersampled quality
         if not self.step_elements:
-            return
+            return out
 
         from PIL import ImageFilter
 
@@ -4835,7 +4933,7 @@ class AnnotationEditor:
         SS = 4
         pad = 26
 
-        img_w, img_h = self.image.size
+        img_w, img_h = out.size
 
         for elem in self.step_elements:
             x_pos = elem['x']
@@ -4936,13 +5034,15 @@ class AnnotationEditor:
             tile_draw = ImageDraw.Draw(tile)
             tile_draw.text((tile_w / 2, tile_h / 2), str(step_num), fill=text_color, font=font, anchor="mm")
 
-            # Composite onto main image
-            base = self.image.convert('RGBA')
+            # Composite onto export image
+            base = out.convert('RGBA')
             ox = left
             oy = top
             base.alpha_composite(tile, dest=(ox, oy))
-            self.image = base.convert('RGB')
-    
+            out = base.convert('RGB')
+
+        return out
+
     # ------------------------------------------------------------------
     # Undo / redo
     #
@@ -5155,17 +5255,17 @@ class AnnotationEditor:
                     print(f"Failed to create directory: {e}")
                     return
             
-            # Render text elements to image before saving
-            self.render_annotations_to_image()
-            
+            # Compose annotations into a fresh export image
+            export_image = self.render_annotations_to_image()
+
             # Generate filename with timestamp
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             format_ext = self.settings.get('image_format', 'png')
             filename = f"screensnap_{timestamp}.{format_ext}"
             file_path = os.path.join(save_dir, filename)
-            
+
             # Save image
-            self.image.save(file_path)
+            export_image.save(file_path)
             self.last_saved_path = file_path
             print(f"Auto-saved: {file_path}")
             
@@ -5196,8 +5296,8 @@ class AnnotationEditor:
     
     def save(self, event=None):
         """Save the image via file dialog."""
-        # Render text elements to image before saving
-        self.render_annotations_to_image()
+        # Compose annotations into a fresh export image
+        export_image = self.render_annotations_to_image()
 
         file_path = filedialog.asksaveasfilename(
             title="Save Screenshot",
@@ -5212,11 +5312,11 @@ class AnnotationEditor:
 
         if file_path:
             try:
-                self.image.save(file_path)
+                export_image.save(file_path)
                 self.last_saved_path = file_path
                 # Also update the library copy if this image originated from library
                 if self.library_path and os.path.exists(self.library_path):
-                    self.image.save(self.library_path)
+                    export_image.save(self.library_path)
                 self.status_var.set(f"Saved: {file_path}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save file: {e}")
@@ -5226,9 +5326,9 @@ class AnnotationEditor:
         import io
         import ctypes
         import ctypes.wintypes as w
-        self.render_annotations_to_image()
+        export_image = self.render_annotations_to_image()
         try:
-            img = self.image.convert('RGB')
+            img = export_image.convert('RGB')
             buf = io.BytesIO()
             img.save(buf, format='BMP')
             dib_data = buf.getvalue()[14:]  # skip BITMAPFILEHEADER
@@ -5260,14 +5360,14 @@ class AnnotationEditor:
 
     def ocr_current_image(self):
         """Extract text from current image via Tesseract and show preview dialog."""
-        # Bake annotations into self.image, matching Copy Image / Save behavior.
-        self.render_annotations_to_image()
+        # Compose annotations into a fresh export image, matching Copy Image / Save behavior.
+        export_image = self.render_annotations_to_image()
 
         self.status_var.set("Running OCR...")
         self.root.config(cursor="watch")
         self.root.update()
         try:
-            text = run_ocr(self.image.copy(), self.settings)
+            text = run_ocr(export_image, self.settings)
         except TesseractNotFoundError:
             self.root.config(cursor="")
             self.status_var.set("OCR failed: Tesseract not found")
@@ -5322,8 +5422,8 @@ class AnnotationEditor:
 
     def save_and_copy(self):
         """Save the image and copy path to clipboard."""
-        # Render text elements to image before saving
-        self.render_annotations_to_image()
+        # Compose annotations into a fresh export image
+        export_image = self.render_annotations_to_image()
 
         # If we have a last saved path, use it
         if self.last_saved_path:
@@ -5345,7 +5445,7 @@ class AnnotationEditor:
 
         if file_path:
             try:
-                self.image.save(file_path)
+                export_image.save(file_path)
                 self.last_saved_path = file_path
 
                 # Copy absolute path to clipboard
@@ -5358,8 +5458,8 @@ class AnnotationEditor:
 
     def share_to_imgbb(self):
         """Upload image to ImgBB and copy link to clipboard."""
-        # Render text elements to image before uploading
-        self.render_annotations_to_image()
+        # Compose annotations into a fresh export image
+        export_image = self.render_annotations_to_image()
 
         api_key = self.settings.get('imbb_api_key', '')
         if not api_key:
@@ -5378,7 +5478,7 @@ class AnnotationEditor:
         self.root.update()
 
         try:
-            result = upload_to_imgbb(self.image, api_key, auto_delete_seconds=86400)
+            result = upload_to_imgbb(export_image, api_key, auto_delete_seconds=86400)
 
             if 'error' in result:
                 self.status_var.set(f"ImgBB upload failed: {result['error']}")

@@ -20,17 +20,12 @@ if not exist "screensnap.ico" (
 )
 
 echo [1/2] Building ScreenSnap.exe...
-pyinstaller --onefile --windowed --name ScreenSnap --icon=screensnap.ico ^
-    --hidden-import PIL --hidden-import pyperclip --hidden-import tkinter ^
-    --hidden-import pytesseract ^
-    --clean screensnap.py
+pyinstaller --clean --noconfirm ScreenSnap.spec
 if errorlevel 1 goto :fail
 
 echo.
 echo [2/2] Building ScreenSnapMonitor.exe...
-pyinstaller --onefile --windowed --name ScreenSnapMonitor --icon=screensnap.ico ^
-    --hidden-import keyboard --hidden-import pystray --hidden-import PIL ^
-    --clean screensnap-printscreen-monitor.py
+pyinstaller --clean --noconfirm ScreenSnapMonitor.spec
 if errorlevel 1 goto :fail
 
 echo.

@@ -1,3 +1,75 @@
+## 2026-05-08
+
+### Fix step tool "mirror image" / ghost duplicates on save
+**Files Changed:** `screensnap.py`
+
+- Symptom: a saved screenshot showed step "1" rendered twice at slightly offset positions (looked like "11"). Triggered when any save-like action ran more than once during a session, especially after dragging a step between calls.
+- Root cause: `render_annotations_to_image()` was mutating `self.image` in place (alpha-compositing every step/shape/text/bubble/stamp onto it). It is invoked from 6 entry points (auto-save, manual save, copy-to-clipboard, OCR, save-and-copy, share-to-imgbb), and never restored a clean baseline. Repeated calls re-baked elements on top of already-baked pixels — and dragged elements left ghosts at their old positions.
+- Fix: refactored `render_annotations_to_image()` to operate on a local `out = self.image.copy()` and **return** the composed image instead of mutating `self.image`. `self.image` now stays pristine (only crop/blur destructively modify it), so re-rendering is idempotent. Updated all 6 callers to use the returned image, including the library-copy save path inside `save()`.
+
+**Deployment:** Not deployed
+
+---
+
+## 2026-05-03
+
+### Center editor action buttons
+**Files Changed:** `screensnap.py`
+
+- Editor toolbar's `actions_frame` (SHARE | SAVE & COPY | OCR | COPY IMAGE | REGION | LAUNCHER) was packed with `side='right'`, pinning the whole group to the right edge of the second toolbar row. Changed to `anchor='center'` so the group sits in the middle of the row.
+- Inner buttons keep `side='right'` so left-to-right visual order is unchanged.
+- Rebuilt `dist\ScreenSnap.exe` (20 MB) and `installer-output\ScreenSnap-Setup-1.1.0.exe` (67 MB).
+
+**Deployment:** Built locally
+
+---
+
+### Fix 3 GB EXE bloat — exclude unused heavy packages
+**Files Changed:** `ScreenSnap.spec`, `ScreenSnapMonitor.spec`, `build-exe.bat`
+
+- Symptom: `dist\ScreenSnap.exe` was 3,008 MB (and the installer 3,045 MB), causing PC lag during use, slow PrtSc launches (onefile extraction took ages), and a broken installer experience.
+- Root cause: `excludes=[]` was empty in both `.spec` files, and `build-exe.bat` was regenerating the spec from CLI args (which discards spec edits). PyInstaller's analysis of `screensnap.py`'s deps was transitively pulling in matplotlib, numpy, nltk, playwright, pygame, yt_dlp, torch, IPython, sqlalchemy, lxml, etc. from the user's global `site-packages` — none of which are used by ScreenSnap. Confirmed via `build/ScreenSnap/PKG-00.toc` (82,290 entries, 3 GB `ScreenSnap.pkg`).
+- Added explicit `excludes=[...]` list to both `ScreenSnap.spec` and `ScreenSnapMonitor.spec` (matplotlib, numpy, scipy, pandas, nltk, lark, torch, accelerate, transformers, sklearn, playwright, selenium, pygame, yt_dlp, cv2, IPython, jupyter*, prompt_toolkit, sqlalchemy, lxml, fastapi/flask/django/etc., requests, lxml, pytest, sphinx, cython, setuptools, pip; monitor also excludes tkinter).
+- Switched `build-exe.bat` to invoke `pyinstaller --clean --noconfirm ScreenSnap.spec` and the equivalent for the monitor — so future rebuilds honor the spec exclude list instead of overwriting it.
+- Smoke-tested: `dist\ScreenSnap.exe --help` runs cleanly, confirming PIL/pyperclip/tkinter/pytesseract still resolve at runtime.
+- Also removed stale `.printscreen-monitor.lock` (held dead PID 25604).
+
+**Result sizes:**
+- `dist\ScreenSnap.exe`: 3,008 MB → **20 MB** (~150×)
+- `dist\ScreenSnapMonitor.exe`: 28 MB → **16 MB**
+- `installer-output\ScreenSnap-Setup-1.1.0.exe`: 3,045 MB → **67 MB** (~45×)
+- ~6 GB freed by deleting old `build/` and `dist/`
+
+**Deployment:** Built locally; new installer at `installer-output\ScreenSnap-Setup-1.1.0.exe`
+
+---
+
+## 2026-05-02
+
+### Editor toolbar: split actions onto own row
+**Files Changed:** `screensnap.py`
+
+- The editor packed Tools/History/Colors (left) and 6 action buttons including SAVE & COPY (right) all in one row inside `create_toolbar` (~line 2290). On smaller screens the left groups consumed all the width and clipped the right-side actions off the visible toolbar.
+- Wrapped the toolbar in a `container` Frame and moved the actions group to a dedicated second row (`actions_bar`) packed below the main toolbar. Same right-aligned button order (SHARE | SAVE & COPY | OCR | COPY IMAGE | REGION | LAUNCHER), now always visible regardless of window width.
+- Removed the now-orphaned vertical separator that previously divided colors from actions.
+
+**Deployment:** Not deployed
+
+---
+
+## 2026-04-23
+
+### Freeze screen during region selection
+**Files Changed:** `screensnap.py`
+
+- `RegionSelector` now captures a full virtual-screen snapshot (`ImageGrab.grab`) before showing the overlay, so anything moving on screen (mouse, animations, live video) stays still while the user drags a selection.
+- Removed the `-alpha 0.4` window transparency that was letting the live screen bleed through; the overlay now paints a dimmed copy of the frozen snapshot as its background, and `on_drag` reveals the un-dimmed patch inside the selection rectangle for a classic "bright region, dimmed surround" look.
+- `on_release` crops the result from the frozen snapshot (scaled back to its physical resolution via stored `scale_x/scale_y`) instead of re-grabbing the live screen; a live-grab fallback remains if the freeze step itself failed.
+
+**Deployment:** Not deployed
+
+---
+
 ## 2026-04-22
 
 ### Bundle Tesseract in portable installer

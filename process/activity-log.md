@@ -1,3 +1,16 @@
+## 2026-05-11
+
+### Fix step tool digit appearing outside teardrop bulb
+**Files Changed:** `screensnap.py`
+
+- Symptom: at certain rotations the step number rendered outside the teardrop, near the tail tip or off the shape entirely (visible on `screensnap_20260511_101910.png`'s "Step 1").
+- Root cause: `_render_step_image()` (live preview) and the save-time step renderer both drew the digit at the tile's geometric center, but the teardrop's bulb (model-space center `(50, 50)`) is offset from the polygon bbox center `(72.5, 50)`. Already wrong unrotated; rotation around the tile center swings the bulb around while the digit stayed put, so it could land outside the bulb entirely.
+- Fix: for `shape == 'teardrop'`, compute the bulb center in supersampled coords, push it through the same PIL `rotate(-rotation, expand=True)` transform (rotating the layer corners to recover the expand offset), then scale to the final tile dimensions. Verified the rotation forward-transform matches PIL within ~1 px across 0°/30°/45°/90°/180°/270°/-60°. Non-teardrop shapes still anchor at tile center.
+
+**Deployment:** Not deployed
+
+---
+
 ## 2026-05-08
 
 ### Fix Save & Copy / Copy Image silently no-op'ing under clipboard contention

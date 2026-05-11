@@ -3597,6 +3597,8 @@ class AnnotationEditor:
             shadow_layer_expanded.paste(shadow_layer, (offset_x, offset_y))
             tile = Image.alpha_composite(shadow_layer_expanded, shape_layer)
         else:
+            new_ss_w = ss_w
+            new_ss_h = ss_h
             tile = Image.alpha_composite(shadow_layer, shape_layer)
 
         target_w = max(1, int(round(sw * zoom)))
@@ -3618,8 +3620,36 @@ class AnnotationEditor:
             font = ImageFont.load_default()
 
         draw = ImageDraw.Draw(tile)
-        tcx = tile.width / 2
-        tcy = tile.height / 2
+        if shape == 'teardrop':
+            # Teardrop bulb sits at model (50,50) — offset from the polygon bbox center,
+            # so anchoring at the tile center lands the digit on the tail. Track the bulb
+            # through the same rotate-with-expand transform, then scale to tile coords.
+            bulb_x_ss = mx + 50 * ss_scale
+            bulb_y_ss = my + 50 * ss_scale
+            if rotation and rotation % 360 != 0:
+                r = math.radians(rotation)
+                cos_r = math.cos(r)
+                sin_r = math.sin(r)
+                crx, cry = ss_w / 2, ss_h / 2
+                def _rot(px, py):
+                    dx = px - crx
+                    dy = py - cry
+                    return crx + dx * cos_r - dy * sin_r, cry + dx * sin_r + dy * cos_r
+                _corners = [(0, 0), (ss_w, 0), (ss_w, ss_h), (0, ss_h)]
+                _rotated = [_rot(p[0], p[1]) for p in _corners]
+                _min_x = min(p[0] for p in _rotated)
+                _min_y = min(p[1] for p in _rotated)
+                _bx, _by = _rot(bulb_x_ss, bulb_y_ss)
+                bulb_after_x = _bx - _min_x
+                bulb_after_y = _by - _min_y
+            else:
+                bulb_after_x = bulb_x_ss
+                bulb_after_y = bulb_y_ss
+            tcx = bulb_after_x * tile.width / new_ss_w
+            tcy = bulb_after_y * tile.height / new_ss_h
+        else:
+            tcx = tile.width / 2
+            tcy = tile.height / 2
         draw.text((tcx, tcy), str(step_num), fill=text_color, font=font, anchor="mm")
 
         # Convert to PhotoImage
@@ -5013,8 +5043,10 @@ class AnnotationEditor:
                 # Composite
                 tile = Image.alpha_composite(shadow_layer_expanded, shape_layer)
             else:
+                new_ss_w = ss_size[0]
+                new_ss_h = ss_size[1]
                 tile = Image.alpha_composite(shadow_layer, shape_layer)
-            
+
             tile = tile.resize((tile_w, tile_h), Image.LANCZOS)
 
             # Draw number on tile (will NOT be rotated)
@@ -5032,7 +5064,38 @@ class AnnotationEditor:
                 font = ImageFont.load_default()
 
             tile_draw = ImageDraw.Draw(tile)
-            tile_draw.text((tile_w / 2, tile_h / 2), str(step_num), fill=text_color, font=font, anchor="mm")
+            if shape == 'teardrop':
+                # Match _render_step_image: anchor digit on the bulb (model 50,50),
+                # tracking it through rotate-with-expand so it lands inside the bulb
+                # rather than near the tail / outside the shape.
+                bulb_x_ss = mx + step_size * SS / 2
+                bulb_y_ss = my + step_size * SS / 2
+                if rotation and rotation % 360 != 0:
+                    r = math.radians(rotation)
+                    cos_r = math.cos(r)
+                    sin_r = math.sin(r)
+                    crx, cry = ss_w / 2, ss_h / 2
+                    def _rot(px, py):
+                        dx = px - crx
+                        dy = py - cry
+                        return crx + dx * cos_r - dy * sin_r, cry + dx * sin_r + dy * cos_r
+                    _w, _h = ss_size
+                    _corners = [(0, 0), (_w, 0), (_w, _h), (0, _h)]
+                    _rotated = [_rot(p[0], p[1]) for p in _corners]
+                    _min_x = min(p[0] for p in _rotated)
+                    _min_y = min(p[1] for p in _rotated)
+                    _bx, _by = _rot(bulb_x_ss, bulb_y_ss)
+                    bulb_after_x = _bx - _min_x
+                    bulb_after_y = _by - _min_y
+                else:
+                    bulb_after_x = bulb_x_ss
+                    bulb_after_y = bulb_y_ss
+                tcx = bulb_after_x * tile_w / new_ss_w
+                tcy = bulb_after_y * tile_h / new_ss_h
+            else:
+                tcx = tile_w / 2
+                tcy = tile_h / 2
+            tile_draw.text((tcx, tcy), str(step_num), fill=text_color, font=font, anchor="mm")
 
             # Composite onto export image
             base = out.convert('RGBA')

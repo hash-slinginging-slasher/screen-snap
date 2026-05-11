@@ -3479,13 +3479,25 @@ class AnnotationEditor:
     def _render_step_image(self, elem, zoom=1.0):
         """Render a step element to a PhotoImage, optionally scaled by `zoom`.
 
+        Returns (PhotoImage, width, height) for canvas display. The pixel
+        data is produced by _render_step_pil; this method just wraps it for
+        Tk. The save renderer calls _render_step_pil directly so saved
+        files use the same pipeline (and therefore land in the same place)
+        as the live preview.
+        """
+        tile = self._render_step_pil(elem, zoom=zoom)
+        photo = ImageTk.PhotoImage(tile)
+        return photo, tile.width, tile.height
+
+    def _render_step_pil(self, elem, zoom=1.0):
+        """Render a step element to a PIL RGBA Image, optionally scaled by `zoom`.
+
         At ``zoom`` = 1.0 the returned tile matches the element's
         image-space size. Larger/smaller zooms produce a correspondingly
         larger/smaller tile so the step lines up with the zoomed canvas
         background. The 4× supersampling is still performed in image
         space, then the final downsample targets the zoomed size, which
         keeps edges crisp at arbitrary zoom levels.
-        Returns (PhotoImage, width, height) for canvas display.
         """
         from PIL import ImageFilter
 
@@ -3621,10 +3633,13 @@ class AnnotationEditor:
 
         draw = ImageDraw.Draw(tile)
         if shape == 'teardrop':
-            # Teardrop bulb sits at model (50,50) — offset from the polygon bbox center,
-            # so anchoring at the tile center lands the digit on the tail. Track the bulb
-            # through the same rotate-with-expand transform, then scale to tile coords.
-            bulb_x_ss = mx + 50 * ss_scale
+            # Anchor the digit at the centroid of the bulb half-disk (model
+            # (50 - 4r/3π, 50)). Using the arc center (50, 50) lands the
+            # digit at the diameter — the boundary with the tail — so it
+            # looks off-center; the tile bbox center lands it on the tail
+            # at certain rotations. Track this anchor through the same
+            # rotate-with-expand transform, then scale to tile coords.
+            bulb_x_ss = mx + (50 - 4 * 40 / (3 * math.pi)) * ss_scale
             bulb_y_ss = my + 50 * ss_scale
             if rotation and rotation % 360 != 0:
                 r = math.radians(rotation)
@@ -3652,9 +3667,60 @@ class AnnotationEditor:
             tcy = tile.height / 2
         draw.text((tcx, tcy), str(step_num), fill=text_color, font=font, anchor="mm")
 
-        # Convert to PhotoImage
-        photo = ImageTk.PhotoImage(tile)
-        return photo, tile.width, tile.height
+        return tile
+
+    def _teardrop_anchor_in_tile(self, step_size, rotation, model_x, model_y):
+        """Return where a teardrop model-space point (model_x, model_y) lands in
+        the final downsampled (zoom=1) tile coords, accounting for rotation.
+
+        Polygon model space spans x[10,135] y[10,90]: tail tip is (135, 50),
+        arc center (bulb diameter) is (50, 50), bulb half-disk centroid is
+        (50 - 4*40/(3*pi), 50).
+        """
+        pad = 10
+        SS = 4
+        rect_w = step_size * 1.4
+        rect_h = step_size
+        sw = int(rect_w) + pad * 2
+        sh = int(rect_h) + pad * 2
+        ss_w = sw * SS
+        ss_h = sh * SS
+        ss_scale = step_size * SS / 100.0
+        mx = pad * SS
+        my = pad * SS
+
+        p_x_ss = mx + model_x * ss_scale
+        p_y_ss = my + model_y * ss_scale
+
+        if rotation and rotation % 360 != 0:
+            r = math.radians(rotation)
+            cos_r = math.cos(r)
+            sin_r = math.sin(r)
+            crx, cry = ss_w / 2, ss_h / 2
+
+            def _rot(px, py):
+                dx = px - crx
+                dy = py - cry
+                return crx + dx * cos_r - dy * sin_r, cry + dx * sin_r + dy * cos_r
+
+            corners = [(0, 0), (ss_w, 0), (ss_w, ss_h), (0, ss_h)]
+            rotated = [_rot(c[0], c[1]) for c in corners]
+            min_x = min(p[0] for p in rotated)
+            max_x = max(p[0] for p in rotated)
+            min_y = min(p[1] for p in rotated)
+            max_y = max(p[1] for p in rotated)
+            new_ss_w = max_x - min_x
+            new_ss_h = max_y - min_y
+            _bx, _by = _rot(p_x_ss, p_y_ss)
+            anchor_x = _bx - min_x
+            anchor_y = _by - min_y
+        else:
+            new_ss_w = ss_w
+            new_ss_h = ss_h
+            anchor_x = p_x_ss
+            anchor_y = p_y_ss
+
+        return anchor_x * sw / new_ss_w, anchor_y * sh / new_ss_h
 
     def add_step_element(self, x, y):
         """Add a numbered step marker at the given position (canvas-only until save)."""
@@ -3664,10 +3730,6 @@ class AnnotationEditor:
 
         self.step_counter += 1
         step_num = self.step_counter
-
-        half_size = self.step_size // 2
-        x_pos = x - half_size
-        y_pos = y - half_size
 
         # Marker dimensions
         if self.step_shape == 'rounded_rect':
@@ -3679,6 +3741,21 @@ class AnnotationEditor:
         else:
             rect_width = self.step_size
             rect_height = self.step_size
+
+        # Place the tile so the click point coincides with the visual anchor
+        # of the marker. For the teardrop the anchor is the tail tip — the
+        # marker visually points at what the user clicked. For symmetric
+        # shapes the click sits at the tile center.
+        if self.step_shape == 'teardrop':
+            tip_x, tip_y = self._teardrop_anchor_in_tile(
+                self.step_size, self.step_rotation, 135, 50
+            )
+            x_pos = x - tip_x
+            y_pos = y - tip_y
+        else:
+            half_size = self.step_size // 2
+            x_pos = x - half_size
+            y_pos = y - half_size
 
         # Fill colour
         fill_color = self.current_color
@@ -4976,6 +5053,22 @@ class AnnotationEditor:
             text_color = elem.get('text_color', 'white')
             step_num = elem['number']
 
+            # Teardrops go through the live-preview pipeline so the saved
+            # file's tail tip lands at the same canvas pixel the user sees in
+            # the editor. The earlier save-only renderer used different pad
+            # and rotation-center conventions, which shifted the saved tail
+            # tip ~10 px up-left of the click for unrotated teardrops and
+            # produced a larger offset at non-zero rotations.
+            if shape == 'teardrop':
+                tile = self._render_step_pil(elem, zoom=1.0)
+                base = out.convert('RGBA')
+                base.alpha_composite(
+                    tile,
+                    dest=(int(round(x_pos)), int(round(y_pos))),
+                )
+                out = base.convert('RGB')
+                continue
+
             # Parse fill color
             if isinstance(fill_color, str) and fill_color.startswith('#'):
                 r = int(fill_color[1:3], 16)
@@ -5020,6 +5113,9 @@ class AnnotationEditor:
                 shadow_draw.rounded_rectangle([mx + sox, my + soy, mx + ss_w + sox, my + ss_h + soy], radius=radius_ss, fill=shadow_rgba)
                 shape_draw.rounded_rectangle([mx, my, mx + ss_w, my + ss_h], radius=radius_ss, fill=fill_color)
             elif shape == 'teardrop':
+                # Unreachable — teardrops are handled at the top of the loop
+                # via the live-preview pipeline. Kept only so the elif chain
+                # is exhaustive.
                 ss_scale = (step_size * SS) / 100.0
                 shadow_draw.polygon(get_poly_pts(mx, my, ss_scale, sox, soy), fill=shadow_rgba)
                 shape_draw.polygon(get_poly_pts(mx, my, ss_scale), fill=fill_color)
@@ -5065,11 +5161,13 @@ class AnnotationEditor:
 
             tile_draw = ImageDraw.Draw(tile)
             if shape == 'teardrop':
-                # Match _render_step_image: anchor digit on the bulb (model 50,50),
-                # tracking it through rotate-with-expand so it lands inside the bulb
-                # rather than near the tail / outside the shape.
-                bulb_x_ss = mx + step_size * SS / 2
-                bulb_y_ss = my + step_size * SS / 2
+                # Match _render_step_image: anchor digit at the centroid of
+                # the bulb half-disk (model (50 - 4r/3π, 50)) — the visual
+                # middle of the round portion, away from the tail boundary.
+                # Use the shifted polygon origin (poly_mx, poly_my) so the
+                # digit tracks the polygon's actual position in the tile.
+                bulb_x_ss = poly_mx + (50 - 4 * 40 / (3 * math.pi)) * ss_scale
+                bulb_y_ss = poly_my + 50 * ss_scale
                 if rotation and rotation % 360 != 0:
                     r = math.radians(rotation)
                     cos_r = math.cos(r)

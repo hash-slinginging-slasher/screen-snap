@@ -1,11 +1,23 @@
 ## 2026-05-11
 
+### Anchor teardrop tail tip at the click point (both editor and saved file)
+**Files Changed:** `screensnap.py`
+
+- Symptom: clicking with the teardrop step tool placed the marker's tile center at the click — but the tail tip is at the far right of the tile, so the visual "pointer" tip ended up tens of pixels away from the target the user clicked. Even after fixing the live preview, the *saved* file's tip still landed ~10 px above-left of the click.
+- Root cause for the save discrepancy: the save renderer used `pad=26` for tile crops and rotated around the polygon's bbox center, while the live preview used `pad=10` and rotated around the layer center. Drawing the polygon at `(pad_save, pad_save)` shifted it 10 px relative to where the live preview drew it. Inconsistent rotation centers and layer dimensions also caused a larger discrepancy at non-zero rotations.
+- Fix: (1) Added `_teardrop_anchor_in_tile(step_size, rotation, model_x, model_y)` that computes where any model-space point lands in the final downsampled tile, using the same rotate-with-expand math as the digit anchor. (2) `add_step_element` now places the tile for teardrops so the tail tip (model `(135, 50)`) lands at the click; other shapes still use `x - half_size`. (3) Refactored `_render_step_image` to delegate to a new `_render_step_pil` that returns a PIL Image. The save renderer reuses `_render_step_pil` for teardrops and composites at `(elem['x'], elem['y'])`, so the saved file uses the exact same pipeline (pad, rotation center, dimensions) as the live preview. Non-teardrop shapes still go through the existing save-render path (their save placement was already correct).
+- Not changed: rotating or resizing an already-placed teardrop still pivots around the tile origin, so the tip moves on the canvas. Can be revisited if it becomes annoying.
+
+**Deployment:** Not deployed
+
+---
+
 ### Fix step tool digit appearing outside teardrop bulb
 **Files Changed:** `screensnap.py`
 
 - Symptom: at certain rotations the step number rendered outside the teardrop, near the tail tip or off the shape entirely (visible on `screensnap_20260511_101910.png`'s "Step 1").
-- Root cause: `_render_step_image()` (live preview) and the save-time step renderer both drew the digit at the tile's geometric center, but the teardrop's bulb (model-space center `(50, 50)`) is offset from the polygon bbox center `(72.5, 50)`. Already wrong unrotated; rotation around the tile center swings the bulb around while the digit stayed put, so it could land outside the bulb entirely.
-- Fix: for `shape == 'teardrop'`, compute the bulb center in supersampled coords, push it through the same PIL `rotate(-rotation, expand=True)` transform (rotating the layer corners to recover the expand offset), then scale to the final tile dimensions. Verified the rotation forward-transform matches PIL within ~1 px across 0°/30°/45°/90°/180°/270°/-60°. Non-teardrop shapes still anchor at tile center.
+- Root cause: `_render_step_image()` (live preview) and the save-time step renderer both drew the digit at the tile's geometric center, but the teardrop's bulb is offset from the polygon bbox center. Already wrong unrotated; rotation around the tile center swings the bulb around while the digit stayed put, so it could land outside the bulb entirely.
+- Fix: for `shape == 'teardrop'`, anchor the digit at the centroid of the bulb half-disk (model `(50 − 4r/3π, 50)` ≈ `(33, 50)`) rather than the arc center / bbox center. Initially used the arc center `(50, 50)` but that lands on the bulb's diameter — the boundary with the tail — so the digit visually straddled the bulb/tail edge. The half-disk centroid is the visual middle of the round portion. The anchor is tracked through the same PIL `rotate(-rotation, expand=True)` transform (rotating the layer corners to recover the expand offset), then scaled to the final tile dimensions. Rotation forward-transform verified against PIL within ~1 px across 0°/30°/45°/90°/180°/270°/-60°. Non-teardrop shapes still anchor at tile center.
 
 **Deployment:** Not deployed
 

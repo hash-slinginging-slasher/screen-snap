@@ -25,6 +25,7 @@ settings.ini
 # Tooling
 .claude/
 .qwen/
+node_modules/
 
 # Locally-installed Inno Setup + installer build output
 inno/Inno Setup 6/

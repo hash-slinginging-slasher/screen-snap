@@ -1,5 +1,18 @@
 ## 2026-07-05
 
+### Library browser: group screenshots by creation date
+**Files Changed:** `screensnap.py`
+
+- Replaced the flat `tk.Listbox` with a Midnight-styled `ttk.Treeview` (`Library.Treeview` style): files are grouped under date headers ("Today", "Yesterday", full date otherwise) with per-group counts.
+- Groups sort newest-first; files inside each group sort newest-first; "Today" (or the newest group when nothing was captured today) is expanded by default, the rest collapsed. Grouping uses `st_ctime` (creation time on Windows).
+- Double-click/Enter opens a file in the editor; double-clicking a header just toggles the group. Delete keeps the surrounding groups' expanded state.
+- Verified live with a synthetic library (backdated file via `SetFileTime`): 2 groups, Today expanded, correct item→path mapping.
+
+**Deployment:** committed in e53db98; `dist\ScreenSnap.exe` + installer rebuilt
+**Test Results:** `test_storage_paths.py`, `test_printscreen_coordination.py` — ALL PASSED
+
+---
+
 ### Library now follows the Storage Location setting; probe-based config dir
 **Files Changed:** `screensnap.py`, `test_storage_paths.py` (new)
 

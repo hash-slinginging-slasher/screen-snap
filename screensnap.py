@@ -67,6 +67,8 @@ import io
 
 import configparser
 import datetime
+import tempfile
+import atexit
 
 # ── Midnight Architect Design System (The "Stitch" Design) ──────────
 class Theme:
@@ -335,6 +337,164 @@ _WM_HOTKEY = 0x0312
 _MOD_NOREPEAT = 0x4000
 
 
+# ── Cross-process PrtScn coordination ──────────────────────────────
+# The launcher registers PrtScn in-process via RegisterHotKey, while the
+# external tray monitor (screensnap-printscreen-monitor.py) hooks the same
+# key. Both would otherwise fire on one press. To make them mutually
+# exclusive, the process that *owns* the in-app hotkey writes its PID to a
+# shared marker file. The monitor skips its own handling whenever a live
+# owner is present, so the in-app hotkey wins when a ScreenSnap window is
+# open and the monitor only acts when none is running.
+#
+# The marker lives in the temp dir (not next to the exe) so it is reliably
+# writable/discoverable regardless of install location (e.g. Program Files).
+
+def hotkey_owner_lockfile():
+    """Path to the shared marker identifying the in-app PrtScn hotkey owner."""
+    return os.path.join(tempfile.gettempdir(), "screensnap-hotkey-owner.lock")
+
+
+def monitor_lockfile():
+    """Path to the shared marker identifying the live PrtScn monitor.
+
+    Global (temp dir), NOT per-install-directory: a source-run and a
+    dist-run ScreenSnap would otherwise each auto-start their own monitor,
+    and one PrtScn press would spawn two capture processes.
+    """
+    return os.path.join(tempfile.gettempdir(), "screensnap-monitor.lock")
+
+
+def pid_alive(pid):
+    """Robust Windows process-liveness check.
+
+    os.kill(pid, 0) is unreliable on Windows (it does not raise for a dead
+    PID), so probe via OpenProcess + GetExitCodeProcess instead.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform != 'win32':
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _pid_process_name(pid):
+    """Best-effort executable basename for a PID ('' if unknown)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ''
+    if pid <= 0 or sys.platform != 'win32':
+        return ''
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ''
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if not k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ''
+        return os.path.basename(buf.value).lower()
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _pid_is_screensnap(pid):
+    """True if the PID's executable looks like ScreenSnap or a Python host.
+
+    Windows recycles PIDs aggressively, so a bare liveness check on a stale
+    PID marker can match an unrelated process — the monitor would then defer
+    to a ghost owner and PrtScn would silently go dead until that process
+    exits. If the image name can't be read, treat the PID as foreign: a
+    double-fire is recoverable, a dead hotkey is not.
+    """
+    if sys.platform != 'win32':
+        return True
+    name = _pid_process_name(pid)
+    return ('screensnap' in name) or name.startswith('python')
+
+
+def hotkey_owner_active():
+    """True if a live ScreenSnap process currently owns the in-app hotkey."""
+    try:
+        path = hotkey_owner_lockfile()
+        if not os.path.exists(path):
+            return False
+        with open(path) as f:
+            pid = int((f.read().strip() or "0"))
+        return pid_alive(pid) and _pid_is_screensnap(pid)
+    except Exception:
+        return False
+
+
+def _write_hotkey_owner():
+    """Claim ownership of the in-app PrtScn hotkey for this process."""
+    try:
+        with open(hotkey_owner_lockfile(), "w") as f:
+            f.write(str(os.getpid()))
+        # The pump thread's finally-cleanup never runs at interpreter exit
+        # (daemon thread stuck in GetMessageW), so also clear the marker at
+        # process exit — a stale marker mutes the external monitor.
+        atexit.register(_clear_hotkey_owner)
+    except Exception:
+        pass
+
+
+def _clear_hotkey_owner():
+    """Release ownership, but only if the marker still points at us."""
+    try:
+        path = hotkey_owner_lockfile()
+        if os.path.exists(path):
+            with open(path) as f:
+                pid = int((f.read().strip() or "0"))
+            if pid == os.getpid():
+                os.remove(path)
+    except Exception:
+        pass
+
+
+def _monitor_lock_active(lock_file):
+    """True if the monitor lockfile points at a live monitor process.
+
+    os.kill(pid, 0) is NOT a liveness probe on Windows — it sends
+    CTRL_C_EVENT and errors out for detached processes, which made a healthy
+    monitor look dead. Every launcher start then spawned a duplicate monitor,
+    and one PrtScn press fanned out into several overlapping capture
+    processes whose windows ended up inside each other's screenshots.
+    """
+    try:
+        lock_file = Path(lock_file)
+        if not lock_file.exists():
+            return False
+        pid = int(lock_file.read_text().strip() or "0")
+        return pid_alive(pid) and _pid_is_screensnap(pid)
+    except Exception:
+        return False
+
+
 def _hotkey_worker():
     """Background thread: register PrtScn and pump Windows messages."""
     from ctypes import wintypes
@@ -344,6 +504,9 @@ def _hotkey_worker():
         print("ScreenSnap: could not register PrintScreen hotkey "
               "(another app may own it).", file=sys.stderr)
         return
+    # Announce that this process owns the in-app hotkey so the external
+    # monitor stays passive and PrtScn does not double-fire.
+    _write_hotkey_owner()
     try:
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
@@ -356,6 +519,7 @@ def _hotkey_worker():
                         pass
     finally:
         user32.UnregisterHotKey(None, _HOTKEY_ID)
+        _clear_hotkey_owner()
 
 
 def start_global_hotkey(callback):
@@ -378,6 +542,12 @@ def start_global_hotkey(callback):
 # Prevents "pyimageN doesn't exist" errors when switching between
 # launcher and editor windows across multiple captures.
 _app_root = None
+
+# The currently-open AnnotationEditor (if any). While an editor is open the
+# launcher root is withdrawn, so the PrtScn hotkey handler needs this to
+# replace the editor with a fresh capture instead of going dead — the
+# external monitor defers to this process the whole time it owns the hotkey.
+_active_editor = None
 
 
 def _get_root():
@@ -460,8 +630,28 @@ def _clear_root(root):
     root.protocol('WM_DELETE_WINDOW', lambda: root.destroy())
 
 
+def _dir_writable(dir_path):
+    """True if dir_path exists (or can be created) AND is truly writable.
+
+    Probes with a real file write: os.access() is unreliable against
+    Windows ACLs, and an installed copy under C:\\Program Files gets
+    WinError 5 on any write attempt.
+    """
+    try:
+        dir_path = Path(dir_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        probe = dir_path / f".write-probe-{os.getpid()}"
+        probe.write_text("")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
 class SettingsManager:
     """Manages application settings persistence using INI file."""
+
+    _resolved_config_dir = None  # cached CONFIG_DIR resolution
 
     @staticmethod
     def _get_base_dir():
@@ -475,20 +665,19 @@ class SettingsManager:
 
     @classmethod
     def CONFIG_DIR(cls):
-        """Get the config directory path.
-
-        When frozen and installed under Program Files (not writable),
-        fall back to %APPDATA%\\ScreenSnap\\config.
+        """Config dir: next to the exe/script when writable (portable mode),
+        else %APPDATA%\\ScreenSnap\\config — an installed copy lives under
+        C:\\Program Files where writes are denied. Probe-based rather than
+        matching "program files" in the path so custom install dirs behave.
         """
-        base = cls._get_base_dir()
-        candidate = base / "config"
-        if getattr(sys, 'frozen', False):
-            base_str = str(base).lower()
-            if "program files" in base_str:
-                appdata = os.environ.get('APPDATA')
-                if appdata:
-                    return Path(appdata) / "ScreenSnap" / "config"
-        return candidate
+        if cls._resolved_config_dir is None:
+            candidate = cls._get_base_dir() / "config"
+            if _dir_writable(candidate):
+                cls._resolved_config_dir = candidate
+            else:
+                appdata = os.environ.get('APPDATA') or str(Path.home() / 'AppData' / 'Roaming')
+                cls._resolved_config_dir = Path(appdata) / "ScreenSnap" / "config"
+        return cls._resolved_config_dir
 
     @classmethod
     def SETTINGS_FILE(cls):
@@ -564,9 +753,14 @@ class SettingsManager:
         except Exception as e:
             print(f"Failed to save settings: {e}")
 
+        # Storage Location may have changed — re-resolve the library folder
+        LibraryManager._resolved_dir = None
+
 
 class LibraryManager:
     """Manages the screenshot library folder."""
+
+    _resolved_dir = None  # cached LIBRARY_DIR resolution
 
     @staticmethod
     def _get_base_dir():
@@ -578,14 +772,36 @@ class LibraryManager:
 
     @classmethod
     def LIBRARY_DIR(cls):
-        """Get the library directory path."""
-        return cls._get_base_dir() / "library"
+        """Resolve the library folder.
+
+        The library IS the user's configured Storage Location
+        (default_save_path) when one is set and writable — the Library
+        browser must show the same folder captures are saved to. Falls
+        back to a 'library' folder next to the exe/script (portable mode),
+        then to %LOCALAPPDATA%\\ScreenSnap\\library — user data must never
+        require admin rights (the installed copy lives in Program Files).
+        """
+        if cls._resolved_dir is None:
+            configured = ''
+            try:
+                configured = (SettingsManager.load().get('default_save_path') or '').strip()
+            except Exception:
+                pass
+            portable = cls._get_base_dir() / "library"
+            if configured and _dir_writable(configured):
+                cls._resolved_dir = Path(configured)
+            elif _dir_writable(portable):
+                cls._resolved_dir = portable
+            else:
+                base = os.environ.get('LOCALAPPDATA') or str(Path.home() / 'AppData' / 'Local')
+                cls._resolved_dir = Path(base) / 'ScreenSnap' / 'library'
+        return cls._resolved_dir
 
     @classmethod
     def ensure_library(cls):
         """Ensure the library directory exists."""
         lib_dir = cls.LIBRARY_DIR()
-        lib_dir.mkdir(exist_ok=True)
+        lib_dir.mkdir(parents=True, exist_ok=True)
         return lib_dir
 
     @classmethod
@@ -742,145 +958,30 @@ class LauncherWindow:
 
     def __init__(self, mode=None, save_path=None):
         self.root = _get_root()
-        _clear_root(self.root)
-        self.root.deiconify()
-        self.root.title("ScreenSnap v1.1")
-        self.root.geometry("500x560")
-        self.root.resizable(False, False)
-        self.root.config(bg=Theme.BACKGROUND)
-
-        # Load settings
         self.settings = SettingsManager.load()
 
         # Auto-start Print Screen monitor if enabled in settings
         self._auto_start_printscreen_monitor()
 
-        # Center window
-        self.center_window()
-
-        # Main container with padding
-        main_container = tk.Frame(self.root, bg=Theme.BACKGROUND, padx=30, pady=30)
-        main_container.pack(fill='both', expand=True)
-
-        # Title
-        title = tk.Label(
-            main_container,
-            text="ScreenSnap",
-            font=("Segoe UI Semibold", 28),
-            fg=Theme.PRIMARY,
-            bg=Theme.BACKGROUND
-        )
-        title.pack(pady=(5, 0))
-
-        subtitle = tk.Label(
-            main_container,
-            text="Midnight Architect Edition",
-            font=("Segoe UI", 9, "bold"),
-            fg=Theme.ON_SURFACE_VARIANT,
-            bg=Theme.BACKGROUND
-        )
-        subtitle.pack(pady=(0, 40))
-
-        # Capture buttons
-        full_btn = ModernButton(
-            main_container,
-            variant="success",
-            text="📷  FULL SCREEN",
-            command=self.capture_full,
-            font=("Segoe UI Bold", 11)
-        )
-        full_btn.pack(fill='x', pady=8)
-
-        region_btn = ModernButton(
-            main_container,
-            variant="primary",
-            text="✂️  REGION SELECT",
-            command=self.capture_region,
-            font=("Segoe UI Bold", 11)
-        )
-        region_btn.pack(fill='x', pady=8)
-
-        text_btn = ModernButton(
-            main_container,
-            variant="action",
-            text="🔤  CAPTURE TEXT",
-            command=self.capture_text,
-            font=("Segoe UI Bold", 11)
-        )
-        text_btn.pack(fill='x', pady=8)
-
-        # Action buttons row
-        row_frame = tk.Frame(main_container, bg=Theme.BACKGROUND)
-        row_frame.pack(fill='x', pady=20)
-
-        library_btn = ModernButton(
-            row_frame,
-            variant="action",
-            text="📚 Library",
-            command=self.open_library,
-            width=15
-        )
-        library_btn.pack(side='left', expand=True, padx=(0, 5))
-
-        open_btn = ModernButton(
-            row_frame,
-            variant="action",
-            text="📂 Open File",
-            command=self.open_file,
-            width=15
-        )
-        open_btn.pack(side='left', expand=True, padx=(5, 0))
-
-        # Settings and Status
-        status_frame = tk.Frame(main_container, bg=Theme.SURFACE, padx=15, pady=15)
-        status_frame.pack(fill='x', pady=(20, 0))
-        
-        # Auto-save status
-        status_color = "#2E7D32" if self.settings.get('auto_save') else Theme.ON_SURFACE_VARIANT
-        status_text = "✓ Auto-save active" if self.settings.get('auto_save') else "• Manual mode"
-        
-        tk.Label(
-            status_frame,
-            text=status_text,
-            font=("Segoe UI Bold", 9),
-            fg=status_color,
-            bg=Theme.SURFACE
-        ) .pack(anchor='w')
-        
-        if self.settings.get('default_save_path'):
-            tk.Label(
-                status_frame,
-                text=self.settings['default_save_path'],
-                font=("Segoe UI", 8),
-                fg=Theme.ON_SURFACE_VARIANT,
-                bg=Theme.SURFACE,
-                wraplength=350,
-                justify="left"
-            ).pack(anchor='w', pady=(5, 0))
-
-        # Settings button - FIXED at bottom
-        settings_btn = ModernButton(
-            main_container,
-            variant="secondary",
-            text="⚙  SYSTEM SETTINGS",
-            command=self.open_settings,
-            font=("Segoe UI Bold", 10)
-        )
-        settings_btn.pack(fill='x', side='bottom', pady=(20, 0))
-        
         # Handle CLI mode if specified
         self.mode = mode
         self.save_path = save_path
-        
-        # Auto-execute if CLI mode specified
+
         if mode:
-            self.root.after(100, self.auto_execute)
+            # CLI/monitor-triggered capture: skip the launcher UI entirely.
+            # Building it first flashed the window for ~100ms on every
+            # PrtScn press and could bleed it into the frozen capture.
+            self.root.withdraw()
+            self.root.after(50, self.auto_execute)
+        else:
+            # Build and show the launcher UI
+            self._build_launcher_ui()
     
     def center_window(self):
         """Center the window on screen."""
         self.root.update_idletasks()
         width = 500
-        height = 520
+        height = 560
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
@@ -912,20 +1013,12 @@ class LauncherWindow:
         if not use_exe and not monitor_script.exists():
             return
 
-        # Lockfile check — avoids launching duplicates
-        lock_file = base_dir / ".printscreen-monitor.lock"
-        try:
-            if lock_file.exists():
-                pid = int(lock_file.read_text().strip() or "0")
-                if pid > 0:
-                    # Probe if process still alive
-                    try:
-                        os.kill(pid, 0)
-                        return  # already running
-                    except OSError:
-                        pass  # stale, fall through
-        except Exception:
-            pass
+        # Lockfile check — avoids launching duplicates. Must be a real
+        # liveness probe (os.kill(pid, 0) sends CTRL_C_EVENT on Windows and
+        # misreports detached processes as dead → duplicate monitors).
+        lock_file = Path(monitor_lockfile())
+        if _monitor_lock_active(lock_file):
+            return  # already running
 
         # Prefer pythonw.exe so no console window appears
         python_exe = sys.executable
@@ -980,8 +1073,7 @@ class LauncherWindow:
         """Execute full screen capture and open editor.
 
         If `screenshot` is provided, skip the capture step and use the
-        pre-captured image (used by the PrtScn hotkey path so the launcher
-        and anything else on screen are included in the shot).
+        pre-captured image.
         """
         try:
             if screenshot is None:
@@ -991,160 +1083,126 @@ class LauncherWindow:
             lib_path = LibraryManager.save_to_library(screenshot, fmt)
             self.root.withdraw()
             AnnotationEditor(screenshot, self.settings, library_path=lib_path)
-            # Editor closed — check if it was replaced by a new capture
-            if getattr(_app_root, '_replacing', False):
-                _app_root._replacing = False
-                return  # Don't rebuild, new editor is running
+            # Editor closed — if a replacement editor (REGION button / PrtScn
+            # while editing) is still open, don't rebuild the launcher over it.
+            # Checked live via _active_editor: a one-shot flag would misfire
+            # when a replaced editor is later closed via 🏠 LAUNCHER.
+            if _active_editor is not None and not _active_editor._closed:
+                return
             # Show launcher again
-            _clear_root(self.root)
-            self.root.deiconify()
             self._build_launcher_ui()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to capture screen: {e}")
-            self.root.deiconify()
+            self._build_launcher_ui()
 
     def _build_launcher_ui(self):
-        """Build/rebuild the launcher UI on the root."""
+        """Build/rebuild the Midnight Architect launcher UI on the root."""
+        _clear_root(self.root)
+        self.root.deiconify()
         self.root.title("ScreenSnap v1.1")
-        self.root.geometry("500x520")
+        self.root.geometry("500x560")
         self.root.resizable(False, False)
+        self.root.config(bg=Theme.BACKGROUND)
 
-        # Reload settings
+        # Reload settings so status reflects current state
         self.settings = SettingsManager.load()
 
-        # Main container with padding
-        main_container = ttk.Frame(self.root, padding=20)
+        self.center_window()
+
+        main_container = tk.Frame(self.root, bg=Theme.BACKGROUND, padx=30, pady=30)
         main_container.pack(fill='both', expand=True)
 
-        # Title
-        title = tk.Label(
+        tk.Label(
             main_container,
             text="ScreenSnap",
-            font=("Segoe UI", 22, "bold")
-        )
-        title.pack(pady=(5, 0))
+            font=("Segoe UI Semibold", 28),
+            fg=Theme.PRIMARY,
+            bg=Theme.BACKGROUND
+        ).pack(pady=(5, 0))
 
-        subtitle = tk.Label(
+        tk.Label(
             main_container,
-            text="Portable Screenshot Tool",
-            font=("Segoe UI", 9),
-            fg="gray"
-        )
-        subtitle.pack(pady=(0, 20))
+            text="Midnight Architect Edition",
+            font=("Segoe UI", 9, "bold"),
+            fg=Theme.ON_SURFACE_VARIANT,
+            bg=Theme.BACKGROUND
+        ).pack(pady=(0, 40))
 
-        # Capture buttons
-        full_btn = tk.Button(
+        ModernButton(
             main_container,
-            text="📷 Full Screen",
-            font=("Segoe UI", 13, "bold"),
+            variant="success",
+            text="📷  FULL SCREEN",
             command=self.capture_full,
-            bg="#4CAF50",
-            fg="white",
-            relief="flat",
-            cursor="hand2",
-            padx=15,
-            pady=10
-        )
-        full_btn.pack(fill='x', pady=5)
+            font=("Segoe UI Bold", 11)
+        ).pack(fill='x', pady=8)
 
-        region_btn = tk.Button(
+        ModernButton(
             main_container,
-            text="✂️ Region Select",
-            font=("Segoe UI", 13, "bold"),
+            variant="primary",
+            text="✂️  REGION SELECT",
             command=self.capture_region,
-            bg="#2196F3",
-            fg="white",
-            relief="flat",
-            cursor="hand2",
-            padx=15,
-            pady=10
-        )
-        region_btn.pack(fill='x', pady=5)
+            font=("Segoe UI Bold", 11)
+        ).pack(fill='x', pady=8)
 
-        text_btn = tk.Button(
+        ModernButton(
             main_container,
-            text="🔤 Capture Text",
-            font=("Segoe UI", 13, "bold"),
+            variant="action",
+            text="🔤  CAPTURE TEXT",
             command=self.capture_text,
-            bg="#9C27B0",
-            fg="white",
-            relief="flat",
-            cursor="hand2",
-            padx=15,
-            pady=10
-        )
-        text_btn.pack(fill='x', pady=5)
+            font=("Segoe UI Bold", 11)
+        ).pack(fill='x', pady=8)
 
-        # Library button
-        library_btn = tk.Button(
-            main_container,
+        row_frame = tk.Frame(main_container, bg=Theme.BACKGROUND)
+        row_frame.pack(fill='x', pady=20)
+
+        ModernButton(
+            row_frame,
+            variant="action",
             text="📚 Library",
-            font=("Segoe UI", 13, "bold"),
             command=self.open_library,
-            bg="#607D8B",
-            fg="white",
-            relief="flat",
-            cursor="hand2",
-            padx=15,
-            pady=10
-        )
-        library_btn.pack(fill='x', pady=5)
+            width=15
+        ).pack(side='left', expand=True, padx=(0, 5))
 
-        # Open File button
-        open_btn = tk.Button(
-            main_container,
-            text="📂 Open Image File",
-            font=("Segoe UI", 11),
+        ModernButton(
+            row_frame,
+            variant="action",
+            text="📂 Open File",
             command=self.open_file,
-            bg="#FF9800",
-            fg="white",
-            relief="flat",
-            cursor="hand2",
-            padx=15,
-            pady=8
-        )
-        open_btn.pack(fill='x', pady=5)
+            width=15
+        ).pack(side='left', expand=True, padx=(5, 0))
 
-        # Spacer to push content down
-        ttk.Frame(main_container).pack(expand=True)
+        status_frame = tk.Frame(main_container, bg=Theme.SURFACE, padx=15, pady=15)
+        status_frame.pack(fill='x', pady=(20, 0))
 
-        # Auto-save status indicator
-        if self.settings.get('auto_save') and self.settings.get('default_save_path'):
-            status_frame = ttk.LabelFrame(main_container, text="Auto-Save Status", padding=8)
-            status_frame.pack(fill='x', pady=(0, 10))
+        status_color = "#2E7D32" if self.settings.get('auto_save') else Theme.ON_SURFACE_VARIANT
+        status_text = "✓ Auto-save active" if self.settings.get('auto_save') else "• Manual mode"
 
-            status_label = tk.Label(
-                status_frame,
-                text="✓ Enabled",
-                font=("Segoe UI", 9, "bold"),
-                fg="#2E7D32"
-            )
-            status_label.pack(side='left')
+        tk.Label(
+            status_frame,
+            text=status_text,
+            font=("Segoe UI Bold", 9),
+            fg=status_color,
+            bg=Theme.SURFACE
+        ).pack(anchor='w')
 
-            path_label = tk.Label(
+        if self.settings.get('default_save_path'):
+            tk.Label(
                 status_frame,
                 text=self.settings['default_save_path'],
                 font=("Segoe UI", 8),
-                fg="gray",
-                wraplength=300,
+                fg=Theme.ON_SURFACE_VARIANT,
+                bg=Theme.SURFACE,
+                wraplength=350,
                 justify="left"
-            )
-            path_label.pack(side='left', padx=(10, 0))
+            ).pack(anchor='w', pady=(5, 0))
 
-        # Settings button - ALWAYS VISIBLE at bottom
-        settings_btn = tk.Button(
+        ModernButton(
             main_container,
-            text="⚙ Settings",
-            font=("Segoe UI", 12, "bold"),
+            variant="secondary",
+            text="⚙  SYSTEM SETTINGS",
             command=self.open_settings,
-            bg="#9C27B0",
-            fg="white",
-            relief="flat",
-            cursor="hand2",
-            padx=15,
-            pady=10
-        )
-        settings_btn.pack(fill='x', side='bottom')
+            font=("Segoe UI Bold", 10)
+        ).pack(fill='x', side='bottom', pady=(20, 0))
 
     def capture_region(self):
         """Handle region capture from launcher."""
@@ -1171,17 +1229,15 @@ class LauncherWindow:
                 # Hide launcher and open editor
                 self.root.withdraw()
                 AnnotationEditor(image, self.settings)
-                # Check if editor was replaced
-                if getattr(_app_root, '_replacing', False):
-                    _app_root._replacing = False
+                # Editor closed — skip the launcher if a replacement editor
+                # is still open (see execute_full_capture)
+                if _active_editor is not None and not _active_editor._closed:
                     return
                 # Show launcher again
-                _clear_root(self.root)
-                self.root.deiconify()
                 self._build_launcher_ui()
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to open file: {e}")
-                self.root.deiconify()
+                self._build_launcher_ui()
 
     def execute_region_capture(self):
         """Execute region selection and open editor."""
@@ -1197,20 +1253,16 @@ class LauncherWindow:
                 fmt = self.settings.get('image_format', 'png')
                 lib_path = LibraryManager.save_to_library(selector.result, fmt)
                 editor = AnnotationEditor(selector.result, self.settings, library_path=lib_path)
-                
-                # Check if editor was replaced by a new capture
-                if getattr(_app_root, '_replacing', False):
-                    _app_root._replacing = False
-                    return  # Don't rebuild, new editor is running
+
+                # Editor closed — skip the launcher if a replacement editor
+                # is still open (see execute_full_capture)
+                if _active_editor is not None and not _active_editor._closed:
+                    return
 
             # Show launcher again
-            _clear_root(self.root)
-            self.root.deiconify()
             self._build_launcher_ui()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to select region: {e}")
-            _clear_root(self.root)
-            self.root.deiconify()
             self._build_launcher_ui()
 
     def capture_text(self):
@@ -1244,13 +1296,18 @@ class LauncherWindow:
                         copied = True
                     except Exception:
                         pass
+                # Show the launcher again BEFORE the result dialog: it is
+                # transient over the root, and a transient of a withdrawn
+                # master never appears on Windows.
+                self._build_launcher_ui()
                 OCRResultDialog(self.root, text, copied=copied)
         except Exception as e:
             messagebox.showerror("Error", f"Text capture failed: {e}")
         finally:
-            _clear_root(self.root)
-            self.root.deiconify()
-            self._build_launcher_ui()
+            # Rebuild only if an early return/error left the root hidden
+            # (success path already rebuilt above)
+            if self.root.state() == 'withdrawn':
+                self._build_launcher_ui()
 
     def _prompt_install_tesseract_launcher(self):
         """Tesseract-missing prompt from the launcher context."""
@@ -1285,10 +1342,10 @@ class LauncherWindow:
         try:
             LibraryBrowser(self.root, self.settings)
             # Show launcher again after browser closes
-            self.root.deiconify()
+            self._build_launcher_ui()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open library: {e}")
-            self.root.deiconify()
+            self._build_launcher_ui()
 
     def run(self):
         """Run the launcher."""
@@ -1305,22 +1362,33 @@ class LauncherWindow:
             pass
 
     def _on_global_hotkey(self):
-        """Handle PrtScn. Captures exactly what's on screen right now.
+        """Handle PrtScn by starting a region selection.
 
-        Unlike the launcher's Full Screen button (which hides the launcher
-        first), this grabs the current screen state immediately so anything
-        visible — including the ScreenSnap launcher itself — is captured.
+        The launcher is hidden and the drag-to-select overlay is shown, matching
+        the external monitor's behavior so PrtScn does the same thing whether or
+        not a ScreenSnap window is already open.
         """
         try:
             if not self.root.winfo_exists():
                 return
-            # If the root is withdrawn, a capture or editor is already active;
-            # ignore the hotkey to avoid re-entrancy.
+            # A modal dialog holds the Tk grab (settings, OCR result, …) —
+            # a selector opened now would never receive mouse events and its
+            # fullscreen overlay would appear stuck. Ignore the hotkey.
+            try:
+                if self.root.grab_current() is not None:
+                    return
+            except Exception:
+                pass
             if self.root.state() == 'withdrawn':
+                # Root withdrawn = an editor, dialog, or capture is active.
+                # If it's an editor, PrtScn must still work: replace it with
+                # a fresh region capture (same as its ✂ REGION button).
+                # Otherwise ignore the hotkey to avoid re-entrancy.
+                ed = _active_editor
+                if ed is not None and not ed._closed:
+                    ed.capture_new_region()
                 return
-            # Capture BEFORE touching any windows so the shot is WYSIWYG.
-            screenshot = capture_all_screens()
-            self.execute_full_capture(screenshot=screenshot)
+            self.capture_region()
         except Exception:
             pass
 
@@ -1697,14 +1765,15 @@ class RegionSelector:
 
         # Freeze the screen BEFORE showing the overlay so subsequent mouse
         # movement / animations don't change what the user sees while selecting.
-        # Caller is expected to have hidden the launcher already; give the
-        # compositor a brief moment to repaint before grabbing.
+        # Caller is expected to have hidden (or withdrawn-then-destroyed) its
+        # own windows already; give the compositor a couple of frames to
+        # actually drop them from the screen before grabbing.
         try:
             parent.update_idletasks()
         except Exception:
             pass
         import time as _time
-        _time.sleep(0.05)
+        _time.sleep(0.09)
         try:
             self.frozen = ImageGrab.grab(bbox=(x, y, x2, y2), all_screens=True)
         except Exception as e:
@@ -1994,6 +2063,8 @@ class AnnotationEditor:
         self.root.config(bg=Theme.BACKGROUND)
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._closed = False
+        global _active_editor
+        _active_editor = self
 
         self.status_var = tk.StringVar(value="Ready")
 
@@ -2272,10 +2343,33 @@ class AnnotationEditor:
 
         self.root.wait_window()
 
+    def _close_window(self, hide_first=False):
+        """Tear down this editor window and release the active-editor slot.
+
+        hide_first withdraws before destroying: destroying a *visible* window
+        plays DWM's ~200ms close-fade animation, so a screen grab taken right
+        after would catch this editor half-faded over the desktop (ghost UI
+        baked into the capture). A hidden window is destroyed with no
+        animation.
+        """
+        global _active_editor
+        self._closed = True
+        if _active_editor is self:
+            _active_editor = None
+        if hide_first:
+            try:
+                self.root.withdraw()
+                self.root.update_idletasks()
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _on_close(self):
         """Handle window close."""
-        self._closed = True
-        self.root.destroy()
+        self._close_window()
     
     def draw_canvas_grid(self):
         """Draw a subtle dot grid on the canvas background."""
@@ -2435,10 +2529,14 @@ class AnnotationEditor:
         return container
     def capture_new_full(self):
         """Capture full screen and open in a new editor window."""
-        # Destroy current editor and signal replacement
-        self._closed = True
-        self.root.destroy()
-        _get_root()._replacing = True
+        # Hide-then-destroy so DWM's close-fade can't ghost this editor
+        # into the new capture
+        self._close_window(hide_first=True)
+
+        # Give the compositor a beat to actually drop the old window from
+        # the screen before grabbing it.
+        import time
+        time.sleep(0.15)
 
         try:
             screenshot = capture_all_screens()
@@ -2451,12 +2549,12 @@ class AnnotationEditor:
 
     def capture_new_region(self):
         """Capture a new region and open in a new editor window."""
-        # Destroy current editor and signal replacement
-        self._closed = True
-        self.root.destroy()
-        _get_root()._replacing = True
+        # Hide-then-destroy so DWM's close-fade can't ghost this editor
+        # into the frozen selection snapshot
+        self._close_window(hide_first=True)
 
-        # Create region selector
+        # Create region selector (its settle delay covers the compositor
+        # dropping the old editor window before the screen is frozen)
         try:
             selector = RegionSelector(_get_root())
             if selector.result:
@@ -2470,9 +2568,9 @@ class AnnotationEditor:
 
     def back_to_launcher(self):
         """Close editor and return to launcher."""
-        self._closed = True
-        self.root.destroy()
-        # No _replacing flag — launcher should rebuild
+        self._close_window()
+        # No editor left open — the capture flow that created this editor
+        # rebuilds the launcher when it unwinds
     
     def set_tool(self, tool):
         """Set the current drawing tool with Midnight Architect styling."""
@@ -5415,20 +5513,30 @@ class AnnotationEditor:
                     self.status_var.set(f"Auto-save failed: Cannot create directory {save_dir}")
                     print(f"Failed to create directory: {e}")
                     return
-            
-            # Compose annotations into a fresh export image
-            export_image = self.render_annotations_to_image()
 
-            # Generate filename with timestamp
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            format_ext = self.settings.get('image_format', 'png')
-            filename = f"screensnap_{timestamp}.{format_ext}"
-            file_path = os.path.join(save_dir, filename)
+            lib = self.library_path
+            if lib and os.path.isfile(lib) and os.path.normcase(
+                    os.path.dirname(os.path.abspath(lib))) == os.path.normcase(os.path.abspath(save_dir)):
+                # The capture was already archived to the library, and the
+                # library IS the storage folder — reuse that file instead of
+                # writing a duplicate with a new timestamp.
+                file_path = lib
+                self.last_saved_path = lib
+                print(f"Auto-save: reusing library file {lib}")
+            else:
+                # Compose annotations into a fresh export image
+                export_image = self.render_annotations_to_image()
 
-            # Save image
-            export_image.save(file_path)
-            self.last_saved_path = file_path
-            print(f"Auto-saved: {file_path}")
+                # Generate filename with timestamp
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                format_ext = self.settings.get('image_format', 'png')
+                filename = f"screensnap_{timestamp}.{format_ext}"
+                file_path = os.path.join(save_dir, filename)
+
+                # Save image
+                export_image.save(file_path)
+                self.last_saved_path = file_path
+                print(f"Auto-saved: {file_path}")
             
             # Copy path to clipboard if enabled
             if self.settings.get('auto_copy_path', True):
@@ -5823,13 +5931,15 @@ class LibraryBrowser:
 
     def __init__(self, parent, settings):
         self.settings = settings
-        self._file_paths = []  # Parallel list storing full paths
+        self._item_paths = {}  # Treeview item id -> full file path
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("ScreenSnap Library")
         self.dialog.geometry("800x600")
         self.dialog.resizable(True, True)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
+        # NOT transient/grabbed: the launcher root is withdrawn while the
+        # library is open, and a transient of a withdrawn master is never
+        # mapped on Windows (the window silently fails to appear) while
+        # grab_set on the unviewable window raises TclError.
         self.dialog.config(bg=Theme.BACKGROUND)
 
         # Center dialog
@@ -5860,30 +5970,37 @@ class LibraryBrowser:
         ModernButton(btn_frame, text="🔄 REFRESH", variant="secondary", 
                      command=self.load_library, font=("Segoe UI Bold", 8)).pack(side='left')
 
-        # List area (The "Sunken" Void)
+        # List area (The "Sunken" Void) — files grouped by creation date
         list_container = tk.Frame(main_frame, bg=Theme.SURFACE_LOW, padx=2, pady=2)
         list_container.pack(fill='both', expand=True)
 
-        self.listbox = tk.Listbox(
-            list_container,
-            bg=Theme.SURFACE_LOW,
-            fg=Theme.ON_SURFACE,
-            font=("Consolas", 10),
-            selectbackground=Theme.SURFACE_BRIGHT,
-            selectforeground=Theme.PRIMARY,
-            borderwidth=0,
-            highlightthickness=0,
-            activestyle='none'
-        )
-        v_scroll = ttk.Scrollbar(list_container, orient='vertical', command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=v_scroll.set)
+        style = ttk.Style(self.dialog)
+        style.configure('Library.Treeview',
+                        background=Theme.SURFACE_LOW,
+                        fieldbackground=Theme.SURFACE_LOW,
+                        foreground=Theme.ON_SURFACE,
+                        font=("Consolas", 10),
+                        rowheight=26,
+                        borderwidth=0)
+        style.map('Library.Treeview',
+                  background=[('selected', Theme.SURFACE_BRIGHT)],
+                  foreground=[('selected', Theme.PRIMARY)])
 
-        self.listbox.pack(side='left', fill='both', expand=True)
+        self.tree = ttk.Treeview(list_container, show='tree', selectmode='browse',
+                                 style='Library.Treeview')
+        self.tree.tag_configure('date_header', foreground=Theme.PRIMARY,
+                                font=("Segoe UI Bold", 9))
+        self.tree.tag_configure('empty', foreground='gray')
+
+        v_scroll = ttk.Scrollbar(list_container, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=v_scroll.set)
+
+        self.tree.pack(side='left', fill='both', expand=True)
         v_scroll.pack(side='right', fill='y')
 
-        # Double-click to open
-        self.listbox.bind('<Double-Button-1>', self.open_selected)
-        self.listbox.bind('<Return>', self.open_selected)
+        # Double-click to open (on a date header it just toggles the group)
+        self.tree.bind('<Double-Button-1>', self.open_selected)
+        self.tree.bind('<Return>', self.open_selected)
 
         # Bottom buttons
         bottom_frame = tk.Frame(main_frame, bg=Theme.BACKGROUND)
@@ -5904,34 +6021,64 @@ class LibraryBrowser:
         # Block until dialog closes
         self.dialog.wait_window()
 
-    def load_library(self):
-        """Load and display library files."""
-        self.listbox.delete(0, tk.END)
-        self._file_paths = []
+    def load_library(self, keep_open=None):
+        """Load library files grouped by creation date, newest group first.
+
+        Today's group (or the newest one if nothing was captured today) is
+        expanded; `keep_open` re-expands a given set of group iids after a
+        reload so deleting inside an old group doesn't collapse it.
+        """
+        self.tree.delete(*self.tree.get_children())
+        self._item_paths = {}
         files = LibraryManager.list_files()
 
         if not files:
-            self.listbox.insert(tk.END, "(Library is empty — take a screenshot!)")
-            self.listbox.itemconfig(0, fg='gray')
+            self.tree.insert('', 'end', text="(Library is empty — take a screenshot!)",
+                             tags=('empty',))
             return
 
+        # Group by creation date (st_ctime is birth time on Windows)
+        groups = {}
         for f in files:
-            mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime)
-            size_kb = f.stat().st_size / 1024
-            display = f"{f.name}  ({size_kb:.0f} KB, {mtime.strftime('%Y-%m-%d %H:%M')})"
-            self.listbox.insert(tk.END, display)
-            self._file_paths.append(str(f))
+            st = f.stat()
+            created = datetime.datetime.fromtimestamp(getattr(st, 'st_ctime', st.st_mtime))
+            groups.setdefault(created.date(), []).append((created, f, st.st_size))
+
+        today = datetime.date.today()
+        days = sorted(groups, reverse=True)
+        for day in days:
+            entries = sorted(groups[day], key=lambda e: e[0], reverse=True)
+            if day == today:
+                label = "Today"
+            elif day == today - datetime.timedelta(days=1):
+                label = "Yesterday"
+            else:
+                label = day.strftime("%A, %B %d, %Y")
+            iid = f"day-{day.isoformat()}"
+            expand = (day == today) or (today not in groups and day == days[0])
+            if keep_open and iid in keep_open:
+                expand = True
+            self.tree.insert('', 'end', iid=iid,
+                             text=f"{label}  ({len(entries)})",
+                             open=expand, tags=('date_header',))
+            for created, f, size in entries:
+                display = f"{f.name}  ({size / 1024:.0f} KB, {created.strftime('%H:%M')})"
+                item = self.tree.insert(iid, 'end', text=display)
+                self._item_paths[item] = str(f)
+
+    def _selected_path(self):
+        """Full path of the selected file item, or None (headers, empty row)."""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self._item_paths.get(sel[0])
 
     def open_selected(self, event=None):
         """Open the selected file in the annotation editor."""
-        sel = self.listbox.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        if idx >= len(self._file_paths):
-            return
+        file_path = self._selected_path()
+        if not file_path:
+            return  # date header — double-click toggles the group natively
 
-        file_path = self._file_paths[idx]
         try:
             image = Image.open(file_path)
             if image.mode != 'RGB':
@@ -5943,25 +6090,22 @@ class LibraryBrowser:
 
     def delete_selected(self):
         """Delete the selected file."""
-        sel = self.listbox.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        if idx >= len(self._file_paths):
+        file_path = self._selected_path()
+        if not file_path:
             return
 
-        file_path = self._file_paths[idx]
         if messagebox.askyesno("Confirm Delete", f"Delete this screenshot?\n\n{os.path.basename(file_path)}"):
+            open_groups = {i for i in self.tree.get_children('')
+                           if self.tree.item(i, 'open')}
             try:
                 os.remove(file_path)
-                self.load_library()
+                self.load_library(keep_open=open_groups)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to delete: {e}")
 
     def open_folder(self):
         """Open the library folder in Windows Explorer."""
-        lib_dir = LibraryManager.LIBRARY_DIR()
-        lib_dir.mkdir(exist_ok=True)
+        lib_dir = LibraryManager.ensure_library()
         subprocess.Popen(f'explorer "{lib_dir}"')
 
 

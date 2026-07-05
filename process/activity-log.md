@@ -1,3 +1,101 @@
+## 2026-07-05
+
+### Library now follows the Storage Location setting; probe-based config dir
+**Files Changed:** `screensnap.py`, `test_storage_paths.py` (new)
+
+- User-reported: Storage Location was configured (Settings) but the Library opened `C:\Program Files\ScreenSnap\library`. The library folder never consulted `default_save_path` — with auto-save on, every capture was written twice (raw copy via `save_to_library` into the exe-side folder, annotated copy via `auto_save_on_open` into the Storage Location) and the browser showed the folder the user never looks at.
+- `LIBRARY_DIR()` resolution is now: configured Storage Location (if set + writable) → portable `library/` next to exe/script → `%LOCALAPPDATA%\ScreenSnap\library`. Cache invalidated on `SettingsManager.save()` so changing Storage Location re-resolves.
+- `auto_save_on_open` no longer writes a duplicate when the capture was already archived to the same folder by `save_to_library` — it reuses the library file (path copy/status behavior unchanged).
+- `SettingsManager.CONFIG_DIR()` fallback is now write-probe based (was `"program files" in path` string match) via shared `_dir_writable()`; resolved location unchanged for existing installs (`%APPDATA%\ScreenSnap\config`). Note: earlier log entry's "settings can't persist" follow-up was wrong — the APPDATA fallback already existed.
+- New `test_storage_paths.py` covers all resolution orders (must run non-elevated).
+
+**Deployment:** `dist\ScreenSnap.exe` rebuilt; installer recompiled and launched for install
+**Test Results:** `test_storage_paths.py` — ALL PASSED; `test_printscreen_coordination.py` — ALL PASSED
+
+---
+
+### Fix: installed copy crashed opening Library (WinError 5, Program Files)
+**Files Changed:** `screensnap.py`
+
+- `LibraryManager.LIBRARY_DIR()` resolved to the exe's folder (`C:\Program Files\ScreenSnap\library` for the installed copy); `ensure_library()`'s `mkdir` then raised `[WinError 5] Access is denied`. Worse, `save_to_library` swallows exceptions, so the installed app had been silently archiving **nothing** on every capture.
+- Fix: `LIBRARY_DIR()` keeps the portable behavior (folder next to exe/script) when that location passes a real write probe, else falls back to `%LOCALAPPDATA%\ScreenSnap\library` (cached; probe is an actual file write because `os.access()` is unreliable against Windows ACLs). `ensure_library`/`open_folder` create parents as needed.
+- Verified non-elevated: portable case → `dist\library` (unchanged); simulated Program Files base → falls back to `C:\Users\<user>\AppData\Local\ScreenSnap\library` and creates it.
+- (Correction, same day: settings already persisted for installed copies via the pre-existing `%APPDATA%\ScreenSnap\config` fallback in `CONFIG_DIR()` — the follow-up concern noted here was wrong.)
+
+**Deployment:** `dist\ScreenSnap.exe` rebuilt; installer rebuilt for updating `C:\Program Files\ScreenSnap\`
+**Test Results:** `test_printscreen_coordination.py` — ALL PASSED; library fallback verified by direct probe
+
+---
+
+### Fix: Library (and OCR-result dialog) never opened; single global monitor lock
+**Files Changed:** `screensnap.py`, `screensnap-printscreen-monitor.py`, `test_printscreen_coordination.py`
+
+- **Library not opening** (pre-existing, also at HEAD): `open_library` withdraws the launcher root, then `LibraryBrowser` made itself `transient(parent)` + `grab_set()`. On Windows a transient of a withdrawn master is never mapped — the window silently doesn't appear (and `grab_set` on the unviewable window can raise). Fix: the library browser is a standalone window now (no transient/grab — the launcher is hidden while it's open, so modality was meaningless). Verified live: browser maps (`winfo_viewable()=1`) with a withdrawn root.
+- **Same defect in CAPTURE TEXT**: `OCRResultDialog` is transient over the root, but `_execute_text_capture` showed it while the root was still withdrawn. Fix: rebuild/show the launcher *before* opening the dialog; the `finally` rebuild now only runs if an early return left the root hidden.
+- **Monitor lock made global**: the lock lived next to the exe/script, so a source-run and a dist-run ScreenSnap each auto-started their own monitor (observed live: pythonw monitor + dist exe monitor simultaneously) — one PrtScn would spawn two capture processes. The lock is now `%TEMP%\screensnap-monitor.lock` (shared by both sides, path agreement covered in the test), and a starting monitor defers if another live monitor holds it.
+
+**Deployment:** both dist EXEs rebuilt (08:34); single dist monitor running with the global lock. Installed copy in `C:\Program Files\ScreenSnap\` still needs the new installer.
+**Test Results:** `test_printscreen_coordination.py` — ALL PASSED
+
+---
+
+### Tray menu: replace dead "Show Status" with "Open ScreenSnap"
+**Files Changed:** `screensnap-printscreen-monitor.py`
+
+- "Show Status" only printed to stdout, which is invisible when the monitor runs under `pythonw`/as a frozen exe — the menu item appeared to do nothing. Removed.
+- New "Open ScreenSnap" item (also the tray icon's double-click default): raises the running app's window if one exists, else launches the app. The app's PID comes from the hotkey-owner marker; its visible top-level window (launcher or editor) is found via `EnumWindows` and raised with `ShowWindow(SW_RESTORE)` + `SetForegroundWindow` (`_bring_app_to_front()`).
+- Refactored the spawn logic into `_launch_screensnap(mode=None)`, shared by the PrtScn handler (`region`) and the new menu item (no args → launcher GUI).
+
+**Deployment:** `dist\ScreenSnapMonitor.exe` rebuilt; running source monitor restarted with the new menu. Installed copy in `C:\Program Files\ScreenSnap\` still needs the new installer.
+**Test Results:** `test_printscreen_coordination.py` — ALL PASSED; `_bring_app_to_front()` verified live (True with app running + window raised, False after app killed)
+
+---
+
+### Fix: PrtScn captures contained ScreenSnap's own UI; PrtScn sometimes dead
+**Files Changed:** `screensnap.py`, `screensnap-printscreen-monitor.py`, `test_printscreen_coordination.py`
+
+- **Ghost UI in captures** (user screenshot showed the editor toolbar + dot-grid canvas semi-transparently over a CLI): `capture_new_region`/`capture_new_full` destroyed the *visible* maximized editor and grabbed the screen ~50ms (or 0ms) later. Destroying a visible window plays DWM's ~200ms close-fade animation, so the grab caught the editor half-faded over the desktop. Fix: new `AnnotationEditor._close_window(hide_first=True)` withdraws (SW_HIDE, no animation) before destroying; `capture_new_full` additionally sleeps 150ms before grabbing; `RegionSelector` settle bumped 0.05s → 0.09s.
+- **PrtScn dead while editor open**: `_on_global_hotkey` ignored the key whenever the launcher root was withdrawn, while the external monitor deferred to this process's hotkey-owner marker — so both sides swallowed the press for as long as an editor was open. Fix: module-global `_active_editor`; the hotkey now replaces an open editor with a fresh region capture (same as its ✂ REGION button).
+- **Duplicate/missing monitor**: `_auto_start_printscreen_monitor` probed the lock PID with `os.kill(pid, 0)`, which on Windows sends CTRL_C_EVENT and errors for detached processes — a healthy monitor looked dead (→ duplicate monitors; each PrtScn then fanned out into multiple capture processes photographing each other). Fix: new `_monitor_lock_active()` using `pid_alive()` + identity check. The monitor also claims/clears its own lockfile now (startup write + atexit).
+- **Stale owner marker / PID reuse**: `_clear_hotkey_owner` lived in a daemon thread's `finally` that never runs at process exit, and a recycled PID could make the monitor defer to a random process forever. Fix: `atexit` cleanup on claim + `_pid_is_screensnap()` identity check (QueryFullProcessImageNameW) on both sides of the marker protocol.
+- **Launcher flash on monitor-spawned captures**: CLI-mode `LauncherWindow` built and showed the launcher, then withdrew it 100ms later — visible flash that could bleed into the frozen capture. Fix: skip building the launcher UI entirely when a CLI mode is given.
+- **Windowless-zombie after chained replacements**: the one-shot `_replacing` flag was only consumed when the *outermost* editor chain unwound, so replace-capture (REGION button, and now PrtScn-while-editing) followed by 🏠 LAUNCHER left the process with no windows and a dead hotkey. Fix: dropped the flag; the unwind now rebuilds the launcher iff no editor is live (`_active_editor` check).
+- Machine cleanup: killed the stale 6:58 AM installed `ScreenSnap.exe` (owned the hotkey with old code) and the installed old `ScreenSnapMonitor.exe`; removed stale `.printscreen-monitor.lock`; rebuilt `dist\ScreenSnap.exe` + `dist\ScreenSnapMonitor.exe` from fixed source.
+
+**Deployment:** dist EXEs rebuilt; installed copy in `C:\Program Files\ScreenSnap\` still needs the new installer (or admin copy of the dist EXEs) to pick up the fix
+**Test Results:** `test_printscreen_coordination.py` — ALL PASSED (extended with PID-reuse identity guard + monitor-lock probe checks)
+
+---
+
+## 2026-07-03
+
+### Fix: Print Screen opened two ScreenSnap windows
+**Files Changed:** `screensnap.py`, `screensnap-printscreen-monitor.py`, `test_printscreen_coordination.py`
+
+- Root cause: two independent PrtScn handlers both fired on one keypress. The launcher registers PrtScn in-process via `RegisterHotKey` (`start_global_hotkey`), while `_auto_start_printscreen_monitor()` also launches the external `ScreenSnapMonitor` that hooks the same key via the `keyboard` library. `RegisterHotKey` and the low-level keyboard hook are separate OS mechanisms, so both fired — one in-process capture plus one spawned `ScreenSnap.exe region` launcher (the extra "Midnight Architect" window).
+- Fix (coordinated, per user choice): the process that successfully registers the in-app hotkey writes its PID to a shared marker in the temp dir (`screensnap-hotkey-owner.lock`). The monitor now checks this marker and stays passive whenever a live owner exists, so the in-app hotkey wins when a ScreenSnap window is open and the monitor only spawns when none is running.
+- Also changed the in-app hotkey action from full-screen capture to **region select** (`_on_global_hotkey` now calls `capture_region`) so PrtScn behaves identically whether handled in-app or by the monitor.
+- Added robust `pid_alive()` (ctypes `OpenProcess`/`GetExitCodeProcess`) because `os.kill(pid, 0)` is unreliable on Windows — it does not raise for a dead PID, so it can't distinguish stale locks from live owners.
+- Note: the running app is the installed build in `C:\Program Files\ScreenSnap\`; the EXEs must be rebuilt for this fix to take effect.
+
+**Deployment:** Not deployed — requires rebuilding `ScreenSnap.exe` and `ScreenSnapMonitor.exe`
+**Test Results:** `test_printscreen_coordination.py` — ALL PASSED
+
+---
+
+## 2026-06-25
+
+### Fix: launcher shows old-style UI after returning from editor
+**Files Changed:** `screensnap.py`
+
+- Root cause: `execute_full_capture` (and other return-to-launcher paths) called `_build_launcher_ui()`, which contained an old plain-`tk.Button` UI instead of the Midnight Architect design
+- Fix: consolidated all UI-building into `_build_launcher_ui()` using the Midnight Architect design (ModernButton, Theme colours); `__init__` now calls `_build_launcher_ui()` instead of building inline
+- `_build_launcher_ui()` also handles `_clear_root`, `deiconify`, geometry, and centering so all call sites are simplified
+
+**Deployment:** Not deployed
+
+---
+
 ## 2026-05-11
 
 ### Anchor teardrop tail tip at the click point (both editor and saved file)

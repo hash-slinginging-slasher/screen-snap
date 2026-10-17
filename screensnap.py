@@ -306,21 +306,19 @@ def capture_all_screens():
 
 def _autocrop_black(img):
     """Trim fully-black borders from a screenshot (virtual screen dead zones)."""
-    import numpy as np
-    arr = np.asarray(img.convert('RGB'))
-    # A row/col is "black" if every pixel is below threshold
+    from PIL import ImageChops
+    # A pixel is "black" if every channel is at or below threshold
     threshold = 5
-    row_max = arr.max(axis=(1, 2))  # max brightness per row
-    col_max = arr.max(axis=(0, 2))  # max brightness per col
-    rows = np.where(row_max > threshold)[0]
-    cols = np.where(col_max > threshold)[0]
-    if len(rows) == 0 or len(cols) == 0:
+    r, g, b = img.convert('RGB').split()
+    lit = ImageChops.lighter(ImageChops.lighter(r, g), b).point(
+        lambda v: 255 if v > threshold else 0
+    )
+    bbox = lit.getbbox()
+    if bbox is None:
         return img  # entirely black — don't crop to nothing
-    top, bottom = rows[0], rows[-1] + 1
-    left, right = cols[0], cols[-1] + 1
-    if top == 0 and bottom == arr.shape[0] and left == 0 and right == arr.shape[1]:
+    if bbox == (0, 0, img.width, img.height):
         return img  # nothing to crop
-    return img.crop((left, top, right, bottom))
+    return img.crop(bbox)
 
 
 # ── Global hotkey (Print Screen) ───────────────────────────────────

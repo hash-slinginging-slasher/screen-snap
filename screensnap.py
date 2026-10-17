@@ -44,7 +44,7 @@ def ensure_dependencies():
 ensure_dependencies()
 
 # Now import dependencies that were just installed
-from PIL import Image, ImageGrab, ImageDraw, ImageTk
+from PIL import Image, ImageGrab, ImageDraw, ImageTk, ImageFont
 import pyperclip
 import ctypes
 
@@ -1209,6 +1209,15 @@ class Icons:
             line((3, 12), (12, 4), (21, 12))
             line((6, 10.5), (6, 20), (18, 20), (18, 10.5))
             line((10, 20), (10, 15), (14, 15), (14, 20))
+        elif name in ('align_left', 'align_center', 'align_right'):
+            for y, width in ((5.5, 16), (10.5, 9.5), (15.5, 16), (20.5, 7)):
+                if name == 'align_left':
+                    x1 = 4
+                elif name == 'align_right':
+                    x1 = 20 - width
+                else:
+                    x1 = 12 - width / 2
+                line((x1, y), (x1 + width, y))
         elif name == 'check':
             line((4.5, 12.5), (9.5, 17.5), (19.5, 6.5))
         elif name == 'trash':
@@ -3005,6 +3014,10 @@ class AnnotationEditor:
         self.text_elements = []
         self.selected_text_id = None
         self.dragging_text = False
+        self.resizing_text = None          # handle name while a text box is being resized
+        self._resize_start = None          # (x1, y1, x2, y2) of the box when the resize began
+        self.text_create_origin = None     # canvas point where a drag-to-create text box began
+        self.text_align = 'center'         # alignment for new text; ShareX defaults to centred
         self.drag_offset_x = 0
         self.drag_offset_y = 0
 
@@ -3122,7 +3135,16 @@ class AnnotationEditor:
         size_spin = ttk.Spinbox(self.text_props_frame, from_=8, to=120, textvariable=self.font_size_var, width=5)
         size_spin.pack(side='left', padx=(0, 20))
 
-        IconButton(self.text_props_frame, 'check', tip="Apply text changes", variant="primary",
+        self.text_align_btns = {}
+        for align, tip in (('left', "Align text left"), ('center', "Center text"), ('right', "Align text right")):
+            btn = IconButton(self.text_props_frame, f'align_{align}', tip=tip,
+                             variant="primary" if align == self.text_align else "tool",
+                             command=lambda a=align: self._set_text_align(a))
+            btn.pack(side='left', padx=(0, 2))
+            self.text_align_btns[align] = btn
+        tk.Frame(self.text_props_frame, width=14, bg=Theme.SURFACE).pack(side='left')
+
+        IconButton(self.text_props_frame, 'check', tip="Apply font, size and colour to the selected text", variant="primary",
                    command=self.update_selected_text).pack(side='left', padx=5)
         IconButton(self.text_props_frame, 'trash', tip="Delete selected text", variant="danger",
                    command=self.delete_selected_text).pack(side='left', padx=5)
@@ -4318,8 +4340,179 @@ class AnnotationEditor:
         dialog.wait_window()
         return result[0]
     
-    def add_text_element(self, x, y, text=None):
-        """Add a new text element to the canvas."""
+    # ── Text boxes ─────────────────────────────────────────────────
+    # Modelled on ShareX's image editor: a text annotation is a *box* with
+    # padding, the text is centred inside it (horizontally and vertically by
+    # default), and the box shows a dashed frame with resize handles when
+    # selected. Both the canvas preview and the saved image are drawn by
+    # _render_text_pil, so what you see is exactly what gets saved.
+
+    TEXT_PAD = 8        # padding between the text and its box, in image pixels
+    TEXT_MIN_BOX = 24   # smallest box a drag or resize can produce, in image pixels
+    TEXT_HANDLE = 8     # on-screen size of a selection handle, in pixels
+    _HANDLE_CURSORS = {
+        'nw': 'size_nw_se', 'se': 'size_nw_se', 'ne': 'size_ne_sw', 'sw': 'size_ne_sw',
+        'n': 'size_ns', 's': 'size_ns', 'e': 'size_we', 'w': 'size_we',
+    }
+
+    @staticmethod
+    def _load_text_font(family, px):
+        px = max(1, int(round(px)))
+        for candidate in (family.lower().replace(' ', '') + '.ttf', 'arial.ttf'):
+            try:
+                return ImageFont.truetype(candidate, px)
+            except Exception:
+                continue
+        try:
+            return ImageFont.load_default(px)
+        except Exception:
+            return ImageFont.load_default()
+
+    @staticmethod
+    def _wrap_text(text, font, max_width):
+        """Greedy word wrap; a single word wider than the box stays on its own line."""
+        lines = []
+        for paragraph in text.split('\n'):
+            line = ''
+            for word in paragraph.split(' '):
+                trial = word if not line else line + ' ' + word
+                if not line or font.getlength(trial) <= max_width:
+                    line = trial
+                else:
+                    lines.append(line)
+                    line = word
+            lines.append(line)
+        return '\n'.join(lines)
+
+    def _text_layout(self, elem, scale=1.0):
+        """Wrap and measure a text element at `scale`.
+
+        Returns (font, wrapped_text, (l, t, r, b)): the ink bounds of the text
+        block relative to the point it is drawn at.
+        """
+        font = self._load_text_font(elem['font_family'], elem['font_size'] * scale)
+        text = elem['text']
+        if not elem.get('auto', True):
+            text = self._wrap_text(text, font, max(1, (elem['width'] - 2 * self.TEXT_PAD) * scale))
+        probe = ImageDraw.Draw(Image.new('L', (1, 1)))
+        bbox = probe.multiline_textbbox((0, 0), text, font=font, align=elem.get('align', 'center'))
+        return font, text, bbox
+
+    def _text_natural_size(self, elem):
+        """Box size (image pixels) that hugs the text with equal padding on every side."""
+        _, _, (l, t, r, b) = self._text_layout(dict(elem, auto=True), 1.0)
+        return (r - l) + 2 * self.TEXT_PAD, (b - t) + 2 * self.TEXT_PAD
+
+    def _render_text_pil(self, elem, zoom=1.0):
+        """Draw a text box to an RGBA tile of its (zoomed) size, text centred inside."""
+        w = max(1, int(round(elem['width'] * zoom)))
+        h = max(1, int(round(elem['height'] * zoom)))
+        tile = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+        if not elem['text']:
+            return tile
+        font, text, (l, t, r, b) = self._text_layout(elem, zoom)
+        block_w, block_h = r - l, b - t
+        pad = self.TEXT_PAD * zoom
+        align = elem.get('align', 'center')
+        if align == 'left':
+            ox = pad - l
+        elif align == 'right':
+            ox = w - pad - block_w - l
+        else:
+            ox = (w - block_w) / 2 - l
+        oy = (h - block_h) / 2 - t
+        ImageDraw.Draw(tile).multiline_text((ox, oy), text, font=font, fill=elem['color'], align=align)
+        return tile
+
+    def _place_text_canvas(self, elem):
+        """(Re)create a text element's canvas image at the current zoom."""
+        z = self.zoom if self.zoom else 1.0
+        if elem.get('canvas_id'):
+            try:
+                self.canvas.delete(elem['canvas_id'])
+            except Exception:
+                pass
+        elem['photo'] = ImageTk.PhotoImage(self._render_text_pil(elem, z))
+        elem['canvas_id'] = self.canvas.create_image(
+            round(elem['x'] * z), round(elem['y'] * z), image=elem['photo'], anchor='nw')
+        self.canvas.tag_raise('selection')
+
+    def _refit_text(self, elem):
+        """Re-measure a text box after its text or font changed.
+
+        A box that hugs its text is resized around its centre, so editing keeps
+        the text where it was. A box the user sized by hand keeps its size.
+        """
+        if elem.get('auto', True):
+            cx, cy = elem['x'] + elem['width'] / 2, elem['y'] + elem['height'] / 2
+            w, h = self._text_natural_size(elem)
+            elem.update(x=cx - w / 2, y=cy - h / 2, width=w, height=h)
+        self._place_text_canvas(elem)
+        if elem['id'] == self.selected_text_id:
+            self._draw_text_selection(elem)
+
+    def _selected_text(self):
+        for elem in self.text_elements:
+            if elem['id'] == self.selected_text_id:
+                return elem
+        return None
+
+    def _handle_points(self, elem):
+        """Canvas-space position of each resize handle."""
+        z = self.zoom if self.zoom else 1.0
+        x1, y1 = elem['x'] * z, elem['y'] * z
+        x2, y2 = x1 + elem['width'] * z, y1 + elem['height'] * z
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        return {'nw': (x1, y1), 'n': (cx, y1), 'ne': (x2, y1), 'e': (x2, cy),
+                'se': (x2, y2), 's': (cx, y2), 'sw': (x1, y2), 'w': (x1, cy)}
+
+    def _text_handle_at(self, elem, cx, cy):
+        """Name of the resize handle under canvas point (cx, cy), or None."""
+        reach = self.TEXT_HANDLE
+        for name, (hx, hy) in self._handle_points(elem).items():
+            if abs(cx - hx) <= reach and abs(cy - hy) <= reach:
+                return name
+        return None
+
+    def _draw_text_selection(self, elem):
+        """Dashed frame with eight resize handles, like ShareX's selection box."""
+        self.canvas.delete('selection')
+        z = self.zoom if self.zoom else 1.0
+        x1, y1 = elem['x'] * z, elem['y'] * z
+        # The frame item keeps the old 'cursor_id' key so existing cleanup code still removes it.
+        elem['cursor_id'] = self.canvas.create_rectangle(
+            x1, y1, x1 + elem['width'] * z, y1 + elem['height'] * z,
+            outline=Theme.PRIMARY, width=1, dash=(4, 4), tags='selection')
+        half = self.TEXT_HANDLE / 2
+        for hx, hy in self._handle_points(elem).values():
+            self.canvas.create_rectangle(
+                hx - half, hy - half, hx + half, hy + half,
+                fill='white', outline=Theme.PRIMARY, width=1, tags='selection')
+
+    def _style_align_buttons(self):
+        for align, btn in self.text_align_btns.items():
+            if align == self.text_align:
+                btn.config(bg=Theme.PRIMARY, fg="#000000")
+            else:
+                btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
+
+    def _set_text_align(self, align):
+        """Set the alignment for new text and for the selected text, if any."""
+        self.text_align = align
+        self._style_align_buttons()
+        elem = self._selected_text()
+        if elem is not None and elem.get('align', 'center') != align:
+            self.save_state()
+            elem['align'] = align
+            self._refit_text(elem)
+
+    def add_text_element(self, x, y, text=None, box=None):
+        """Create a text box.
+
+        Without `box` the box hugs the text and is centred on (x, y), the point
+        that was clicked. With `box` = (x1, y1, x2, y2) the user dragged out a
+        fixed-size box: the text wraps to it and stays centred inside it.
+        """
         # Prompt for text if not provided
         if text is None:
             text = self.prompt_text()
@@ -4329,107 +4522,92 @@ class AnnotationEditor:
         # Snapshot the pre-mutation state so undo can remove this text.
         self.save_state()
 
-        # Create text element
-        text_element = {
-            'id': len(self.text_elements),
+        elem = {
+            'id': 1 + max((e['id'] for e in self.text_elements), default=-1),
             'text': text,
-            'x': x,
-            'y': y,
+            'x': 0, 'y': 0, 'width': 0, 'height': 0,
             'color': self.current_color,
             'font_family': self.font_family_var.get(),
             'font_size': self.font_size_var.get(),
-            'canvas_id': None
+            'align': self.text_align,
+            'auto': box is None,
+            'canvas_id': None,
         }
-        
-        # Get font
-        try:
-            from PIL import ImageFont
-            font = ImageFont.truetype(f"{text_element['font_family'].lower().replace(' ', '')}.ttf", text_element['font_size'])
-        except:
-            try:
-                font = ImageFont.truetype("arial.ttf", text_element['font_size'])
-            except:
-                font = ImageFont.load_default()
-        
-        # Draw text on temporary image to get dimensions
-        temp_img = Image.new('RGB', (1, 1))
-        draw = ImageDraw.Draw(temp_img)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        
-        # Add to canvas at canvas-space coordinates with a zoom-scaled font.
-        z = self.zoom if self.zoom else 1.0
-        canvas_id = self.canvas.create_text(
-            x * z, y * z,
-            text=text,
-            fill=text_element['color'],
-            font=(text_element['font_family'],
-                  max(1, int(round(text_element['font_size'] * z)))),
-            anchor='nw'
-        )
-        text_element['canvas_id'] = canvas_id
-        text_element['width'] = text_width
-        text_element['height'] = text_height
+        if box is None:
+            w, h = self._text_natural_size(elem)
+            elem.update(x=x - w / 2, y=y - h / 2, width=w, height=h)
+        else:
+            x1, y1, x2, y2 = box
+            elem.update(x=x1, y=y1, width=x2 - x1, height=y2 - y1)
 
-        self.text_elements.append(text_element)
-        self.select_text_element(text_element['id'])
+        self.text_elements.append(elem)
+        self._place_text_canvas(elem)
+        self.select_text_element(elem['id'])
         self.status_var.set(f"Text added: '{text}'")
-    
+
     def select_text_element(self, text_id):
-        """Select a text element and show blinking cursor."""
+        """Select a text box: show its frame and load its settings into the panel."""
         self.deselect_all()
         self.selected_text_id = text_id
-        
-        # Find the text element
-        text_elem = None
-        for elem in self.text_elements:
-            if elem['id'] == text_id:
-                text_elem = elem
-                break
-        
-        if not text_elem:
+        elem = self._selected_text()
+        if not elem:
             return
-        
-        # Update properties panel
-        self.font_family_var.set(text_elem['font_family'])
-        self.font_size_var.set(text_elem['font_size'])
-        
-        # Draw blinking cursor at the START of text (canvas-space coords)
-        z = self.zoom if self.zoom else 1.0
-        cursor_x = text_elem['x'] * z
-        cursor_y1 = text_elem['y'] * z
-        cursor_y2 = (text_elem['y'] + text_elem['height']) * z
 
-        text_elem['cursor_id'] = self.canvas.create_line(
-            cursor_x, cursor_y1, cursor_x, cursor_y2,
-            fill='#2196F3',
-            width=2,
-            tags='selection'
-        )
-        
-        # Start blinking
-        self._blink_cursor(visible=True)
-        
-        self.status_var.set(f"Selected: '{text_elem['text']}' (drag to move, double-click to edit)")
-    
-    def _blink_cursor(self, visible):
-        """Blink the text selection cursor."""
-        if self.selected_text_id is None:
+        # Update properties panel
+        self.font_family_var.set(elem['font_family'])
+        self.font_size_var.set(elem['font_size'])
+        self.text_align = elem.get('align', 'center')
+        self._style_align_buttons()
+
+        self._draw_text_selection(elem)
+        self.status_var.set(f"Selected: '{elem['text']}' (drag to move, handles to resize, double-click to edit)")
+
+    def _resize_selected_text(self, event):
+        """Drag one of the selection handles; the text stays centred in the box."""
+        elem = self._selected_text()
+        if elem is None or self._resize_start is None:
             return
-        
-        # Find selected text element
-        for elem in self.text_elements:
-            if elem['id'] == self.selected_text_id and 'cursor_id' in elem:
-                if visible:
-                    self.canvas.itemconfig(elem['cursor_id'], state='normal')
-                else:
-                    self.canvas.itemconfig(elem['cursor_id'], state='hidden')
-                
-                # Schedule next blink
-                self.root.after(500, lambda: self._blink_cursor(not visible))
-                break
-    
+        if not getattr(self, '_drag_snapshot_taken', False):
+            self.save_state()
+            self._drag_snapshot_taken = True
+        cx, cy = self.get_canvas_coords(event)
+        z = self.zoom if self.zoom else 1.0
+        ix, iy = cx / z, cy / z
+        x1, y1, x2, y2 = self._resize_start
+        handle, minimum = self.resizing_text, self.TEXT_MIN_BOX
+        if 'w' in handle:
+            x1 = min(ix, x2 - minimum)
+        if 'e' in handle:
+            x2 = max(ix, x1 + minimum)
+        if 'n' in handle:
+            y1 = min(iy, y2 - minimum)
+        if 's' in handle:
+            y2 = max(iy, y1 + minimum)
+        elem.update(x=x1, y=y1, width=x2 - x1, height=y2 - y1, auto=False)
+        self._place_text_canvas(elem)
+        self._draw_text_selection(elem)
+
+    def _finish_text_create(self, event):
+        """Mouse released after pressing on empty canvas with the text tool.
+
+        A real drag makes a fixed-size box; a plain click makes a box that hugs
+        the text and is centred on the click.
+        """
+        origin = self.text_create_origin
+        self.text_create_origin = None
+        self.drawing = False
+        if self.current_shape:
+            self.canvas.delete(self.current_shape)
+            self.current_shape = None
+        cx, cy = self.get_canvas_coords(event)
+        z = self.zoom if self.zoom else 1.0
+        x1, x2 = sorted((origin[0] / z, cx / z))
+        y1, y2 = sorted((origin[1] / z, cy / z))
+        if x2 - x1 >= self.TEXT_MIN_BOX and y2 - y1 >= self.TEXT_MIN_BOX:
+            self.add_text_element(0, 0, box=(x1, y1, x2, y2))
+        else:
+            self.add_text_element(origin[0] / z, origin[1] / z)
+
     def deselect_all(self, event=None):
         """Deselect all text and step elements."""
         self.selected_text_id = None
@@ -4455,72 +4633,25 @@ class AnnotationEditor:
                 self.save_state()
                 if elem['canvas_id']:
                     self.canvas.delete(elem['canvas_id'])
+                self.canvas.delete('selection')
                 self.text_elements.pop(i)
                 self.selected_text_id = None
                 self.status_var.set("Text deleted")
                 break
     
     def update_selected_text(self):
-        """Update the selected text element with new properties."""
-        if self.selected_text_id is None:
+        """Apply the panel's font, size and colour to the selected text box."""
+        elem = self._selected_text()
+        if elem is None:
             return
+        # Snapshot before mutation so undo can revert the edit.
+        self.save_state()
+        elem['font_family'] = self.font_family_var.get()
+        elem['font_size'] = self.font_size_var.get()
+        elem['color'] = self.current_color
+        elem['align'] = self.text_align
+        self._refit_text(elem)
 
-        # Find the text element
-        for elem in self.text_elements:
-            if elem['id'] == self.selected_text_id:
-                # Snapshot before mutation so undo can revert the edit.
-                self.save_state()
-                # Update properties
-                elem['font_family'] = self.font_family_var.get()
-                elem['font_size'] = self.font_size_var.get()
-                elem['color'] = self.current_color
-                
-                # Delete old canvas item
-                if elem['canvas_id']:
-                    self.canvas.delete(elem['canvas_id'])
-                
-                # Get font
-                try:
-                    from PIL import ImageFont
-                    font = ImageFont.truetype(f"{elem['font_family'].lower().replace(' ', '')}.ttf", elem['font_size'])
-                except:
-                    try:
-                        font = ImageFont.truetype("arial.ttf", elem['font_size'])
-                    except:
-                        font = ImageFont.load_default()
-                
-                # Recreate on canvas at canvas-space coords with zoomed font
-                z = self.zoom if self.zoom else 1.0
-                elem['canvas_id'] = self.canvas.create_text(
-                    elem['x'] * z, elem['y'] * z,
-                    text=elem['text'],
-                    fill=elem['color'],
-                    font=(elem['font_family'],
-                          max(1, int(round(elem['font_size'] * z)))),
-                    anchor='nw'
-                )
-
-                # Update dimensions (stored in image space)
-                temp_img = Image.new('RGB', (1, 1))
-                draw = ImageDraw.Draw(temp_img)
-                bbox = draw.textbbox((0, 0), elem['text'], font=font)
-                elem['width'] = bbox[2] - bbox[0]
-                elem['height'] = bbox[3] - bbox[1]
-
-                # Update cursor position (canvas-space)
-                self.canvas.delete('selection')
-                cursor_x = elem['x'] * z
-                cursor_y1 = elem['y'] * z
-                cursor_y2 = (elem['y'] + elem['height']) * z
-
-                elem['cursor_id'] = self.canvas.create_line(
-                    cursor_x, cursor_y1, cursor_x, cursor_y2,
-                    fill='#2196F3',
-                    width=2,
-                    tags='selection'
-                )
-                break
-    
     def find_text_at_position(self, x, y):
         """Find text element at given position."""
         # Search in reverse order (top-most first)
@@ -5070,9 +5201,19 @@ class AnnotationEditor:
 
         # Handle text tool
         if self.current_tool == 'text':
-            # Check if clicking on existing text
-            clicked_text = self.find_text_at_position(ix, iy)
-            if clicked_text:
+            selected = self._selected_text()
+            handle = self._text_handle_at(selected, cx, cy) if selected else None
+            clicked_text = None if handle else self.find_text_at_position(ix, iy)
+            if handle:
+                # Grab a resize handle of the selected box (pre-resize snapshot
+                # is taken lazily on the first motion, like dragging).
+                self.resizing_text = handle
+                self._resize_start = (selected['x'], selected['y'],
+                                      selected['x'] + selected['width'],
+                                      selected['y'] + selected['height'])
+                self._drag_snapshot_taken = False
+                self.drawing = False
+            elif clicked_text:
                 # Select and prepare to drag. The pre-drag snapshot is taken
                 # lazily on the first drag motion (see on_canvas_drag) to
                 # avoid polluting history with no-op clicks.
@@ -5082,9 +5223,9 @@ class AnnotationEditor:
                 self.drag_offset_x = ix - clicked_text['x']
                 self.drag_offset_y = iy - clicked_text['y']
             else:
-                # Add new text
-                self.drawing = False
-                self.add_text_element(ix, iy)
+                # Empty canvas: the text is created on release, as a box
+                # centred on a click or sized by a drag.
+                self.text_create_origin = (cx, cy)
 
         # Handle step tool — works at ANY zoom level.
         elif self.current_tool == 'step':
@@ -5159,6 +5300,11 @@ class AnnotationEditor:
 
     def on_canvas_drag(self, event):
         """Handle canvas mouse drag."""
+        # Resizing a text box by one of its handles
+        if self.resizing_text:
+            self._resize_selected_text(event)
+            return
+
         # Handle text dragging (elem['x']/['y'] are stored in IMAGE space,
         # while canvas items live in canvas space — so we convert deltas).
         if self.dragging_text and self.selected_text_id is not None:
@@ -5172,34 +5318,13 @@ class AnnotationEditor:
             z = self.zoom if self.zoom else 1.0
             ix, iy = cx / z, cy / z
 
-            for elem in self.text_elements:
-                if elem['id'] == self.selected_text_id:
-                    new_x = ix - self.drag_offset_x
-                    new_y = iy - self.drag_offset_y
-
-                    # Update canvas position (canvas-space)
-                    if elem['canvas_id']:
-                        self.canvas.coords(
-                            elem['canvas_id'], new_x * z, new_y * z
-                        )
-
-                    # Update position (image-space)
-                    elem['x'] = new_x
-                    elem['y'] = new_y
-
-                    # Update cursor position (canvas-space)
-                    self.canvas.delete('selection')
-                    cursor_x = new_x * z
-                    cursor_y1 = new_y * z
-                    cursor_y2 = (new_y + elem['height']) * z
-
-                    elem['cursor_id'] = self.canvas.create_line(
-                        cursor_x, cursor_y1, cursor_x, cursor_y2,
-                        fill='#2196F3',
-                        width=2,
-                        tags='selection'
-                    )
-                    break
+            elem = self._selected_text()
+            if elem is not None:
+                elem['x'] = ix - self.drag_offset_x
+                elem['y'] = iy - self.drag_offset_y
+                if elem['canvas_id']:
+                    self.canvas.coords(elem['canvas_id'], round(elem['x'] * z), round(elem['y'] * z))
+                self._draw_text_selection(elem)
             return
 
         # Handle step dragging (step coords are stored in IMAGE space)
@@ -5419,19 +5544,28 @@ class AnnotationEditor:
                 width=2,
                 dash=(5, 5)
             )
-        elif self.current_tool == 'text' and self.text_box_mode:
+        elif self.current_tool == 'text' and self.text_create_origin is not None:
             self.current_shape = self.canvas.create_rectangle(
                 self.start_x, self.start_y, x, y,
-                outline='#FF9800',
-                width=2,
-                dash=(5, 5)
+                outline=Theme.PRIMARY,
+                width=1,
+                dash=(4, 4)
             )
     
     def on_canvas_release(self, event):
         """Handle canvas mouse release."""
         # Handle text release
+        if self.resizing_text:
+            self.resizing_text = None
+            self._resize_start = None
+            return
+
         if self.dragging_text:
             self.dragging_text = False
+            return
+
+        if self.current_tool == 'text' and self.text_create_origin is not None:
+            self._finish_text_create(event)
             return
 
         # Handle step release
@@ -5691,7 +5825,8 @@ class AnnotationEditor:
 
     def on_canvas_motion(self, event):
         """Handle mouse motion for hover cursor feedback."""
-        if self.dragging_text or self.dragging_step or self.dragging_stamp or self.dragging_shape or self.drawing:
+        if (self.dragging_text or self.resizing_text or self.dragging_step
+                or self.dragging_stamp or self.dragging_shape or self.drawing):
             return
 
         x, y = self.get_canvas_coords(event)
@@ -5702,6 +5837,15 @@ class AnnotationEditor:
             hovered = self.find_step_at_position(x, y)
             if hovered:
                 self.canvas.config(cursor="hand2")
+            else:
+                self.canvas.config(cursor="")
+        elif self.current_tool == 'text':
+            selected = self._selected_text()
+            handle = self._text_handle_at(selected, x, y) if selected else None
+            if handle:
+                self.canvas.config(cursor=self._HANDLE_CURSORS[handle])
+            elif self.find_text_at_position(ix, iy):
+                self.canvas.config(cursor="fleur")
             else:
                 self.canvas.config(cursor="")
         elif self.current_tool == 'stamp':
@@ -5742,51 +5886,10 @@ class AnnotationEditor:
             if new_text and new_text != clicked_text['text']:
                 # Snapshot before mutation so undo can restore the old text.
                 self.save_state()
-                # Update text
                 clicked_text['text'] = new_text
-                
-                # Recreate on canvas
-                if clicked_text['canvas_id']:
-                    self.canvas.delete(clicked_text['canvas_id'])
-                
-                z = self.zoom if self.zoom else 1.0
-                clicked_text['canvas_id'] = self.canvas.create_text(
-                    clicked_text['x'] * z, clicked_text['y'] * z,
-                    text=new_text,
-                    fill=clicked_text['color'],
-                    font=(clicked_text['font_family'],
-                          max(1, int(round(clicked_text['font_size'] * z)))),
-                    anchor='nw'
-                )
-
-                # Update dimensions (stored in image space)
-                try:
-                    from PIL import ImageFont
-                    font = ImageFont.truetype(f"{clicked_text['font_family'].lower().replace(' ', '')}.ttf", clicked_text['font_size'])
-                except:
-                    font = ImageFont.truetype("arial.ttf", clicked_text['font_size'])
-
-                temp_img = Image.new('RGB', (1, 1))
-                draw = ImageDraw.Draw(temp_img)
-                bbox = draw.textbbox((0, 0), new_text, font=font)
-                clicked_text['width'] = bbox[2] - bbox[0]
-                clicked_text['height'] = bbox[3] - bbox[1]
-
-                # Update cursor position (canvas-space)
-                self.canvas.delete('selection')
-                cursor_x = clicked_text['x'] * z
-                cursor_y1 = clicked_text['y'] * z
-                cursor_y2 = (clicked_text['y'] + clicked_text['height']) * z
-                
-                clicked_text['cursor_id'] = self.canvas.create_line(
-                    cursor_x, cursor_y1, cursor_x, cursor_y2,
-                    fill='#2196F3',
-                    width=2,
-                    tags='selection'
-                )
-                
+                self._refit_text(clicked_text)
                 self.status_var.set(f"Text updated: '{new_text}'")
-    
+
     def refresh_display(self):
         """Refresh the canvas display with current image at current zoom.
 
@@ -5865,32 +5968,12 @@ class AnnotationEditor:
                     tags='selection'
                 )
 
-        # Text: recreate each canvas text item at canvas-space coords with
-        # a zoom-scaled font. Also rebuild the selection cursor if shown.
+        # Text: redraw each box at the current zoom, then its selection frame.
         for elem in self.text_elements:
-            if elem.get('canvas_id'):
-                try:
-                    self.canvas.delete(elem['canvas_id'])
-                except Exception:
-                    pass
-            elem['canvas_id'] = self.canvas.create_text(
-                elem['x'] * z, elem['y'] * z,
-                text=elem['text'],
-                fill=elem['color'],
-                font=(elem['font_family'],
-                      max(1, int(round(elem['font_size'] * z)))),
-                anchor='nw'
-            )
-            if 'cursor_id' in elem:
-                try:
-                    self.canvas.delete(elem['cursor_id'])
-                except Exception:
-                    pass
-                elem['cursor_id'] = self.canvas.create_line(
-                    elem['x'] * z, elem['y'] * z,
-                    elem['x'] * z, (elem['y'] + elem['height']) * z,
-                    fill='#2196F3', width=2, tags='selection'
-                )
+            self._place_text_canvas(elem)
+        selected = self._selected_text()
+        if selected is not None:
+            self._draw_text_selection(selected)
 
         # Bubbles: re-render canvas items at the current zoom.
         for elem in self.bubble_elements:
@@ -6004,18 +6087,12 @@ class AnnotationEditor:
             out = base.convert('RGB')
             draw = ImageDraw.Draw(out)
 
-        # Render text elements
-        draw = ImageDraw.Draw(out)
+        # Render text elements with the same renderer as the canvas preview,
+        # so the saved image matches what was on screen.
         for elem in self.text_elements:
-            try:
-                from PIL import ImageFont
-                font = ImageFont.truetype(f"{elem['font_family'].lower().replace(' ', '')}.ttf", elem['font_size'])
-            except:
-                try:
-                    font = ImageFont.truetype("arial.ttf", elem['font_size'])
-                except:
-                    font = ImageFont.load_default()
-            draw.text((elem['x'], elem['y']), elem['text'], fill=elem['color'], font=font)
+            tile = self._render_text_pil(elem, 1.0)
+            out.paste(tile, (int(round(elem['x'])), int(round(elem['y']))), tile)
+        draw = ImageDraw.Draw(out)
 
         # Render bubble elements
         for elem in self.bubble_elements:
@@ -6296,6 +6373,7 @@ class AnnotationEditor:
     _TEXT_SNAPSHOT_FIELDS = (
         'id', 'text', 'x', 'y', 'color',
         'font_family', 'font_size', 'width', 'height',
+        'align', 'auto',
     )
     _STEP_SNAPSHOT_FIELDS = (
         'id', 'number', 'x', 'y', 'size', 'width', 'height',
@@ -6354,6 +6432,7 @@ class AnnotationEditor:
                 except Exception:
                     pass
             elem['canvas_id'] = None
+            elem.pop('photo', None)
             if 'cursor_id' in elem:
                 try:
                     self.canvas.delete(elem['cursor_id'])

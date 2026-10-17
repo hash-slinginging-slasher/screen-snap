@@ -972,6 +972,329 @@ class ModernButton(tk.Button):
         self.config(bg=self._bg)
 
 
+class Icons:
+    """Crisp single-colour toolbar icons drawn with Pillow (no image files to ship).
+
+    Each icon is drawn on a 24x24 grid at 4x resolution and downsampled, then
+    tinted with the requested colour, so one icon serves the normal, hovered
+    and selected states of a button.
+    """
+
+    SS = 4          # supersampling factor
+    STROKE = 1.9    # line weight on the 24-unit grid
+    _cache = {}     # (name, size, color) -> PIL image (root-independent)
+
+    @classmethod
+    def render(cls, name, size, color):
+        key = (name, size, color)
+        img = cls._cache.get(key)
+        if img is None:
+            img = cls._cache[key] = cls._draw(name, size, color)
+        return img
+
+    @classmethod
+    def photo(cls, name, size, color):
+        return ImageTk.PhotoImage(cls.render(name, size, color))
+
+    @classmethod
+    def _draw(cls, name, size, color):
+        n = size * cls.SS
+        k = n / 24.0
+        sw = max(2, round(cls.STROKE * k))
+        img = Image.new('RGBA', (n, n), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+
+        def P(x, y):
+            return (x * k, y * k)
+
+        def dot(x, y, r=None):
+            r = sw / 2 if r is None else r * k
+            d.ellipse([x * k - r, y * k - r, x * k + r, y * k + r], fill=color)
+
+        def line(*pts):
+            d.line([P(*p) for p in pts], fill=color, width=sw, joint='curve')
+            dot(*pts[0])
+            dot(*pts[-1])
+
+        def rect(x1, y1, x2, y2, r=0.0):
+            d.rounded_rectangle([P(x1, y1), P(x2, y2)], radius=r * k, outline=color, width=sw)
+
+        def ellipse(x1, y1, x2, y2, fill=False):
+            d.ellipse([P(x1, y1), P(x2, y2)], fill=color if fill else None,
+                      outline=None if fill else color, width=sw)
+
+        def poly(*pts):
+            d.polygon([P(*p) for p in pts], fill=color)
+
+        def arc(x1, y1, x2, y2, start, end):
+            d.arc([P(x1, y1), P(x2, y2)], start, end, fill=color, width=sw)
+
+        def head(tip, frm, length=6.5, half=3.4, filled=True):
+            dx, dy = tip[0] - frm[0], tip[1] - frm[1]
+            dist = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / dist, dy / dist
+            bx, by = tip[0] - ux * length, tip[1] - uy * length
+            a = (bx - uy * half, by + ux * half)
+            b = (bx + uy * half, by - ux * half)
+            if filled:
+                poly(tip, a, b)
+            else:
+                line(a, tip, b)
+
+        def dashed(x1, y1, x2, y2, dash=2.4, gap=1.9):
+            """Dashed rectangle outline."""
+            for (ax, ay, bx, by) in ((x1, y1, x2, y1), (x2, y1, x2, y2), (x2, y2, x1, y2), (x1, y2, x1, y1)):
+                total = math.hypot(bx - ax, by - ay)
+                ux, uy = (bx - ax) / total, (by - ay) / total
+                pos = 0.0
+                while pos < total:
+                    end = min(pos + dash, total)
+                    line((ax + ux * pos, ay + uy * pos), (ax + ux * end, ay + uy * end))
+                    pos += dash + gap
+
+        def droplet(cx, cy, r, tip_y):
+            d_tip = cy - tip_y
+            phi = math.degrees(math.acos(r / d_tip))
+            pts = [(cx, tip_y)]
+            a = -90 + phi
+            while a <= 270 - phi:
+                pts.append((cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))))
+                a += 6
+            pts.append((cx, tip_y))
+            line(*pts)
+
+        mirror = False
+
+        if name == 'rectangle':
+            rect(4, 5.5, 20, 18.5, r=1.5)
+        elif name == 'circle':
+            ellipse(3.8, 3.8, 20.2, 20.2)
+        elif name == 'line':
+            line((5, 19), (19, 5))
+        elif name in ('arrow', 'arrow_filled'):
+            line((5, 19), (16, 8))
+            head((20, 4), (5, 19), length=7.5, half=3.8)
+        elif name == 'arrow_open':
+            line((5, 19), (19, 5))
+            head((19.5, 4.5), (5, 19), length=7.5, half=4.2, filled=False)
+        elif name == 'arrow_single':
+            line((3.5, 12), (16, 12))
+            head((21, 12), (3.5, 12), length=7, half=3.8)
+        elif name == 'arrow_double':
+            line((8, 12), (16, 12))
+            head((22, 12), (8, 12), length=6.5, half=3.6)
+            head((2, 12), (16, 12), length=6.5, half=3.6)
+        elif name == 'text':
+            line((5, 5.5), (19, 5.5))
+            line((12, 5.5), (12, 19))
+            line((9, 19), (15, 19))
+        elif name == 'step':
+            cx, cy, r = 10.2, 12, 7.2
+            pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a)))
+                   for a in range(40, 321, 8)]
+            line(*pts, (21.8, 12), pts[0])
+            line((10.6, 8.4), (10.6, 15.8))
+            line((8.7, 10.0), (10.6, 8.4))
+        elif name == 'bubble':
+            rect(3, 4, 21, 16, r=3.5)
+            line((8, 16), (7, 21), (13, 16))
+        elif name == 'stamp':
+            ellipse(3.5, 3.5, 20.5, 20.5)
+            dot(9.2, 10, 1.25)
+            dot(14.8, 10, 1.25)
+            arc(7.2, 8.2, 16.8, 17.2, 25, 155)
+        elif name == 'highlight':
+            line((13.5, 3.5), (20.5, 10.5), (12, 19), (5, 12), (13.5, 3.5))
+            line((5, 12), (3.5, 15.5))
+            line((3, 21.5), (14, 21.5))
+        elif name == 'blur':
+            droplet(12, 14.6, 6.4, 3.2)
+        elif name == 'pixelate':
+            cell, gap, x0 = 4.6, 1.2, 4.3
+            for row in range(3):
+                for col in range(3):
+                    x1 = x0 + col * (cell + gap)
+                    y1 = x0 + row * (cell + gap)
+                    if (row + col) % 2 == 0:
+                        d.rectangle([P(x1, y1), P(x1 + cell, y1 + cell)], fill=color)
+                    else:
+                        d.rectangle([P(x1, y1), P(x1 + cell, y1 + cell)], outline=color,
+                                    width=max(2, sw // 2))
+        elif name == 'gaussian':
+            ellipse(3.8, 3.8, 20.2, 20.2)
+            ellipse(8, 8, 16, 16)
+            dot(12, 12, 1.4)
+        elif name == 'smart_move':
+            line((12, 4), (12, 20))
+            line((4, 12), (20, 12))
+            head((12, 2), (12, 8), length=4.6, half=2.8)
+            head((12, 22), (12, 16), length=4.6, half=2.8)
+            head((2, 12), (8, 12), length=4.6, half=2.8)
+            head((22, 12), (16, 12), length=4.6, half=2.8)
+        elif name == 'crop':
+            line((7, 2.5), (7, 17), (21.5, 17))
+            line((2.5, 7), (17, 7), (17, 21.5))
+        elif name in ('undo', 'redo'):
+            line((14, 8), (7, 8))
+            arc(9, 8, 19, 18, -90, 90)
+            line((14, 18), (8, 18))
+            poly((3.6, 8), (9.2, 3.8), (9.2, 12.2))
+            mirror = name == 'redo'
+        elif name == 'copy':
+            line((8, 7.5), (8, 4), (20, 4), (20, 16), (16.5, 16))
+            rect(4, 8, 16, 21, r=1.8)
+        elif name == 'save':
+            rect(4, 4, 20, 20, r=2.2)
+            rect(8, 4, 16, 9.5)
+            rect(7, 14, 17, 20)
+        elif name == 'ocr':
+            line((3, 8), (3, 3), (8, 3))
+            line((16, 3), (21, 3), (21, 8))
+            line((21, 16), (21, 21), (16, 21))
+            line((8, 21), (3, 21), (3, 16))
+            line((8.5, 9), (15.5, 9))
+            line((12, 9), (12, 16))
+        elif name == 'share':
+            line((12, 15), (12, 4))
+            line((7.5, 8.2), (12, 3.7), (16.5, 8.2))
+            line((4.5, 13), (4.5, 20), (19.5, 20), (19.5, 13))
+        elif name == 'region':
+            dashed(3.5, 4.5, 16.5, 17)
+            poly((12.5, 12), (21.5, 15.5), (17.6, 16.9), (20, 21.2), (17.7, 22.4), (15.3, 18.1), (12.5, 20.6))
+        elif name == 'library':
+            rect(4, 4, 10.8, 10.8, r=1.2)
+            rect(13.2, 4, 20, 10.8, r=1.2)
+            rect(4, 13.2, 10.8, 20, r=1.2)
+            rect(13.2, 13.2, 20, 20, r=1.2)
+        elif name == 'home':
+            line((3, 12), (12, 4), (21, 12))
+            line((6, 10.5), (6, 20), (18, 20), (18, 10.5))
+            line((10, 20), (10, 15), (14, 15), (14, 20))
+        elif name == 'check':
+            line((4.5, 12.5), (9.5, 17.5), (19.5, 6.5))
+        elif name == 'trash':
+            line((4, 7), (20, 7))
+            line((9, 7), (9, 4), (15, 4), (15, 7))
+            line((6, 7), (7, 20), (17, 20), (18, 7))
+            line((10.2, 10.5), (10.2, 16.5))
+            line((13.8, 10.5), (13.8, 16.5))
+        elif name == 'reset':
+            arc(5, 5, 19, 19, 40, 330)
+            head((19.2, 10.2), (17.4, 6.6), length=5.6, half=3.2)
+            mirror = True
+        else:
+            raise ValueError(f"unknown icon {name!r}")
+
+        img = img.resize((size, size), Image.LANCZOS)
+        if mirror:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        return img
+
+
+class Tooltip:
+    """Hover tooltip for any widget (shown after a short delay)."""
+
+    def __init__(self, widget, text, delay=450):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after = None
+        self._tip = None
+        widget.bind('<Enter>', self._schedule, add='+')
+        widget.bind('<Leave>', self._hide, add='+')
+        widget.bind('<ButtonPress>', self._hide, add='+')
+        widget.bind('<Destroy>', self._hide, add='+')
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+
+    def _show(self):
+        self._after = None
+        if self._tip is not None:
+            return
+        try:
+            tip = tk.Toplevel(self.widget)
+            tip.overrideredirect(True)
+            tip.attributes('-topmost', True)
+            tk.Label(tip, text=self.text, font=("Segoe UI", 9), fg=Theme.ON_SURFACE,
+                     bg=Theme.SURFACE_BRIGHT, padx=9, pady=4, highlightthickness=1,
+                     highlightbackground=Theme.OUTLINE).pack()
+            tip.update_idletasks()
+            x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2 - tip.winfo_reqwidth() // 2
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            x = max(0, min(x, self.widget.winfo_screenwidth() - tip.winfo_reqwidth()))
+            tip.geometry(f"+{x}+{y}")
+            self._tip = tip
+        except tk.TclError:
+            self._tip = None
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+
+class IconButton(ModernButton):
+    """Icon-only ModernButton with a tooltip.
+
+    The icon is re-tinted whenever the foreground colour changes, so existing
+    code that highlights a button with `btn.config(bg=..., fg=...)` (the active
+    tool, toggles) keeps working unchanged. A background set that way becomes
+    the button's resting colour, so hovering no longer wipes the highlight.
+    """
+
+    def __init__(self, master, icon, tip=None, variant="tool", size=22, **kwargs):
+        self._icon = icon
+        self._icon_size = size
+        self._photo = None
+        kwargs.setdefault('padx', 9)
+        kwargs.setdefault('pady', 7)
+        super().__init__(master, variant=variant, **kwargs)
+        self._set_icon(self.cget('fg'))
+        self.tooltip = Tooltip(self, tip) if tip else None
+
+    def _set_icon(self, color):
+        self._photo = Icons.photo(self._icon, self._icon_size, color)
+        tk.Button.configure(self, image=self._photo)
+
+    def configure(self, cnf=None, **kw):
+        if cnf is None and not kw:
+            return super().configure()
+        if cnf:
+            kw = {**cnf, **kw}
+        result = super().configure(**kw)
+        fg = kw.get('fg', kw.get('foreground'))
+        if fg is not None:
+            self._set_icon(fg)
+        bg = kw.get('bg', kw.get('background'))
+        if bg is not None:
+            self._bg = bg
+            self._abg = Theme.PRIMARY_GLOW if bg == Theme.PRIMARY else Theme.SURFACE_BRIGHT
+        return result
+
+    config = configure
+
+    # Hover colours are applied directly so they don't overwrite the resting colour.
+    def on_enter(self):
+        tk.Button.configure(self, bg=self._abg)
+
+    def on_leave(self):
+        tk.Button.configure(self, bg=self._bg)
+
+
 def _clear_root(root):
     """Remove all children from a root without destroying it."""
     for widget in root.winfo_children():
@@ -2786,10 +3109,10 @@ class AnnotationEditor:
         size_spin = ttk.Spinbox(self.text_props_frame, from_=8, to=120, textvariable=self.font_size_var, width=5)
         size_spin.pack(side='left', padx=(0, 20))
 
-        ModernButton(self.text_props_frame, text="✓ APPLY", variant="primary", 
-                     command=self.update_selected_text, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
-        ModernButton(self.text_props_frame, text="🗑 DELETE", variant="danger", 
-                     command=self.delete_selected_text, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
+        IconButton(self.text_props_frame, 'check', tip="Apply text changes", variant="primary",
+                   command=self.update_selected_text).pack(side='left', padx=5)
+        IconButton(self.text_props_frame, 'trash', tip="Delete selected text", variant="danger",
+                   command=self.delete_selected_text).pack(side='left', padx=5)
 
         # Step properties panel
         self.step_props_frame = tk.Frame(self.props_container, bg=Theme.SURFACE, padx=15, pady=10)
@@ -2828,8 +3151,8 @@ class AnnotationEditor:
         rotation_spin.bind('<Return>', lambda e: self.update_step_rotation())
         rotation_spin.bind('<FocusOut>', lambda e: self.update_step_rotation())
 
-        ModernButton(self.step_props_frame, text="↺ RESET", variant="secondary",
-                     command=self.reset_step_counter, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
+        IconButton(self.step_props_frame, 'reset', tip="Reset step counter to 1", variant="secondary",
+                   command=self.reset_step_counter).pack(side='left', padx=5)
 
         # Arrow properties panel
         self.arrow_props_frame = tk.Frame(self.props_container, bg=Theme.SURFACE, padx=15, pady=10)
@@ -2842,31 +3165,27 @@ class AnnotationEditor:
         tk.Label(self.arrow_props_frame, text="Style", font=Theme.FONT_LABEL,
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
 
-        self.arrow_filled_btn = ModernButton(
-            self.arrow_props_frame, text="\u25b6 Filled", variant="primary",
-            command=lambda: self._set_arrow_style('filled'),
-            font=("Segoe UI Bold", 8))
+        self.arrow_filled_btn = IconButton(
+            self.arrow_props_frame, 'arrow_filled', tip="Filled arrow head", variant="primary",
+            command=lambda: self._set_arrow_style('filled'))
         self.arrow_filled_btn.pack(side='left', padx=2)
 
-        self.arrow_open_btn = ModernButton(
-            self.arrow_props_frame, text="\u25b7 Open", variant="tool",
-            command=lambda: self._set_arrow_style('open'),
-            font=("Segoe UI Bold", 8))
+        self.arrow_open_btn = IconButton(
+            self.arrow_props_frame, 'arrow_open', tip="Open arrow head", variant="tool",
+            command=lambda: self._set_arrow_style('open'))
         self.arrow_open_btn.pack(side='left', padx=(2, 20))
 
         tk.Label(self.arrow_props_frame, text="Heads", font=Theme.FONT_LABEL,
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
 
-        self.arrow_single_btn = ModernButton(
-            self.arrow_props_frame, text="\u2192 Single", variant="primary",
-            command=lambda: self._set_arrow_heads('single'),
-            font=("Segoe UI Bold", 8))
+        self.arrow_single_btn = IconButton(
+            self.arrow_props_frame, 'arrow_single', tip="Head at one end", variant="primary",
+            command=lambda: self._set_arrow_heads('single'))
         self.arrow_single_btn.pack(side='left', padx=2)
 
-        self.arrow_double_btn = ModernButton(
-            self.arrow_props_frame, text="\u2194 Double", variant="tool",
-            command=lambda: self._set_arrow_heads('double'),
-            font=("Segoe UI Bold", 8))
+        self.arrow_double_btn = IconButton(
+            self.arrow_props_frame, 'arrow_double', tip="Heads at both ends", variant="tool",
+            command=lambda: self._set_arrow_heads('double'))
         self.arrow_double_btn.pack(side='left', padx=2)
 
         # Blur properties panel
@@ -2880,16 +3199,14 @@ class AnnotationEditor:
         tk.Label(self.blur_props_frame, text="Mode", font=Theme.FONT_LABEL,
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
 
-        self.blur_pixelate_btn = ModernButton(
-            self.blur_props_frame, text="\u25a6 Pixelate", variant="primary",
-            command=lambda: self._set_blur_mode('pixelate'),
-            font=("Segoe UI Bold", 8))
+        self.blur_pixelate_btn = IconButton(
+            self.blur_props_frame, 'pixelate', tip="Pixelate", variant="primary",
+            command=lambda: self._set_blur_mode('pixelate'))
         self.blur_pixelate_btn.pack(side='left', padx=2)
 
-        self.blur_gaussian_btn = ModernButton(
-            self.blur_props_frame, text="\u25cc Blur", variant="tool",
-            command=lambda: self._set_blur_mode('gaussian'),
-            font=("Segoe UI Bold", 8))
+        self.blur_gaussian_btn = IconButton(
+            self.blur_props_frame, 'gaussian', tip="Gaussian blur", variant="tool",
+            command=lambda: self._set_blur_mode('gaussian'))
         self.blur_gaussian_btn.pack(side='left', padx=(2, 20))
 
         tk.Label(self.blur_props_frame, text="Intensity", font=Theme.FONT_LABEL,
@@ -2948,8 +3265,8 @@ class AnnotationEditor:
         ttk.Spinbox(self.bubble_props_frame, from_=8, to=48,
                     textvariable=self.bubble_font_size_var, width=5).pack(side='left', padx=(0, 20))
 
-        ModernButton(self.bubble_props_frame, text="\U0001f5d1 DELETE", variant="danger",
-                     command=self._delete_selected_bubble, font=("Segoe UI Bold", 8)).pack(side='left', padx=5)
+        IconButton(self.bubble_props_frame, 'trash', tip="Delete selected bubble", variant="danger",
+                   command=self._delete_selected_bubble).pack(side='left', padx=5)
 
         # Canvas frame (The "Sunken" Void)
         canvas_container = tk.Frame(main_frame, bg=Theme.BACKGROUND, padx=20, pady=20)
@@ -3078,81 +3395,32 @@ class AnnotationEditor:
         toolbar = tk.Frame(container, bg=Theme.SURFACE, padx=20, pady=12)
         toolbar.pack(side='top', fill='x')
 
-        # 1. Tools Group
+        # 1. Tools Group — icon buttons; hover for the name and shortcut
         tools_frame = tk.Frame(toolbar, bg=Theme.SURFACE)
         tools_frame.pack(side='left')
 
         tools = [
-            ('Rectangle', 'rectangle', 'R'),
-            ('Line', 'line', 'L'),
-            ('Circle', 'circle', 'C'),
-            ('Crop', 'crop', 'X'),
-            ('Text', 'text', 'T'),
-            ('Step', 'step', 'P'),
+            ('rectangle', "Rectangle (R)"),
+            ('circle', "Circle (C)"),
+            ('line', "Line (L)"),
+            ('arrow', "Arrow (A)"),
+            ('text', "Text (T)"),
+            ('step', "Step number (P)"),
+            ('bubble', "Speech bubble (B)"),
+            ('stamp', "Stamp (M)"),
+            ('highlight', "Highlight (H)"),
+            ('blur', "Blur / pixelate (U)"),
+            ('smart_move', "Smart move (V)"),
+            ('crop', "Crop (X)"),
         ]
-
-        for text, tool, key in tools:
-            btn = ModernButton(
-                tools_frame,
-                text=f"{text} ({key})",
-                variant="tool",
-                command=lambda t=tool: self.set_tool(t)
-            )
-            btn.pack(side='left', padx=2)
-            setattr(self, f'{tool}_btn', btn)
-
-        # Overflow "More" dropdown for additional tools
-        self.overflow_menu_btn = tk.Menubutton(
-            tools_frame,
-            text="More \u25be",
-            font=Theme.FONT_BUTTON,
-            bg=Theme.SURFACE,
-            fg=Theme.ON_SURFACE_VARIANT,
-            activebackground=Theme.SURFACE_BRIGHT,
-            activeforeground=Theme.ON_SURFACE,
-            relief='flat',
-            borderwidth=0,
-            cursor='hand2',
-            padx=15,
-            pady=5,
-        )
-        self.overflow_menu_btn.pack(side='left', padx=2)
-
-        self.overflow_menu = tk.Menu(
-            self.overflow_menu_btn,
-            tearoff=0,
-            bg=Theme.SURFACE,
-            fg=Theme.ON_SURFACE,
-            activebackground=Theme.PRIMARY,
-            activeforeground="#000000",
-            font=Theme.FONT_BUTTON,
-            borderwidth=1,
-            relief='flat',
-        )
-        self.overflow_menu_btn['menu'] = self.overflow_menu
-
-        self.overflow_tools = [
-            ('Arrow', 'arrow', 'A'),
-            ('Stamp', 'stamp', 'M'),
-            ('Bubble', 'bubble', 'B'),
-            ('Smart Move', 'smart_move', 'V'),
-            ('Blur', 'blur', 'U'),
-            ('Highlight', 'highlight', 'H'),
-        ]
-        self._overflow_tool_names = {t[1] for t in self.overflow_tools}
+        self._tool_names = [t for t, _ in tools]
+        # Tools whose keyboard shortcut is live (the rest show "Coming soon")
         self._implemented_overflow = {'arrow', 'highlight', 'blur', 'stamp', 'bubble', 'smart_move'}
 
-        for label, tool, key in self.overflow_tools:
-            if tool in self._implemented_overflow:
-                self.overflow_menu.add_command(
-                    label=f"{label} ({key})",
-                    command=lambda t=tool: self.set_tool(t),
-                )
-            else:
-                self.overflow_menu.add_command(
-                    label=f"{label} ({key}) \u2014 Coming soon",
-                    state='disabled',
-                )
+        for tool, tip in tools:
+            btn = IconButton(tools_frame, tool, tip=tip, command=lambda t=tool: self.set_tool(t))
+            btn.pack(side='left', padx=1)
+            setattr(self, f'{tool}_btn', btn)
 
         tk.Frame(toolbar, width=1, bg=Theme.OUTLINE).pack(side='left', fill='y', padx=20)
 
@@ -3160,18 +3428,14 @@ class AnnotationEditor:
         history_frame = tk.Frame(toolbar, bg=Theme.SURFACE)
         history_frame.pack(side='left')
 
-        self.undo_btn = ModernButton(
-            history_frame,
-            text="↶ UNDO",
-            variant="secondary",
+        self.undo_btn = IconButton(
+            history_frame, 'undo', tip="Undo (Ctrl+Z)",
             command=self.undo,
         )
         self.undo_btn.pack(side='left', padx=2)
 
-        self.redo_btn = ModernButton(
-            history_frame,
-            text="↷ REDO",
-            variant="secondary",
+        self.redo_btn = IconButton(
+            history_frame, 'redo', tip="Redo (Ctrl+Y)",
             command=self.redo,
         )
         self.redo_btn.pack(side='left', padx=2)
@@ -3203,14 +3467,19 @@ class AnnotationEditor:
         actions_frame = tk.Frame(actions_bar, bg=Theme.SURFACE)
         actions_frame.pack(anchor='center')
 
-        ModernButton(actions_frame, text="🏠 LAUNCHER", variant="secondary", command=self.back_to_launcher).pack(side='right', padx=5)
-        ModernButton(actions_frame, text="📚 LIBRARY", variant="secondary", command=self.open_library).pack(side='right', padx=5)
-        ModernButton(actions_frame, text="✂️ REGION", variant="primary", command=self.capture_new_region).pack(side='right', padx=5)
-        ModernButton(actions_frame, text="📋 COPY IMAGE", variant="primary", command=self.copy_image_to_clipboard).pack(side='right', padx=5)
-        ModernButton(actions_frame, text="🔤 OCR", variant="primary", command=self.ocr_current_image).pack(side='right', padx=5)
-        ModernButton(actions_frame, text="💾 SAVE & COPY", variant="success", command=self.save_and_copy).pack(side='right', padx=5)
-        ModernButton(actions_frame, text="🔗 SHARE", variant="primary", command=self.share_to_imgbb).pack(side='right', padx=5)
-
+        # Packed right-to-left, so they read: share, save, OCR, copy, region, library, launcher
+        actions = [
+            ('home', "Back to launcher", 'tool', self.back_to_launcher),
+            ('library', "Library (Ctrl+L)", 'tool', self.open_library),
+            ('region', "New region capture (PrtScn)", 'tool', self.capture_new_region),
+            ('copy', "Copy image to clipboard", 'tool', self.copy_image_to_clipboard),
+            ('ocr', "OCR: copy text from the image", 'tool', self.ocr_current_image),
+            ('save', "Save & copy path", 'success', self.save_and_copy),
+            ('share', "Share (upload to ImgBB)", 'tool', self.share_to_imgbb),
+        ]
+        for icon, tip, variant, command in actions:
+            IconButton(actions_frame, icon, tip=tip, variant=variant, size=24,
+                       command=command).pack(side='right', padx=3)
 
         return container
     def capture_new_full(self):
@@ -3300,32 +3569,14 @@ class AnnotationEditor:
         self.current_tool = tool
         self.status_var.set(f"MODE: {tool.upper()}")
 
-        # Update primary button states (Capsule highlight)
-        for t in ['rectangle', 'line', 'circle', 'crop', 'text', 'step']:
+        # Highlight the active tool's icon button
+        for t in self._tool_names:
             btn = getattr(self, f'{t}_btn', None)
             if btn:
                 if t == tool:
                     btn.config(bg=Theme.PRIMARY, fg="#000000")
                 else:
                     btn.config(bg=Theme.SURFACE, fg=Theme.ON_SURFACE_VARIANT)
-
-        # Update overflow menu button label
-        if tool in self._overflow_tool_names:
-            display = next(
-                (lbl for lbl, t, _ in self.overflow_tools if t == tool),
-                tool.title()
-            )
-            self.overflow_menu_btn.config(
-                text=f"{display} \u25be",
-                bg=Theme.PRIMARY,
-                fg="#000000",
-            )
-        else:
-            self.overflow_menu_btn.config(
-                text="More \u25be",
-                bg=Theme.SURFACE,
-                fg=Theme.ON_SURFACE_VARIANT,
-            )
 
         # Show/hide properties panels
         if tool == 'text':

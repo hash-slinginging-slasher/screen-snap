@@ -1115,6 +1115,7 @@ class LibraryManager:
     """Manages the screenshot library folder."""
 
     _resolved_dir = None  # cached LIBRARY_DIR resolution
+    IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif'}
 
     @staticmethod
     def _get_base_dir():
@@ -1177,10 +1178,9 @@ class LibraryManager:
     def list_files(cls):
         """List all image files in the library, sorted by modification time (newest first)."""
         lib_dir = cls.ensure_library()
-        image_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.gif'}
         files = []
         for f in lib_dir.iterdir():
-            if f.is_file() and f.suffix.lower() in image_exts:
+            if f.is_file() and f.suffix.lower() in cls.IMAGE_EXTS:
                 files.append(f)
         # Sort by modification time, newest first
         files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
@@ -6723,6 +6723,12 @@ class LibraryBrowser:
         if self._view not in ('thumbnails', 'list'):
             self._view = 'thumbnails'
         self._stale = {'thumbnails': True, 'list': True}  # view needs re-rendering
+        # Date groups are lazy: only opened groups get rows/tiles/thumbnails, so
+        # a library with thousands of screenshots opens as fast as an empty one.
+        self._expanded = set()    # iids of opened date groups (shared by both views)
+        self._shown = {}          # group iid -> tiles the grid shows (paging)
+        self._lazy = {}           # list view: group iid -> closed group still to fill in
+        self._loaded_once = False
         # Thumbnail grid state
         self._tiles = {}          # path -> tile frame
         self._tile_order = []     # paths in display order (arrow-key navigation)
@@ -6776,6 +6782,9 @@ class LibraryBrowser:
                      command=self.open_folder, font=("Segoe UI Bold", 8)).pack(side='left', padx=(0, 10))
         ModernButton(btn_frame, text="🔄 REFRESH", variant="secondary",
                      command=self.load_library, font=("Segoe UI Bold", 8)).pack(side='left')
+        tk.Label(btn_frame, text="Today is loaded — click a date to load its screenshots",
+                 font=("Segoe UI", 8), fg=Theme.ON_SURFACE_VARIANT,
+                 bg=Theme.BACKGROUND).pack(side='left', padx=20)
 
         view_frame = tk.Frame(btn_frame, bg=Theme.BACKGROUND)
         view_frame.pack(side='right')
@@ -6820,6 +6829,9 @@ class LibraryBrowser:
         # Double-click to open (on a date header it just toggles the group)
         self.tree.bind('<Double-Button-1>', self.open_selected)
         self.tree.bind('<Return>', self.open_selected)
+        # Date groups fill in when opened (see _populate_tree)
+        self.tree.bind('<<TreeviewOpen>>', self._on_tree_open)
+        self.tree.bind('<<TreeviewClose>>', self._on_tree_close)
 
         # Thumbnail view
         self.grid_container = tk.Frame(self.content, bg=Theme.SURFACE_LOW)
@@ -6913,18 +6925,32 @@ class LibraryBrowser:
 
     # ── Loading ────────────────────────────────────────────────────
 
+    PAGE = 60   # tiles the grid shows per date group until "show more" is clicked
+
     def _scan(self):
-        """Library files grouped by creation date, newest group first."""
+        """Library files grouped by creation date, newest group first.
+
+        One directory pass: DirEntry.stat() is served from the listing on
+        Windows, so this costs no extra disk access per file.
+        """
         groups = {}
-        for f in LibraryManager.list_files():
-            try:
-                st = f.stat()
-            except OSError:
-                continue
-            # st_ctime is birth time on Windows
-            created = datetime.datetime.fromtimestamp(getattr(st, 'st_ctime', st.st_mtime))
-            groups.setdefault(created.date(), []).append(
-                (created, str(f), st.st_size, st.st_mtime_ns))
+        try:
+            with os.scandir(LibraryManager.ensure_library()) as entries:
+                for entry in entries:
+                    if os.path.splitext(entry.name)[1].lower() not in LibraryManager.IMAGE_EXTS:
+                        continue
+                    try:
+                        if not entry.is_file():
+                            continue
+                        st = entry.stat()
+                    except OSError:
+                        continue
+                    # st_ctime is birth time on Windows
+                    created = datetime.datetime.fromtimestamp(getattr(st, 'st_ctime', st.st_mtime))
+                    groups.setdefault(created.date(), []).append(
+                        (created, entry.path, st.st_size, st.st_mtime_ns))
+        except OSError as e:
+            print(f"Failed to read library folder: {e}")
 
         today = datetime.date.today()
         days = sorted(groups, reverse=True)
@@ -6940,19 +6966,25 @@ class LibraryBrowser:
                 'iid': f"day-{day.isoformat()}",
                 'label': label,
                 'entries': sorted(groups[day], key=lambda e: e[0], reverse=True),
-                # Today's group (or the newest one if nothing was captured today)
+                # Opened by default: today (or the newest day, so the browser
+                # isn't blank when nothing was captured today).
                 'open': (day == today) or (today not in groups and day == days[0]),
             })
         return result
 
-    def load_library(self, keep_open=None):
-        """(Re)load the library from disk and render the visible view.
+    def load_library(self):
+        """(Re)scan the library folder and render the visible view.
 
-        `keep_open` re-expands a set of list-view group iids after a reload so
-        deleting inside an old group doesn't collapse it.
+        Only opened date groups are rendered with content; the rest stay
+        collapsed headers until the user opens them.
         """
         self._groups = self._scan()
-        self._keep_open = keep_open
+        known = {g['iid'] for g in self._groups}
+        if not self._loaded_once:
+            self._expanded = {g['iid'] for g in self._groups if g['open']}
+            self._loaded_once = True
+        else:
+            self._expanded &= known  # keep the user's choices across refreshes
         self._stale = {'thumbnails': True, 'list': True}
         self._render(self._view)
 
@@ -6963,26 +6995,54 @@ class LibraryBrowser:
         else:
             self._populate_grid()
 
+    # ── List view ──────────────────────────────────────────────────
+
     def _populate_tree(self):
         self.tree.delete(*self.tree.get_children())
         self._item_paths = {}
+        self._lazy = {}
         if not self._groups:
             self.tree.insert('', 'end', text="(Library is empty — take a screenshot!)",
                              tags=('empty',))
             return
         for group in self._groups:
-            expand = group['open'] or bool(self._keep_open and group['iid'] in self._keep_open)
-            self.tree.insert('', 'end', iid=group['iid'],
+            iid = group['iid']
+            is_open = iid in self._expanded
+            self.tree.insert('', 'end', iid=iid,
                              text=f"{group['label']}  ({len(group['entries'])})",
-                             open=expand, tags=('date_header',))
-            for created, path, size, _mtime in group['entries']:
-                display = f"{os.path.basename(path)}  ({size / 1024:.0f} KB, {created.strftime('%H:%M')})"
-                item = self.tree.insert(group['iid'], 'end', text=display)
-                self._item_paths[item] = path
+                             open=is_open, tags=('date_header',))
+            if is_open:
+                self._fill_tree_group(group)
+            else:
+                # A placeholder child gives the group its expander arrow; the
+                # real rows are only inserted when the user opens it.
+                self.tree.insert(iid, 'end', iid=f"{iid}-pending", text="…")
+                self._lazy[iid] = group
+
+    def _fill_tree_group(self, group):
+        for created, path, size, _mtime in group['entries']:
+            display = f"{os.path.basename(path)}  ({size / 1024:.0f} KB, {created.strftime('%H:%M')})"
+            item = self.tree.insert(group['iid'], 'end', text=display)
+            self._item_paths[item] = path
+
+    def _on_tree_open(self, event):
+        iid = self.tree.focus()
+        group = self._lazy.pop(iid, None)
+        if group is not None:
+            self.tree.delete(f"{iid}-pending")
+            self._fill_tree_group(group)
+        if iid.startswith('day-'):
+            self._expanded.add(iid)
+
+    def _on_tree_close(self, event):
+        self._expanded.discard(self.tree.focus())
+
+    # ── Thumbnail view ─────────────────────────────────────────────
 
     def _populate_grid(self):
         for child in self.grid_inner.winfo_children():
             child.destroy()
+        keep = self._thumb_selected
         self._tiles = {}
         self._tile_order = []
         self._tile_groups = []
@@ -6997,13 +7057,23 @@ class LibraryBrowser:
 
         todo = []
         for group in self._groups:
-            tk.Label(self.grid_inner, text=f"{group['label']}  ({len(group['entries'])})",
-                     font=("Segoe UI Bold", 9), fg=Theme.PRIMARY,
-                     bg=Theme.SURFACE_LOW).pack(anchor='w', padx=8, pady=(12, 2))
+            iid = group['iid']
+            entries = group['entries']
+            is_open = iid in self._expanded
+            header = tk.Label(self.grid_inner,
+                              text=f"{'▾' if is_open else '▸'}  {group['label']}  ({len(entries)})",
+                              font=("Segoe UI Bold", 9), fg=Theme.PRIMARY,
+                              bg=Theme.SURFACE_LOW, cursor='hand2')
+            header.pack(anchor='w', padx=8, pady=(12, 2))
+            header.bind('<Button-1>', lambda e, i=iid: self._toggle_group(i))
+            if not is_open:
+                continue  # collapsed: no tiles, no thumbnails
+
+            shown = self._shown.setdefault(iid, self.PAGE)
             tiles_frame = tk.Frame(self.grid_inner, bg=Theme.SURFACE_LOW)
             tiles_frame.pack(anchor='w', fill='x')
             tiles = []
-            for created, path, size, mtime in group['entries']:
+            for created, path, size, mtime in entries[:shown]:
                 tile = self._make_tile(tiles_frame, created, path, size)
                 tiles.append(tile)
                 self._tiles[path] = tile
@@ -7014,9 +7084,38 @@ class LibraryBrowser:
                 else:
                     todo.append((path, mtime))
             self._tile_groups.append(tiles)
+
+            remaining = len(entries) - shown
+            if remaining > 0:
+                more = tk.Label(self.grid_inner,
+                                text=f"Show {min(self.PAGE, remaining)} more  ({remaining} not shown)",
+                                font=("Segoe UI Bold", 9), fg=Theme.PRIMARY, bg=Theme.SURFACE_BRIGHT,
+                                padx=14, pady=6, cursor='hand2')
+                more.pack(anchor='w', padx=12, pady=(0, 8))
+                more.bind('<Button-1>', lambda e, i=iid: self._show_more(i))
+
         self._reflow()
+        if keep in self._tiles:
+            self._select_tile(keep, reveal=False)
         if todo:
             threading.Thread(target=self._thumb_worker, args=(gen, todo), daemon=True).start()
+
+    def _rerender_grid(self):
+        """Rebuild the grid, keeping the scroll position."""
+        pos = self.canvas.yview()[0]
+        self._populate_grid()
+        self.dialog.after_idle(lambda: self.canvas.yview_moveto(pos))
+
+    def _toggle_group(self, iid):
+        if iid in self._expanded:
+            self._expanded.discard(iid)
+        else:
+            self._expanded.add(iid)
+        self._rerender_grid()
+
+    def _show_more(self, iid):
+        self._shown[iid] = self._shown.get(iid, self.PAGE) + self.PAGE
+        self._rerender_grid()
 
     def _make_tile(self, parent, created, path, size):
         tile = tk.Frame(parent, bg=Theme.SURFACE, width=self.TILE_W, height=self.TILE_H,
@@ -7097,7 +7196,7 @@ class LibraryBrowser:
         if self._view == 'thumbnails':
             self.canvas.yview_scroll(-3 if event.delta > 0 else 3, 'units')
 
-    def _select_tile(self, path):
+    def _select_tile(self, path, reveal=True):
         old = self._tiles.get(self._thumb_selected)
         if old is not None:
             old.config(highlightbackground=Theme.SURFACE, highlightcolor=Theme.SURFACE)
@@ -7105,7 +7204,8 @@ class LibraryBrowser:
         tile = self._tiles.get(path)
         if tile is not None:
             tile.config(highlightbackground=Theme.PRIMARY, highlightcolor=Theme.PRIMARY)
-            self._ensure_visible(tile)
+            if reveal:
+                self._ensure_visible(tile)
         self.dialog.focus_set()
 
     def _ensure_visible(self, tile):
@@ -7186,13 +7286,11 @@ class LibraryBrowser:
             return
 
         if messagebox.askyesno("Confirm Delete", f"Delete this screenshot?\n\n{os.path.basename(file_path)}"):
-            open_groups = {i for i in self.tree.get_children('')
-                           if self.tree.item(i, 'open')}
             scroll_pos = self.canvas.yview()[0]
             try:
                 ThumbnailCache.forget(file_path)
                 os.remove(file_path)
-                self.load_library(keep_open=open_groups)
+                self.load_library()
                 if self._view == 'thumbnails':
                     self.dialog.after_idle(lambda: self.canvas.yview_moveto(scroll_pos))
             except Exception as e:

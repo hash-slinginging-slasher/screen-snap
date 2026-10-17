@@ -9,6 +9,10 @@ import os
 import subprocess
 import argparse
 import math
+import contextlib
+import queue
+import time
+import types
 from pathlib import Path
 
 # Auto-install dependencies
@@ -259,14 +263,12 @@ def _bitblt_capture(left, top, width, height):
             user32.ReleaseDC(None, screen_dc)
 
 
-def capture_all_screens():
-    """Capture all monitors as a single image, matching native Win+PrtScn.
+@contextlib.contextmanager
+def _physical_dpi_context():
+    """Temporarily make the calling thread Per-Monitor V2 DPI aware.
 
-    Uses Windows GDI BitBlt directly (the same path used by Windows' built-in
-    Print Screen and Snipping Tool). Temporarily switches the calling thread
-    to Per-Monitor V2 DPI awareness so GetSystemMetrics and BitBlt return true
-    physical pixels regardless of display scaling. Falls back to Pillow's
-    ImageGrab if BitBlt fails for any reason.
+    Inside the block GetSystemMetrics, BitBlt, EnumDisplayMonitors, DWM and UI
+    Automation all report true physical pixels regardless of display scaling.
     """
     user32 = ctypes.windll.user32
     old_ctx = None
@@ -282,7 +284,28 @@ def capture_all_screens():
         except Exception:
             old_ctx = None
     try:
-        # Virtual screen bounds (physical pixels thanks to DPI context above).
+        yield
+    finally:
+        if old_ctx and set_thread_ctx is not None:
+            try:
+                set_thread_ctx(ctypes.c_void_p(old_ctx))
+            except Exception:
+                pass
+
+
+def capture_virtual_screen():
+    """Capture all monitors as one uncropped image.
+
+    Returns (image, left, top): the image is in physical pixels and (left, top)
+    is the virtual-screen origin in the same space, so a physical screen point
+    (x, y) lives at (x - left, y - top) in the image.
+
+    Uses Windows GDI BitBlt directly (the same path used by Windows' built-in
+    Print Screen and Snipping Tool). Falls back to Pillow's ImageGrab if
+    BitBlt fails for any reason.
+    """
+    user32 = ctypes.windll.user32
+    with _physical_dpi_context():
         left = user32.GetSystemMetrics(76)    # SM_XVIRTUALSCREEN
         top = user32.GetSystemMetrics(77)     # SM_YVIRTUALSCREEN
         width = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
@@ -295,13 +318,13 @@ def capture_all_screens():
                 bbox=(left, top, left + width, top + height),
                 all_screens=True,
             )
-        return _autocrop_black(img)
-    finally:
-        if old_ctx and set_thread_ctx is not None:
-            try:
-                set_thread_ctx(ctypes.c_void_p(old_ctx))
-            except Exception:
-                pass
+    return img, left, top
+
+
+def capture_all_screens():
+    """Capture all monitors as a single image, matching native Win+PrtScn."""
+    img, _, _ = capture_virtual_screen()
+    return _autocrop_black(img)
 
 
 def _autocrop_black(img):
@@ -319,6 +342,337 @@ def _autocrop_black(img):
     if bbox == (0, 0, img.width, img.height):
         return img  # nothing to crop
     return img.crop(bbox)
+
+
+# ── Smart capture: monitors, windows, UI elements ──────────────────
+# The region selector can highlight whatever is under the cursor (a monitor,
+# a window, or a UI element such as a browser's address bar) and capture it
+# with one click. Everything below works in *physical* pixels.
+
+def _enum_monitor_rects():
+    """Return {hmonitor: (l, t, r, b)} in the calling thread's DPI space."""
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    found = {}
+    proc_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(wintypes.RECT), ctypes.c_void_p)
+
+    def _cb(hmon, _hdc, rect, _lp):
+        r = rect.contents
+        found[hmon] = (r.left, r.top, r.right, r.bottom)
+        return True
+
+    user32.EnumDisplayMonitors(None, None, proc_type(_cb), None)
+    return found
+
+
+class ScreenMap:
+    """Maps between the overlay's logical coordinates and physical pixels.
+
+    tkinter runs system-DPI-aware, so on mixed-DPI setups each monitor is
+    scaled differently in logical space than in the captured image. Pairing
+    every monitor's logical and physical rect lets us convert points per
+    monitor instead of assuming one global scale factor.
+    """
+
+    def __init__(self):
+        self.monitors = []  # [(physical_rect, logical_rect)] sorted left-to-right
+        try:
+            logical = _enum_monitor_rects()          # process DPI (system aware)
+            with _physical_dpi_context():
+                physical = _enum_monitor_rects()
+            pairs = [(physical[h], logical[h]) for h in physical if h in logical]
+            self.monitors = sorted(pairs, key=lambda p: (p[0][0], p[0][1]))
+        except Exception:
+            self.monitors = []
+
+    @staticmethod
+    def _nearest(point, rects):
+        x, y = point
+        best, best_d = None, None
+        for i, (l, t, r, b) in enumerate(rects):
+            dx = max(l - x, 0, x - r + 1)
+            dy = max(t - y, 0, y - b + 1)
+            d = dx * dx + dy * dy
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        return best
+
+    def _convert(self, x, y, src, dst):
+        if not self.monitors:
+            return x, y
+        i = self._nearest((x, y), [m[src] for m in self.monitors])
+        s, d = self.monitors[i][src], self.monitors[i][dst]
+        sw, sh = max(1, s[2] - s[0]), max(1, s[3] - s[1])
+        return (d[0] + (x - s[0]) * (d[2] - d[0]) / sw,
+                d[1] + (y - s[1]) * (d[3] - d[1]) / sh)
+
+    def to_physical(self, x, y):
+        return self._convert(x, y, 1, 0)
+
+    def to_logical(self, x, y):
+        return self._convert(x, y, 0, 1)
+
+    def physical_rects(self):
+        return [m[0] for m in self.monitors]
+
+    def monitor_index_at(self, x, y):
+        """Index (left-to-right) of the monitor nearest to a physical point."""
+        if not self.monitors:
+            return None
+        return self._nearest((x, y), self.physical_rects())
+
+
+def list_windows():
+    """Visible top-level windows, topmost first, as dicts of hwnd/rect/title.
+
+    Rects are physical pixels (DWM extended frame bounds, so the invisible
+    resize border of Windows 10/11 windows is excluded). ScreenSnap's own
+    windows, the desktop, and cloaked/minimised windows are skipped.
+    """
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    dwmapi = ctypes.windll.dwmapi
+    own_pid = os.getpid()
+    windows = []
+    proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _cb(hwnd, _lp):
+        h = ctypes.c_void_p(hwnd)
+        if not user32.IsWindowVisible(h) or user32.IsIconic(h):
+            return True
+        cloaked = wintypes.DWORD(0)
+        dwmapi.DwmGetWindowAttribute(h, 14, ctypes.byref(cloaked), 4)  # DWMWA_CLOAKED
+        if cloaked.value:
+            return True
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        if pid.value == own_pid:
+            return True
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value in ('Progman', 'WorkerW'):
+            return True  # desktop: let it fall through to the monitor
+        rect = wintypes.RECT()
+        # DWMWA_EXTENDED_FRAME_BOUNDS
+        if dwmapi.DwmGetWindowAttribute(h, 9, ctypes.byref(rect), ctypes.sizeof(rect)) != 0:
+            user32.GetWindowRect(h, ctypes.byref(rect))
+        if rect.right - rect.left < 4 or rect.bottom - rect.top < 4:
+            return True
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(h, title, 256)
+        windows.append({
+            'hwnd': hwnd,
+            'rect': (rect.left, rect.top, rect.right, rect.bottom),
+            'title': title.value,
+        })
+        return True
+
+    with _physical_dpi_context():
+        user32.EnumWindows(proc_type(_cb), None)
+    return windows
+
+
+def _com_call(obj, index, argtypes, *args):
+    """Call slot `index` of a COM object's vtable; returns the HRESULT."""
+    vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    func = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[index])
+    return func(obj, *args)
+
+
+class _UIAutomation:
+    """Minimal ctypes client for Windows UI Automation (no extra packages).
+
+    Only what smart capture needs: descend from a window to the innermost UI
+    element under a point. Must be created and used on a single thread, with
+    that thread in the physical DPI context.
+    """
+
+    # UIA control types we treat as leaves — descending further only finds
+    # glyph runs and text nodes, never something worth capturing on its own.
+    _LEAF_TYPES = {
+        50000, 50002, 50003, 50004, 50005, 50006, 50007, 50011, 50013, 50014,
+        50015, 50016, 50019, 50020, 50024, 50029, 50030, 50031, 50035,
+    }
+    _MAX_DEPTH = 24
+    _MAX_SIBLINGS = 300
+
+    def __init__(self):
+        import uuid
+        from ctypes import wintypes
+        self._wintypes = wintypes
+        self._ole32 = ctypes.windll.ole32
+        self._oleaut32 = ctypes.windll.oleaut32
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16),
+                        ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+
+        def guid(text):
+            u = uuid.UUID(text)
+            g = GUID()
+            g.a, g.b, g.c = u.time_low, u.time_mid, u.time_hi_version
+            for i, byte in enumerate(u.bytes[8:]):
+                g.d[i] = byte
+            return g
+
+        self._ole32.CoInitializeEx(None, 0)  # multithreaded apartment
+        self._ole32.CoCreateInstance.argtypes = [
+            ctypes.POINTER(GUID), ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+        clsid = guid("ff48dba4-60ef-4201-aa87-54103eef594e")   # CUIAutomation
+        iid = guid("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee")     # IUIAutomation
+        self._auto = ctypes.c_void_p()
+        hr = self._ole32.CoCreateInstance(
+            ctypes.byref(clsid), None, 1 | 4, ctypes.byref(iid), ctypes.byref(self._auto))
+        if hr != 0 or not self._auto.value:
+            raise OSError(f"UI Automation unavailable (HRESULT {hr & 0xFFFFFFFF:#x})")
+        self._walker = ctypes.c_void_p()
+        # IUIAutomation::get_ControlViewWalker
+        if _com_call(self._auto, 14, (ctypes.POINTER(ctypes.c_void_p),),
+                     ctypes.byref(self._walker)) != 0 or not self._walker.value:
+            raise OSError("UI Automation tree walker unavailable")
+
+    def close(self):
+        for obj in (self._walker, self._auto):
+            if obj and obj.value:
+                _com_call(obj, 2, ())  # IUnknown::Release
+        self._ole32.CoUninitialize()
+
+    # -- thin wrappers over the COM vtable slots we use ----------------
+    def _release(self, element):
+        _com_call(element, 2, ())
+
+    def _element_from_handle(self, hwnd):
+        out = ctypes.c_void_p()
+        # IUIAutomation::ElementFromHandle
+        hr = _com_call(self._auto, 6, (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+                       ctypes.c_void_p(hwnd), ctypes.byref(out))
+        return out if hr == 0 and out.value else None
+
+    def _walk(self, slot, element):
+        """TreeWalker slot 5 = GetLastChildElement, 7 = GetPreviousSiblingElement."""
+        out = ctypes.c_void_p()
+        hr = _com_call(self._walker, slot,
+                       (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+                       element, ctypes.byref(out))
+        return out if hr == 0 and out.value else None
+
+    def _rect(self, element):
+        r = self._wintypes.RECT()
+        # IUIAutomationElement::get_CurrentBoundingRectangle
+        hr = _com_call(element, 43, (ctypes.POINTER(self._wintypes.RECT),), ctypes.byref(r))
+        return (r.left, r.top, r.right, r.bottom) if hr == 0 else None
+
+    def _control_type(self, element):
+        v = ctypes.c_int(0)
+        _com_call(element, 21, (ctypes.POINTER(ctypes.c_int),), ctypes.byref(v))
+        return v.value
+
+    def _name(self, element):
+        bstr = ctypes.c_void_p()
+        hr = _com_call(element, 23, (ctypes.POINTER(ctypes.c_void_p),), ctypes.byref(bstr))
+        if hr != 0 or not bstr.value:
+            return ""
+        try:
+            return ctypes.wstring_at(bstr.value)
+        finally:
+            self._oleaut32.SysFreeString(ctypes.c_void_p(bstr.value))
+
+    def _deepest(self, parent, x, y, deadline, depth):
+        """Longest chain of nested elements under (x, y) below `parent`.
+
+        Every sibling containing the point is explored, not just the topmost:
+        Chromium puts empty full-window panes beside the real browser UI, and
+        following only the last sibling dead-ends on one of them. Siblings are
+        visited last-to-first (topmost first), so ties go to the topmost.
+        """
+        best = []
+        if depth >= self._MAX_DEPTH:
+            return best
+        child = self._walk(5, parent)
+        scanned = 0
+        while child is not None:
+            if scanned >= self._MAX_SIBLINGS or time.monotonic() > deadline:
+                self._release(child)
+                break
+            scanned += 1
+            rect = self._rect(child)
+            if rect and rect[0] <= x < rect[2] and rect[1] <= y < rect[3]:
+                entry = (rect, self._name(child))
+                if self._control_type(child) in self._LEAF_TYPES:
+                    sub = []
+                else:
+                    sub = self._deepest(child, x, y, deadline, depth + 1)
+                if 1 + len(sub) > len(best):
+                    best = [entry] + sub
+            sibling = self._walk(7, child)
+            self._release(child)
+            child = sibling
+        return best
+
+    def chain_at(self, hwnd, x, y, budget=0.5):
+        """UI elements under physical point (x, y) inside `hwnd`.
+
+        Returns [(rect, name), ...] ordered outermost to innermost. If the
+        time budget runs out, whatever was found so far is returned.
+        """
+        root = self._element_from_handle(hwnd)
+        if root is None:
+            return []
+        try:
+            return self._deepest(root, x, y, time.monotonic() + budget, 0)
+        finally:
+            self._release(root)
+
+
+class _UIAWorker(threading.Thread):
+    """Runs UI Automation queries off the Tk thread.
+
+    Only the latest request matters: while the cursor is moving, older
+    requests are dropped. Results land in `results` as (key, chain).
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.results = queue.SimpleQueue()
+        self._cv = threading.Condition()
+        self._request = None
+        self._stopped = False
+
+    def request(self, key, hwnd, x, y):
+        with self._cv:
+            self._request = (key, hwnd, x, y)
+            self._cv.notify()
+
+    def stop(self):
+        with self._cv:
+            self._stopped = True
+            self._cv.notify()
+
+    def run(self):
+        with _physical_dpi_context():
+            try:
+                uia = _UIAutomation()
+            except Exception:
+                return  # no UI Automation: window-level capture still works
+            try:
+                while True:
+                    with self._cv:
+                        while self._request is None and not self._stopped:
+                            self._cv.wait()
+                        if self._stopped:
+                            return
+                        key, hwnd, x, y = self._request
+                        self._request = None
+                    try:
+                        chain = uia.chain_at(hwnd, x, y)
+                    except Exception:
+                        chain = []
+                    self.results.put((key, chain))
+            finally:
+                uia.close()
 
 
 # ── Global hotkey (Print Screen) ───────────────────────────────────
@@ -979,7 +1333,7 @@ class LauncherWindow:
         """Center the window on screen."""
         self.root.update_idletasks()
         width = 500
-        height = 560
+        height = 620
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
@@ -991,6 +1345,8 @@ class LauncherWindow:
             self.execute_full_capture()
         elif self.mode == 'region':
             self.execute_region_capture()
+        elif self.mode == 'display':
+            self.execute_region_capture(mode='display')
 
     def _auto_start_printscreen_monitor(self):
         """Auto-start the Print Screen monitor (hidden, tray-only)."""
@@ -1098,7 +1454,7 @@ class LauncherWindow:
         _clear_root(self.root)
         self.root.deiconify()
         self.root.title("ScreenSnap v1.1")
-        self.root.geometry("500x560")
+        self.root.geometry("500x620")
         self.root.resizable(False, False)
         self.root.config(bg=Theme.BACKGROUND)
 
@@ -1137,8 +1493,16 @@ class LauncherWindow:
         ModernButton(
             main_container,
             variant="primary",
-            text="✂️  REGION SELECT",
+            text="✂️  REGION / WINDOW",
             command=self.capture_region,
+            font=("Segoe UI Bold", 11)
+        ).pack(fill='x', pady=8)
+
+        ModernButton(
+            main_container,
+            variant="primary",
+            text="🖥  SINGLE DISPLAY",
+            command=self.capture_display,
             font=("Segoe UI Bold", 11)
         ).pack(fill='x', pady=8)
 
@@ -1237,14 +1601,19 @@ class LauncherWindow:
                 messagebox.showerror("Error", f"Failed to open file: {e}")
                 self._build_launcher_ui()
 
-    def execute_region_capture(self):
-        """Execute region selection and open editor."""
+    def capture_display(self):
+        """Handle single-display capture from launcher."""
+        self.root.withdraw()
+        self.root.after(200, lambda: self.execute_region_capture(mode='display'))
+
+    def execute_region_capture(self, mode='region'):
+        """Execute region selection (or display picking) and open editor."""
         try:
             # Hide launcher
             self.root.withdraw()
 
             # Create region selector as overlay
-            selector = RegionSelector(self.root)
+            selector = RegionSelector(self.root, mode=mode)
 
             if selector.result:
                 # Auto-save to library
@@ -1734,15 +2103,43 @@ class SettingsDialog:
 
 
 class RegionSelector:
-    """Full-screen overlay for region selection with Midnight Architect styling."""
+    """Full-screen overlay for region selection with Midnight Architect styling.
 
-    def __init__(self, parent):
+    Drag to select a free-form region. Hovering also highlights the display,
+    window, or UI element under the cursor (scroll to grow or shrink the
+    target) and a click captures it. With mode='display' only whole displays
+    are offered.
+    """
+
+    CLICK_SLOP = 4         # px of movement before a click becomes a drag
+    UIA_DEBOUNCE_MS = 50   # let the cursor settle before querying UI Automation
+    SAME_RECT_TOL = 6      # px: UI elements this close to a window's bounds are the window
+
+    def __init__(self, parent, mode='region'):
         self.result = None
+        self.mode = mode
         self.start_x = None
         self.start_y = None
         self.current_rect = None
         self.current_bright = None
         self.finished = False
+        self.dragging = False
+
+        # Hover-to-capture state. hover_chain holds the candidate targets under
+        # the cursor, smallest first, as (physical_rect, label).
+        self.hover_chain = []
+        self.hover_index = 0
+        self.hover_items = []
+        self._hover_photo = None
+        self._bright_cache = {}
+        self._user_scrolled = False
+        self._hover_hwnd = None
+        self._hover_point = (0, 0)  # last cursor position, physical pixels
+        self._uia_chain = []       # UI elements under the cursor, smallest first
+        self._uia_worker = None
+        self._uia_after = None
+        self._request_key = 0
+        self._closing = False
 
         # Get all screens bounding box
         bbox = get_all_screens_bbox()
@@ -1760,6 +2157,7 @@ class RegionSelector:
         self.offset_y = y
         self.v_width = width
         self.v_height = height
+        self.screen_map = ScreenMap()
 
         # Freeze the screen BEFORE showing the overlay so subsequent mouse
         # movement / animations don't change what the user sees while selecting.
@@ -1770,34 +2168,32 @@ class RegionSelector:
             parent.update_idletasks()
         except Exception:
             pass
-        import time as _time
-        _time.sleep(0.09)
+        time.sleep(0.09)
         try:
-            self.frozen = ImageGrab.grab(bbox=(x, y, x2, y2), all_screens=True)
+            self.frozen, self.phys_left, self.phys_top = capture_virtual_screen()
         except Exception as e:
             print(f"Failed to capture frozen screen: {e}")
             self.frozen = None
+            self.phys_left, self.phys_top = x, y
+
+        # Snapshot the window stack now, while the overlay doesn't exist yet.
+        self.windows = []
+        if self.mode == 'region':
+            try:
+                self.windows = list_windows()
+            except Exception as e:
+                print(f"Failed to enumerate windows: {e}")
 
         # Build a display-sized copy (logical pixels) and a dimmed version for
-        # the overlay background. Track scale so on_release can crop from the
-        # original physical-resolution snapshot.
+        # the overlay background. Crops come from the original physical-
+        # resolution snapshot.
         if self.frozen is not None:
-            if self.frozen.size != (width, height):
-                display_src = self.frozen.resize((width, height), Image.LANCZOS)
-                self.scale_x = self.frozen.size[0] / width
-                self.scale_y = self.frozen.size[1] / height
-            else:
-                display_src = self.frozen
-                self.scale_x = 1.0
-                self.scale_y = 1.0
-            self.frozen_display = display_src.convert('RGB')
+            self.frozen_display = self._build_display_image(width, height)
             dim_layer = Image.new('RGB', (width, height), (0, 0, 0))
             self.dimmed_display = Image.blend(self.frozen_display, dim_layer, 0.5)
         else:
             self.frozen_display = None
             self.dimmed_display = None
-            self.scale_x = 1.0
-            self.scale_y = 1.0
 
         # Create full-screen opaque window (no -alpha so the live screen can't
         # bleed through the selection overlay).
@@ -1828,17 +2224,288 @@ class RegionSelector:
             pady=5
         )
 
+        # One-line usage hint, dropped after a few seconds or on first use
+        if self.mode == 'display':
+            hint = "Click a display to capture it   •   Drag for a custom region   •   Esc to cancel"
+        else:
+            hint = ("Click to capture the highlighted area   •   Drag for a custom region   •   "
+                    "Scroll to grow / shrink   •   Esc to cancel")
+        self.hint_label = tk.Label(
+            self.root,
+            text=hint,
+            font=("Segoe UI", 10),
+            bg=Theme.SURFACE,
+            fg=Theme.ON_SURFACE,
+            padx=14,
+            pady=8
+        )
+        hint_x, hint_y = self._physical_to_canvas(*self._primary_monitor_top_center())
+        self.hint_label.place(x=int(hint_x), y=int(hint_y) + 24, anchor='n')
+        self.root.after(6000, self._hide_hint)
+
         # Bind events
         self.canvas.bind('<Button-1>', self.on_press)
         self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_release)
+        self.canvas.bind('<Motion>', self.on_motion)
+        self.canvas.bind('<MouseWheel>', self.on_wheel)
         self.root.bind('<Escape>', self.on_escape)
 
+        self.root.after(30, self._poll_uia)
+        self.root.after(60, self._initial_hover)
         self.root.wait_window()
-    
+
+    # ── Coordinate helpers ─────────────────────────────────────────
+
+    def _build_display_image(self, width, height):
+        """The frozen snapshot laid out in the overlay's logical coordinates.
+
+        Monitors are resized one by one so mixed-DPI setups stay undistorted.
+        """
+        frozen = self.frozen.convert('RGB')
+        monitors = self.screen_map.monitors
+        if not monitors:
+            if frozen.size == (width, height):
+                return frozen
+            return frozen.resize((width, height), Image.LANCZOS)
+        canvas = Image.new('RGB', (width, height), (0, 0, 0))
+        for phys, logical in monitors:
+            tile = frozen.crop((phys[0] - self.phys_left, phys[1] - self.phys_top,
+                                phys[2] - self.phys_left, phys[3] - self.phys_top))
+            box = (logical[0] - self.offset_x, logical[1] - self.offset_y,
+                   logical[2] - self.offset_x, logical[3] - self.offset_y)
+            size = (box[2] - box[0], box[3] - box[1])
+            if tile.size != size:
+                tile = tile.resize(size, Image.LANCZOS)
+            canvas.paste(tile, box[:2])
+        return canvas
+
+    def _canvas_to_physical(self, cx, cy):
+        return self.screen_map.to_physical(cx + self.offset_x, cy + self.offset_y)
+
+    def _physical_to_canvas(self, px, py):
+        lx, ly = self.screen_map.to_logical(px, py)
+        return lx - self.offset_x, ly - self.offset_y
+
+    def _primary_monitor_top_center(self):
+        """Physical point at the top-centre of the monitor holding the origin."""
+        rects = self.screen_map.physical_rects()
+        if not rects:
+            return (self.phys_left + self.v_width / 2, self.phys_top)
+        origin = next((r for r in rects if r[0] <= 0 < r[2] and r[1] <= 0 < r[3]), rects[0])
+        return ((origin[0] + origin[2]) / 2, origin[1])
+
+    def _crop_physical(self, rect):
+        """Crop the frozen snapshot to a physical-pixel rect, or None if empty."""
+        fw, fh = self.frozen.size
+        l = max(0, min(fw, int(round(rect[0] - self.phys_left))))
+        t = max(0, min(fh, int(round(rect[1] - self.phys_top))))
+        r = max(0, min(fw, int(round(rect[2] - self.phys_left))))
+        b = max(0, min(fh, int(round(rect[3] - self.phys_top))))
+        if r - l < 1 or b - t < 1:
+            return None
+        return self.frozen.crop((l, t, r, b))
+
+    # ── Hover-to-capture ───────────────────────────────────────────
+
+    def _hide_hint(self):
+        try:
+            self.hint_label.place_forget()
+        except tk.TclError:
+            pass
+
+    def _initial_hover(self):
+        """Highlight whatever is already under the cursor when the overlay opens."""
+        if self._closing:
+            return
+        try:
+            px, py = self.root.winfo_pointerxy()
+        except tk.TclError:
+            return
+        if self.start_x is None:
+            self.on_motion(types.SimpleNamespace(x=px - self.offset_x, y=py - self.offset_y))
+
+    def on_motion(self, event):
+        # Only fires with no button held; dragging is handled by on_drag.
+        # Hover is a convenience on top of drag-select, so a failure here must
+        # never leave the overlay stuck or block a normal capture.
+        try:
+            self._update_hover(event.x, event.y)
+        except Exception as e:
+            print(f"Hover update failed: {e}")
+
+    def on_wheel(self, event):
+        """Scroll up to grow the highlighted target, down to shrink it."""
+        if self.start_x is not None or not self.hover_chain:
+            return
+        step = 1 if event.delta > 0 else -1
+        new_index = max(0, min(len(self.hover_chain) - 1, self.hover_index + step))
+        if new_index != self.hover_index:
+            self.hover_index = new_index
+            self._user_scrolled = True
+            try:
+                self._draw_hover()
+            except Exception as e:
+                print(f"Hover draw failed: {e}")
+
+    def _window_at(self, px, py):
+        for w in self.windows:
+            l, t, r, b = w['rect']
+            if l <= px < r and t <= py < b:
+                return w
+        return None
+
+    @staticmethod
+    def _near(a, b, tol):
+        return all(abs(p - q) <= tol for p, q in zip(a, b))
+
+    def _update_hover(self, cx, cy):
+        px, py = self._canvas_to_physical(cx, cy)
+        px, py = int(round(px)), int(round(py))
+        self._hover_point = (px, py)
+        window = self._window_at(px, py) if self.mode == 'region' else None
+        hwnd = window['hwnd'] if window else None
+
+        if hwnd != self._hover_hwnd:
+            self._hover_hwnd = hwnd
+            self._user_scrolled = False
+            self._uia_chain = []
+        elif self._uia_chain:
+            # Still inside the innermost element we already resolved?  Then
+            # nothing smaller can be under the cursor, so skip re-querying.
+            l, t, r, b = self._uia_chain[0][0]
+            if not (l <= px < r and t <= py < b):
+                self._uia_chain = []
+
+        if hwnd is not None and not self._uia_chain:
+            self._schedule_uia(hwnd, px, py)
+        self._rebuild_targets(px, py, window)
+
+    def _rebuild_targets(self, px, py, window):
+        """Recompute the candidate targets (smallest first) and redraw if needed."""
+        targets = []
+
+        def add(rect, label):
+            if rect[2] - rect[0] < 4 or rect[3] - rect[1] < 4:
+                return
+            if targets and self._near(targets[-1][0], rect, 1):
+                return
+            targets.append((rect, label))
+
+        if window is not None:
+            for rect, name in self._uia_chain:
+                if not self._near(rect, window['rect'], self.SAME_RECT_TOL):
+                    add(rect, name or "Element")
+            add(window['rect'], (window['title'] or "Window")[:48])
+
+        monitors = self.screen_map.physical_rects()
+        if monitors:
+            index = self.screen_map.monitor_index_at(px, py)
+            add(monitors[index], f"Display {index + 1}")
+        elif self.frozen is not None:
+            add((self.phys_left, self.phys_top,
+                 self.phys_left + self.frozen.width, self.phys_top + self.frozen.height),
+                "Screen")
+
+        previous = self.hover_chain[self.hover_index] if self.hover_chain else None
+        self.hover_chain = targets
+        if previous is not None and self._user_scrolled:
+            # Keep the level the user scrolled to if it still exists.
+            self.hover_index = next(
+                (i for i, t in enumerate(targets) if t[0] == previous[0]), 0)
+        else:
+            self.hover_index = 0
+        current = targets[self.hover_index] if targets else None
+        if current != previous or not self.hover_items:
+            self._draw_hover()
+
+    def _schedule_uia(self, hwnd, px, py):
+        if self._uia_after is not None:
+            self.root.after_cancel(self._uia_after)
+        self._request_key += 1
+        key = self._request_key
+        self._uia_after = self.root.after(
+            self.UIA_DEBOUNCE_MS, lambda: self._send_uia(key, hwnd, px, py))
+
+    def _send_uia(self, key, hwnd, px, py):
+        self._uia_after = None
+        if self._closing:
+            return
+        if self._uia_worker is None:
+            self._uia_worker = _UIAWorker()
+            self._uia_worker.start()
+        self._uia_worker.request(key, hwnd, px, py)
+
+    def _poll_uia(self):
+        """Pick up the newest UI Automation result from the worker thread."""
+        if self._closing:
+            return
+        try:
+            if self._uia_worker is not None and not self.dragging and self.start_x is None:
+                latest = None
+                while True:
+                    try:
+                        latest = self._uia_worker.results.get_nowait()
+                    except queue.Empty:
+                        break
+                if latest is not None and latest[0] == self._request_key and latest[1]:
+                    # Worker returns outermost-first; targets are smallest-first.
+                    self._uia_chain = list(reversed(latest[1]))
+                    px, py = self._hover_point
+                    self._rebuild_targets(px, py, self._window_at(px, py))
+        except Exception as e:
+            print(f"Hover refresh failed: {e}")
+        finally:
+            self.root.after(30, self._poll_uia)
+
+    def _clear_hover(self):
+        for item in self.hover_items:
+            self.canvas.delete(item)
+        self.hover_items = []
+        self.dim_label.place_forget()
+
+    def _draw_hover(self):
+        """Reveal and outline the selected target, with a size label."""
+        self._clear_hover()
+        if not self.hover_chain or self.dragging:
+            return
+        rect, label = self.hover_chain[self.hover_index]
+        x1, y1 = self._physical_to_canvas(rect[0], rect[1])
+        x2, y2 = self._physical_to_canvas(rect[2], rect[3])
+        x1 = max(0, min(self.v_width, int(round(x1))))
+        x2 = max(0, min(self.v_width, int(round(x2))))
+        y1 = max(0, min(self.v_height, int(round(y1))))
+        y2 = max(0, min(self.v_height, int(round(y2))))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return
+
+        if self.frozen_display is not None:
+            key = (x1, y1, x2, y2)
+            photo = self._bright_cache.get(key)
+            if photo is None:
+                if len(self._bright_cache) > 32:
+                    self._bright_cache.clear()
+                photo = ImageTk.PhotoImage(self.frozen_display.crop(key))
+                self._bright_cache[key] = photo
+            self._hover_photo = photo  # keep alive even if the cache is cleared
+            self.hover_items.append(
+                self.canvas.create_image(x1, y1, anchor='nw', image=photo))
+        self.hover_items.append(self.canvas.create_rectangle(
+            x1, y1, x2, y2, outline=Theme.PRIMARY, width=3))
+
+        self.dim_label.config(text=f"{label}  ·  {rect[2] - rect[0]} × {rect[3] - rect[1]}")
+        self.dim_label.update_idletasks()
+        label_h = self.dim_label.winfo_reqheight()
+        # Above the target if there is room, otherwise tucked inside its top-left.
+        label_y = y1 - label_h - 6 if y1 - label_h - 6 >= 0 else y1 + 6
+        self.dim_label.place(x=max(0, min(x1, self.v_width - 40)), y=label_y)
+
+    # ── Mouse handling ─────────────────────────────────────────────
+
     def on_press(self, event):
         self.start_x = event.x
         self.start_y = event.y
+        self.dragging = False
         if self.current_rect:
             self.canvas.delete(self.current_rect)
             self.current_rect = None
@@ -1848,6 +2515,13 @@ class RegionSelector:
 
     def on_drag(self, event):
         if self.start_x is None: return
+        if not self.dragging:
+            if (abs(event.x - self.start_x) < self.CLICK_SLOP
+                    and abs(event.y - self.start_y) < self.CLICK_SLOP):
+                return  # still a click; keep the hover highlight
+            self.dragging = True
+            self._clear_hover()
+            self._hide_hint()
         if self.current_rect:
             self.canvas.delete(self.current_rect)
         if self.current_bright:
@@ -1884,6 +2558,13 @@ class RegionSelector:
         if self.start_x is None:
             return
 
+        if not self.dragging:
+            # A click: capture whatever is highlighted (no highlight = cancel).
+            if self.hover_chain and self.frozen is not None:
+                self.result = self._crop_physical(self.hover_chain[self.hover_index][0])
+            self._close()
+            return
+
         # Calculate canvas-relative region
         cx1 = min(self.start_x, event.x)
         cy1 = min(self.start_y, event.y)
@@ -1898,26 +2579,18 @@ class RegionSelector:
 
         # Minimum size check
         if cx2 - cx1 < 10 or cy2 - cy1 < 10:
-            self.root.destroy()
+            self._close()
             return
 
         # Crop from the frozen snapshot (preserves its physical resolution).
         # Fall back to a live grab only if the freeze step failed earlier.
         if self.frozen is not None:
-            fx1 = int(round(cx1 * self.scale_x))
-            fy1 = int(round(cy1 * self.scale_y))
-            fx2 = int(round(cx2 * self.scale_x))
-            fy2 = int(round(cy2 * self.scale_y))
-            fw, fh = self.frozen.size
-            fx1 = max(0, min(fw, fx1))
-            fx2 = max(0, min(fw, fx2))
-            fy1 = max(0, min(fh, fy1))
-            fy2 = max(0, min(fh, fy2))
-            if fx2 > fx1 and fy2 > fy1:
-                try:
-                    self.result = self.frozen.crop((fx1, fy1, fx2, fy2))
-                except Exception as e:
-                    print(f"Failed to crop region: {e}")
+            x1, y1 = self._canvas_to_physical(cx1, cy1)
+            x2, y2 = self._canvas_to_physical(cx2, cy2)
+            try:
+                self.result = self._crop_physical((x1, y1, x2, y2))
+            except Exception as e:
+                print(f"Failed to crop region: {e}")
         else:
             # Fallback: hide overlay and grab the live screen
             x1 = cx1 + self.offset_x
@@ -1926,18 +2599,28 @@ class RegionSelector:
             y2 = cy2 + self.offset_y
             self.root.withdraw()
             self.root.update_idletasks()
-            import time; time.sleep(0.05)
+            time.sleep(0.05)
             try:
                 self.result = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
             except Exception as e:
                 print(f"Failed to capture region: {e}")
 
-        self.root.destroy()
-    
+        self._close()
+
     def on_escape(self, event):
         """Handle ESC key."""
         self.result = None
-        self.root.destroy()
+        self._close()
+
+    def _close(self):
+        """Tear down the overlay and stop the UI Automation worker."""
+        self._closing = True
+        if self._uia_worker is not None:
+            self._uia_worker.stop()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 class AnnotationEditor:
@@ -6160,7 +6843,8 @@ def main():
 Examples:
   screensnap                  Open launcher window
   screensnap full             Capture full screen, open editor
-  screensnap region           Select region, open editor
+  screensnap region           Pick a region, window or UI element, open editor
+  screensnap display          Pick a single display, open editor
   screensnap full --save C:\\output.png   Headless full screen save
         """
     )
@@ -6168,8 +6852,8 @@ Examples:
     parser.add_argument(
         'mode',
         nargs='?',
-        choices=['full', 'region'],
-        help='Capture mode: full or region'
+        choices=['full', 'region', 'display'],
+        help='Capture mode: full, region, or display'
     )
     
     parser.add_argument(

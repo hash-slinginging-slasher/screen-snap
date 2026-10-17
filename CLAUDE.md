@@ -45,9 +45,18 @@ Everything is in `screensnap.py`. There are no modules, packages, or imports fro
 | `LibraryManager` | 322 | Manages the screenshot library — tracks saved files in the default save folder. |
 | `LauncherWindow` | 374 | Main GUI window with Full/Region buttons, settings gear, and library browser. Uses a single persistent `tk.Tk` root (`_get_root()`) to avoid image reference bugs. |
 | `SettingsDialog` | 771 | Modal dialog for configuring save path, auto-save, auto-copy, and image format. |
-| `RegionSelector` | 883 | Fullscreen transparent overlay for drag-selecting a screen region. Shows live W×H dimensions. |
+| `RegionSelector` | 883 | Fullscreen overlay over a frozen snapshot. Drag selects a free region (live W×H); hovering highlights the display/window/UI element under the cursor and a click captures it (see "Smart capture" below). `mode='display'` offers whole monitors only. |
 | `AnnotationEditor` | 1005 | The main editor with annotation tools (rectangle, line, circle, crop, text, **step**), color palette, stroke width, undo stack. Handles auto-save on open if enabled. Default tool on open is **step** (`set_tool('step')` at line ~1180). Tool shortcuts: R/L/C/X/T/P. |
 | `LibraryBrowser` | 2382 | Browse and manage previously saved screenshots. |
+
+### Smart capture (hover-to-capture in `RegionSelector`)
+- Works in **physical pixels**. `capture_virtual_screen()` returns the uncropped BitBlt grab plus its origin; `capture_all_screens()` is that plus `_autocrop_black()`. Use the uncropped one whenever coordinates matter, because cropping shifts the origin.
+- `ScreenMap` converts overlay (logical, system-DPI) ↔ physical coordinates **per monitor**, so mixed-DPI setups don't need a single global scale factor. The dimmed overlay image is also composed per monitor.
+- Targets under the cursor, smallest first: UI elements → window → display. Scroll wheel steps through them; click captures; a drag (>4px) falls back to free-form selection.
+- Windows come from `list_windows()` (EnumWindows + DWM frame bounds, snapshotted *before* the overlay exists). UI elements come from `_UIAutomation`, a dependency-free ctypes client for Windows UI Automation that runs on `_UIAWorker` (own thread, debounced, latest request wins). If UIA is unavailable the selector silently degrades to window/display targets.
+- **Do not query UIA with `ElementFromPoint` through the overlay.** The overlay is topmost so it would win the hit-test, and flipping `WS_EX_TRANSPARENT` to see through it lets a click land on the app underneath. Instead walk the tree down from the window found by `list_windows()`; `_deepest()` explores *every* sibling containing the point because Chromium adds empty full-window panes next to the real UI.
+- COM vtable slots used (`_com_call`): IUIAutomation 6 ElementFromHandle / 14 get_ControlViewWalker; walker 5 GetLastChildElement / 7 GetPreviousSiblingElement; element 21 ControlType / 23 Name / 43 BoundingRectangle.
+- Hover code is wrapped in try/except on purpose: a hover bug must never leave the fullscreen overlay stuck.
 
 ### Persistent Tk root pattern
 A single `_app_root` is reused across launcher/editor/region-selector windows via `_get_root()` and `_clear_root()`. This prevents tkinter's "pyimageN doesn't exist" errors when cycling between windows.

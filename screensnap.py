@@ -1161,11 +1161,50 @@ class Icons:
         elif name == 'region':
             dashed(3.5, 4.5, 16.5, 17)
             poly((12.5, 12), (21.5, 15.5), (17.6, 16.9), (20, 21.2), (17.7, 22.4), (15.3, 18.1), (12.5, 20.6))
-        elif name == 'library':
+        elif name == 'grid':
             rect(4, 4, 10.8, 10.8, r=1.2)
             rect(13.2, 4, 20, 10.8, r=1.2)
             rect(4, 13.2, 10.8, 20, r=1.2)
             rect(13.2, 13.2, 20, 20, r=1.2)
+        elif name == 'library':     # picture gallery
+            rect(3, 4, 21, 20, r=2.5)
+            dot(8.5, 9.5, 1.7)
+            line((3.8, 17), (9, 12.5), (13, 16), (16, 13.5), (20.2, 17.5))
+        elif name == 'fullscreen':
+            line((3, 8.5), (3, 3), (8.5, 3))
+            line((15.5, 3), (21, 3), (21, 8.5))
+            line((21, 15.5), (21, 21), (15.5, 21))
+            line((8.5, 21), (3, 21), (3, 15.5))
+            d.rectangle([P(8, 8), P(16, 16)], fill=color)
+        elif name == 'display':
+            rect(3, 4, 21, 16, r=1.8)
+            line((12, 16), (12, 20))
+            line((8, 20.2), (16, 20.2))
+        elif name == 'folder':
+            line((3, 19), (3, 5.5), (9, 5.5), (11.5, 8.2), (21, 8.2), (21, 19), (3, 19))
+        elif name == 'file':
+            line((6, 3), (14, 3), (19, 8), (19, 21), (6, 21), (6, 3))
+            line((14, 3), (14, 8), (19, 8))
+            line((9.5, 13), (15.5, 13))
+            line((9.5, 17), (15.5, 17))
+        elif name == 'list':
+            for y in (6, 12, 18):
+                dot(5, y, 1.5)
+                line((9, y), (20, y))
+        elif name == 'gear':
+            pts = []
+            for i in range(8):
+                for da, rad in ((-17, 7.6), (-10, 10.2), (10, 10.2), (17, 7.6)):
+                    ang = math.radians(i * 45 + da)
+                    pts.append((12 + rad * math.cos(ang), 12 + rad * math.sin(ang)))
+            line(*pts, pts[0])
+            ellipse(8.6, 8.6, 15.4, 15.4)
+        elif name == 'close':
+            line((6, 6), (18, 18))
+            line((18, 6), (6, 18))
+        elif name == 'edit':
+            line((5, 15.5), (15.5, 5), (19, 8.5), (8.5, 19), (4, 20), (5, 15.5))
+            line((12.5, 8), (16, 11.5))
         elif name == 'home':
             line((3, 12), (12, 4), (21, 12))
             line((6, 10.5), (6, 20), (18, 20), (18, 10.5))
@@ -1178,10 +1217,10 @@ class Icons:
             line((6, 7), (7, 20), (17, 20), (18, 7))
             line((10.2, 10.5), (10.2, 16.5))
             line((13.8, 10.5), (13.8, 16.5))
-        elif name == 'reset':
+        elif name in ('reset', 'refresh'):
             arc(5, 5, 19, 19, 40, 330)
             head((19.2, 10.2), (17.4, 6.6), length=5.6, half=3.2)
-            mirror = True
+            mirror = name == 'reset'    # reset turns counter-clockwise, refresh clockwise
         else:
             raise ValueError(f"unknown icon {name!r}")
 
@@ -1631,7 +1670,9 @@ def run_ocr(image: Image.Image, settings=None) -> str:
 
 
 class LauncherWindow:
-    """Initial launcher window with Full Screen and Region buttons."""
+    """Initial launcher window: icon tiles for each capture mode."""
+
+    SIZE = (500, 400)
 
     def __init__(self, mode=None, save_path=None):
         self.root = _get_root()
@@ -1657,8 +1698,7 @@ class LauncherWindow:
     def center_window(self):
         """Center the window on screen."""
         self.root.update_idletasks()
-        width = 500
-        height = 620
+        width, height = self.SIZE
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
@@ -1779,7 +1819,7 @@ class LauncherWindow:
         _clear_root(self.root)
         self.root.deiconify()
         self.root.title("ScreenSnap v1.1")
-        self.root.geometry("500x620")
+        self.root.geometry("%dx%d" % self.SIZE)
         self.root.resizable(False, False)
         self.root.config(bg=Theme.BACKGROUND)
 
@@ -1805,61 +1845,42 @@ class LauncherWindow:
             font=("Segoe UI", 9, "bold"),
             fg=Theme.ON_SURFACE_VARIANT,
             bg=Theme.BACKGROUND
-        ).pack(pady=(0, 40))
+        ).pack(pady=(0, 28))
 
-        ModernButton(
-            main_container,
-            variant="success",
-            text="📷  FULL SCREEN",
-            command=self.capture_full,
-            font=("Segoe UI Bold", 11)
-        ).pack(fill='x', pady=8)
+        hint_default = "Choose how to capture"
+        hint = tk.Label(main_container, text=hint_default, font=("Segoe UI", 10),
+                        fg=Theme.ON_SURFACE_VARIANT, bg=Theme.BACKGROUND)
 
-        ModernButton(
-            main_container,
-            variant="primary",
-            text="✂️  REGION / WINDOW",
-            command=self.capture_region,
-            font=("Segoe UI Bold", 11)
-        ).pack(fill='x', pady=8)
+        def add_icon(parent, icon, tip, variant, command, size, pad):
+            """Icon button whose name also appears in the caption under the tiles."""
+            btn = IconButton(parent, icon, tip=tip, variant=variant, size=size,
+                             command=command, padx=pad, pady=pad)
+            btn.bind('<Enter>', lambda e, t=tip: hint.config(text=t), add='+')
+            btn.bind('<Leave>', lambda e: hint.config(text=hint_default), add='+')
+            return btn
 
-        ModernButton(
-            main_container,
-            variant="primary",
-            text="🖥  SINGLE DISPLAY",
-            command=self.capture_display,
-            font=("Segoe UI Bold", 11)
-        ).pack(fill='x', pady=8)
+        tile_row = tk.Frame(main_container, bg=Theme.BACKGROUND)
+        tile_row.pack()
+        for icon, tip, variant, command in [
+            ('fullscreen', "Full screen: capture every display", 'success', self.capture_full),
+            ('region', "Region / window: pick an area, window or UI element", 'primary', self.capture_region),
+            ('display', "Single display: capture one monitor", 'primary', self.capture_display),
+            ('ocr', "Capture text: OCR a region to the clipboard", 'action', self.capture_text),
+        ]:
+            add_icon(tile_row, icon, tip, variant, command, 44, 22).pack(side='left', padx=7)
+        hint.pack(pady=(10, 22))
 
-        ModernButton(
-            main_container,
-            variant="action",
-            text="🔤  CAPTURE TEXT",
-            command=self.capture_text,
-            font=("Segoe UI Bold", 11)
-        ).pack(fill='x', pady=8)
-
-        row_frame = tk.Frame(main_container, bg=Theme.BACKGROUND)
-        row_frame.pack(fill='x', pady=20)
-
-        ModernButton(
-            row_frame,
-            variant="action",
-            text="📚 Library",
-            command=self.open_library,
-            width=15
-        ).pack(side='left', expand=True, padx=(0, 5))
-
-        ModernButton(
-            row_frame,
-            variant="action",
-            text="📂 Open File",
-            command=self.open_file,
-            width=15
-        ).pack(side='left', expand=True, padx=(5, 0))
+        small_row = tk.Frame(main_container, bg=Theme.BACKGROUND)
+        small_row.pack()
+        for icon, tip, command in [
+            ('library', "Library: browse past screenshots", self.open_library),
+            ('file', "Open an image file", self.open_file),
+            ('gear', "Settings", self.open_settings),
+        ]:
+            add_icon(small_row, icon, tip, 'action', command, 28, 12).pack(side='left', padx=6)
 
         status_frame = tk.Frame(main_container, bg=Theme.SURFACE, padx=15, pady=15)
-        status_frame.pack(fill='x', pady=(20, 0))
+        status_frame.pack(fill='x', pady=(24, 0))
 
         status_color = "#2E7D32" if self.settings.get('auto_save') else Theme.ON_SURFACE_VARIANT
         status_text = "✓ Auto-save active" if self.settings.get('auto_save') else "• Manual mode"
@@ -1882,14 +1903,6 @@ class LauncherWindow:
                 wraplength=350,
                 justify="left"
             ).pack(anchor='w', pady=(5, 0))
-
-        ModernButton(
-            main_container,
-            variant="secondary",
-            text="⚙  SYSTEM SETTINGS",
-            command=self.open_settings,
-            font=("Segoe UI Bold", 10)
-        ).pack(fill='x', side='bottom', pady=(20, 0))
 
     def capture_region(self):
         """Handle region capture from launcher."""
@@ -7029,10 +7042,10 @@ class LibraryBrowser:
         btn_frame = tk.Frame(main_frame, bg=Theme.BACKGROUND)
         btn_frame.pack(fill='x', pady=(0, 15))
 
-        ModernButton(btn_frame, text="📂 OPEN FOLDER", variant="secondary",
-                     command=self.open_folder, font=("Segoe UI Bold", 8)).pack(side='left', padx=(0, 10))
-        ModernButton(btn_frame, text="🔄 REFRESH", variant="secondary",
-                     command=self.load_library, font=("Segoe UI Bold", 8)).pack(side='left')
+        IconButton(btn_frame, 'folder', tip="Open library folder in Explorer", variant="secondary",
+                   command=self.open_folder).pack(side='left', padx=(0, 8))
+        IconButton(btn_frame, 'refresh', tip="Refresh", variant="secondary",
+                   command=self.load_library).pack(side='left')
         tk.Label(btn_frame, text="Today is loaded — click a date to load its screenshots",
                  font=("Segoe UI", 8), fg=Theme.ON_SURFACE_VARIANT,
                  bg=Theme.BACKGROUND).pack(side='left', padx=20)
@@ -7040,9 +7053,9 @@ class LibraryBrowser:
         view_frame = tk.Frame(btn_frame, bg=Theme.BACKGROUND)
         view_frame.pack(side='right')
         self.view_buttons = {}
-        for key, text in (('thumbnails', "▦  THUMBNAILS"), ('list', "☰  LIST")):
-            btn = ModernButton(view_frame, text=text, variant="secondary", font=("Segoe UI Bold", 8),
-                               command=lambda k=key: self._set_view(k))
+        for key, icon, tip in (('thumbnails', 'grid', "Thumbnail view"), ('list', 'list', "List view")):
+            btn = IconButton(view_frame, icon, tip=tip, variant="secondary",
+                             command=lambda k=key: self._set_view(k))
             btn.pack(side='left', padx=(6, 0))
             self.view_buttons[key] = btn
 
@@ -7111,15 +7124,15 @@ class LibraryBrowser:
         bottom_frame = tk.Frame(main_frame, bg=Theme.BACKGROUND)
         bottom_frame.pack(fill='x', pady=(20, 0))
 
-        open_text = "✏️  OPEN IN EDITOR" if not pick_only else "✏️  OPEN THIS IMAGE"
-        ModernButton(bottom_frame, text=open_text, variant="primary",
-                     command=self.open_selected, width=20).pack(side='left')
+        open_tip = "Open in editor (Enter)" if not pick_only else "Open this image (Enter)"
+        IconButton(bottom_frame, 'edit', tip=open_tip, variant="primary", size=24,
+                   command=self.open_selected).pack(side='left')
 
-        ModernButton(bottom_frame, text="🗑 DELETE", variant="danger",
-                     command=self.delete_selected, width=12).pack(side='right', padx=5)
+        IconButton(bottom_frame, 'trash', tip="Delete selected (Del)", variant="danger", size=24,
+                   command=self.delete_selected).pack(side='right', padx=5)
 
-        ModernButton(bottom_frame, text="CLOSE", variant="secondary",
-                     command=self.dialog.destroy, width=12).pack(side='right', padx=5)
+        IconButton(bottom_frame, 'close', tip="Close (Esc)", variant="secondary", size=24,
+                   command=self.dialog.destroy).pack(side='right', padx=5)
 
         self._style_view_buttons()
         self._show_view()
@@ -7141,11 +7154,10 @@ class LibraryBrowser:
 
     def _style_view_buttons(self):
         for key, btn in self.view_buttons.items():
-            active = key == self._view
-            btn._bg = Theme.PRIMARY if active else Theme.SURFACE_BRIGHT
-            btn._abg = Theme.PRIMARY_GLOW if active else Theme.OUTLINE
-            fg = "#000000" if active else Theme.ON_SURFACE
-            btn.config(bg=btn._bg, fg=fg, activebackground=btn._abg, activeforeground=fg)
+            if key == self._view:
+                btn.config(bg=Theme.PRIMARY, fg="#000000")
+            else:
+                btn.config(bg=Theme.SURFACE_BRIGHT, fg=Theme.ON_SURFACE)
 
     def _show_view(self):
         self.list_container.pack_forget()

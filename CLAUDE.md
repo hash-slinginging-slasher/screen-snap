@@ -53,7 +53,8 @@ Everything is in `screensnap.py`. There are no modules, packages, or imports fro
 - The editor toolbar is icon-only (ShareX style) with tooltips carrying the name and shortcut. Icons are **drawn with Pillow** on a 24×24 grid (`Icons._draw`), supersampled 4× and tinted per state — there are no image assets to ship or bundle. To add an icon, add a branch in `Icons._draw` and use `IconButton(parent, 'name', tip="…", variant=…)`.
 - `IconButton` subclasses `ModernButton` and **re-tints its icon whenever `config(fg=…)` is called**, so existing highlight code (`btn.config(bg=Theme.PRIMARY, fg="#000000")` in `set_tool`, the arrow/blur toggles) works unchanged. A `bg` set this way becomes the resting colour, so hover/leave no longer wipes the active highlight. `config = configure` is re-aliased on purpose (tkinter binds the alias at class creation).
 - All 12 tools are shown inline; the old "More ▾" dropdown (`overflow_menu*`) is gone. `_tool_names` lists the tool buttons; `_implemented_overflow` still gates the shortcut keys.
-- Launcher, library, settings and OCR dialogs still use text `ModernButton`s.
+- The launcher (large capture tiles + a caption that follows hover) and the library window use icon buttons too. Settings and the OCR result dialog still use text `ModernButton`s (they are form-style dialogs: SAVE/CANCEL/BROWSE).
+- Launcher size lives in `LauncherWindow.SIZE`; resize it if you add or remove rows.
 
 ### Smart capture (hover-to-capture in `RegionSelector`)
 - Works in **physical pixels**. `capture_virtual_screen()` returns the uncropped BitBlt grab plus its origin; `capture_all_screens()` is that plus `_autocrop_black()`. Use the uncropped one whenever coordinates matter, because cropping shifts the origin.

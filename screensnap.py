@@ -1050,6 +1050,7 @@ class SettingsManager:
             'imbb_api_key': '',
             'printscreen_monitor': 'false',
             'tesseract_path': '',
+            'library_view': 'thumbnails',
         }
 
         # Ensure config directory exists
@@ -1095,6 +1096,7 @@ class SettingsManager:
             'imbb_api_key': settings.get('imbb_api_key', ''),
             'printscreen_monitor': str(settings.get('printscreen_monitor', False)).lower(),
             'tesseract_path': settings.get('tesseract_path', ''),
+            'library_view': settings.get('library_view', 'thumbnails'),
         }
 
         try:
@@ -3001,6 +3003,8 @@ class AnnotationEditor:
         self.root.bind('<Control-y>', self.redo)
         self.root.bind('<Control-Y>', self.redo)
         self.root.bind('<Control-s>', self.save)
+        self.root.bind('<Control-l>', self.open_library)
+        self.root.bind('<Control-L>', self.open_library)
         self.root.bind('<Escape>', self.deselect_all)
         self.root.bind('<Delete>', self.delete_selected_step)
 
@@ -3200,6 +3204,7 @@ class AnnotationEditor:
         actions_frame.pack(anchor='center')
 
         ModernButton(actions_frame, text="🏠 LAUNCHER", variant="secondary", command=self.back_to_launcher).pack(side='right', padx=5)
+        ModernButton(actions_frame, text="📚 LIBRARY", variant="secondary", command=self.open_library).pack(side='right', padx=5)
         ModernButton(actions_frame, text="✂️ REGION", variant="primary", command=self.capture_new_region).pack(side='right', padx=5)
         ModernButton(actions_frame, text="📋 COPY IMAGE", variant="primary", command=self.copy_image_to_clipboard).pack(side='right', padx=5)
         ModernButton(actions_frame, text="🔤 OCR", variant="primary", command=self.ocr_current_image).pack(side='right', padx=5)
@@ -3246,6 +3251,31 @@ class AnnotationEditor:
                 AnnotationEditor(selector.result, self.settings, library_path=lib_path)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to capture region: {e}")
+
+    def _has_annotations(self):
+        """True when this editor holds edits that opening another image would discard."""
+        return bool(self.history or self.text_elements or self.step_elements
+                    or self.stamp_elements or self.shape_elements or self.bubble_elements)
+
+    def open_library(self, event=None):
+        """Browse the library and open the picked image in a fresh editor."""
+        browser = LibraryBrowser(self.root, self.settings, pick_only=True)
+        path = browser.selected_path
+        if not path:
+            return
+        if self._has_annotations() and not messagebox.askyesno(
+                "Discard Annotations?",
+                "Opening another image closes this editor and discards any "
+                "annotations you haven't saved.\n\nOpen the library image anyway?"):
+            return
+        try:
+            with Image.open(path) as opened:
+                image = opened.convert('RGB')
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open image: {e}")
+            return
+        self._close_window()
+        AnnotationEditor(image, self.settings, library_path=path)
 
     def back_to_launcher(self):
         """Close editor and return to launcher."""
@@ -6607,25 +6637,121 @@ class OCRResultDialog:
                 messagebox.showerror("Error", f"Failed to save: {e}")
 
 
-class LibraryBrowser:
-    """Browser window for viewing and managing library screenshots with Midnight Architect styling."""
+class ThumbnailCache:
+    """On-disk cache of library thumbnails, keyed by path + mtime + size.
 
-    def __init__(self, parent, settings):
+    Decoding a multi-monitor PNG takes ~100ms, so a big library would be slow
+    to browse without this. Entries are invalidated automatically when a file
+    changes (the key includes mtime and size).
+    """
+
+    SIZE = (200, 125)
+    _dir = None
+
+    @classmethod
+    def _cache_dir(cls):
+        if cls._dir is None:
+            base = os.environ.get('LOCALAPPDATA') or str(Path.home() / 'AppData' / 'Local')
+            cls._dir = Path(base) / 'ScreenSnap' / 'thumbs'
+            try:
+                cls._dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        return cls._dir
+
+    @classmethod
+    def _cache_file(cls, path):
+        import hashlib
+        st = os.stat(path)
+        ident = f"{os.path.normcase(os.path.abspath(path))}|{st.st_mtime_ns}|{st.st_size}"
+        return cls._cache_dir() / (hashlib.sha1(ident.encode('utf-8')).hexdigest() + '.jpg')
+
+    @classmethod
+    def get(cls, path):
+        """Thumbnail of an image file as an RGB PIL image fitting within SIZE.
+
+        Safe to call from a worker thread.
+        """
+        try:
+            cache_file = cls._cache_file(path)
+        except OSError:
+            cache_file = None
+        if cache_file is not None and cache_file.is_file():
+            try:
+                with Image.open(cache_file) as cached:
+                    return cached.convert('RGB')
+            except Exception:
+                pass  # corrupt cache entry — rebuild below
+        with Image.open(path) as im:
+            im.draft('RGB', (cls.SIZE[0] * 2, cls.SIZE[1] * 2))  # cheap JPEG downscale; no-op otherwise
+            thumb = im.convert('RGB')
+        thumb.thumbnail(cls.SIZE, Image.LANCZOS)
+        if cache_file is not None:
+            try:
+                thumb.save(cache_file, 'JPEG', quality=85)
+            except Exception:
+                pass
+        return thumb
+
+    @classmethod
+    def forget(cls, path):
+        """Drop the cached thumbnail for a file (call before deleting it)."""
+        try:
+            cls._cache_file(path).unlink()
+        except Exception:
+            pass
+
+
+class LibraryBrowser:
+    """Browser window for viewing and managing library screenshots with Midnight Architect styling.
+
+    Shows the library as a thumbnail grid (default) or a grouped list. With
+    pick_only=True (used from inside the editor) opening an item just records
+    it in `selected_path` and closes, leaving the caller to load the image.
+    """
+
+    TILE_W = 216
+    TILE_H = 160
+
+    def __init__(self, parent, settings, pick_only=False):
         self.settings = settings
-        self._item_paths = {}  # Treeview item id -> full file path
+        self.pick_only = pick_only
+        self.selected_path = None
+        self._item_paths = {}   # Treeview item id -> full file path
+        self._groups = []
+        self._view = settings.get('library_view', 'thumbnails')
+        if self._view not in ('thumbnails', 'list'):
+            self._view = 'thumbnails'
+        self._stale = {'thumbnails': True, 'list': True}  # view needs re-rendering
+        # Thumbnail grid state
+        self._tiles = {}          # path -> tile frame
+        self._tile_order = []     # paths in display order (arrow-key navigation)
+        self._tile_groups = []    # [[tile, ...]] one list per date group
+        self._thumb_selected = None
+        self._thumb_cache = {}    # (path, mtime_ns) -> PhotoImage (also keeps refs alive)
+        self._thumb_gen = 0       # bumped on reload/close so stale worker results are dropped
+        self._thumb_queue = queue.SimpleQueue()
+        self._cols = 1
+
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("ScreenSnap Library")
-        self.dialog.geometry("800x600")
         self.dialog.resizable(True, True)
-        # NOT transient/grabbed: the launcher root is withdrawn while the
-        # library is open, and a transient of a withdrawn master is never
-        # mapped on Windows (the window silently fails to appear) while
-        # grab_set on the unviewable window raises TclError.
+        self.dialog.minsize(640, 480)
+        # From the launcher the root is withdrawn, so the dialog must NOT be
+        # transient/grabbed: a transient of a withdrawn master is never mapped
+        # on Windows (the window silently fails to appear) while grab_set on
+        # the unviewable window raises TclError. From the editor the parent is
+        # visible, so there it can be a proper modal.
         self.dialog.config(bg=Theme.BACKGROUND)
+        if pick_only:
+            try:
+                self.dialog.transient(parent)
+            except tk.TclError:
+                pass
 
         # Center dialog
         self.dialog.update_idletasks()
-        w, h = 800, 600
+        w, h = 1040, 700
         x = (self.dialog.winfo_screenwidth() // 2) - (w // 2)
         y = (self.dialog.winfo_screenheight() // 2) - (h // 2)
         self.dialog.geometry(f"{w}x{h}+{x}+{y}")
@@ -6635,25 +6761,37 @@ class LibraryBrowser:
         main_frame.pack(fill='both', expand=True)
 
         # Header
-        tk.Label(main_frame, text="LIBRARY", font=("Segoe UI Bold", 10), 
+        tk.Label(main_frame, text="LIBRARY", font=("Segoe UI Bold", 10),
                  fg=Theme.PRIMARY, bg=Theme.BACKGROUND).pack(anchor='w', pady=(0, 5))
-        
+
         lib_dir = LibraryManager.LIBRARY_DIR()
-        tk.Label(main_frame, text=str(lib_dir), font=("Consolas", 8), 
+        tk.Label(main_frame, text=str(lib_dir), font=("Consolas", 8),
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.BACKGROUND).pack(anchor='w', pady=(0, 20))
 
         # Buttons row
         btn_frame = tk.Frame(main_frame, bg=Theme.BACKGROUND)
         btn_frame.pack(fill='x', pady=(0, 15))
 
-        ModernButton(btn_frame, text="📂 OPEN FOLDER", variant="secondary", 
+        ModernButton(btn_frame, text="📂 OPEN FOLDER", variant="secondary",
                      command=self.open_folder, font=("Segoe UI Bold", 8)).pack(side='left', padx=(0, 10))
-        ModernButton(btn_frame, text="🔄 REFRESH", variant="secondary", 
+        ModernButton(btn_frame, text="🔄 REFRESH", variant="secondary",
                      command=self.load_library, font=("Segoe UI Bold", 8)).pack(side='left')
 
-        # List area (The "Sunken" Void) — files grouped by creation date
-        list_container = tk.Frame(main_frame, bg=Theme.SURFACE_LOW, padx=2, pady=2)
-        list_container.pack(fill='both', expand=True)
+        view_frame = tk.Frame(btn_frame, bg=Theme.BACKGROUND)
+        view_frame.pack(side='right')
+        self.view_buttons = {}
+        for key, text in (('thumbnails', "▦  THUMBNAILS"), ('list', "☰  LIST")):
+            btn = ModernButton(view_frame, text=text, variant="secondary", font=("Segoe UI Bold", 8),
+                               command=lambda k=key: self._set_view(k))
+            btn.pack(side='left', padx=(6, 0))
+            self.view_buttons[key] = btn
+
+        # Content area (The "Sunken" Void) — files grouped by creation date
+        self.content = tk.Frame(main_frame, bg=Theme.SURFACE_LOW, padx=2, pady=2)
+        self.content.pack(fill='both', expand=True)
+
+        # List view
+        self.list_container = tk.Frame(self.content, bg=Theme.SURFACE_LOW)
 
         style = ttk.Style(self.dialog)
         style.configure('Library.Treeview',
@@ -6667,13 +6805,13 @@ class LibraryBrowser:
                   background=[('selected', Theme.SURFACE_BRIGHT)],
                   foreground=[('selected', Theme.PRIMARY)])
 
-        self.tree = ttk.Treeview(list_container, show='tree', selectmode='browse',
+        self.tree = ttk.Treeview(self.list_container, show='tree', selectmode='browse',
                                  style='Library.Treeview')
         self.tree.tag_configure('date_header', foreground=Theme.PRIMARY,
                                 font=("Segoe UI Bold", 9))
         self.tree.tag_configure('empty', foreground='gray')
 
-        v_scroll = ttk.Scrollbar(list_container, orient='vertical', command=self.tree.yview)
+        v_scroll = ttk.Scrollbar(self.list_container, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=v_scroll.set)
 
         self.tree.pack(side='left', fill='both', expand=True)
@@ -6683,82 +6821,354 @@ class LibraryBrowser:
         self.tree.bind('<Double-Button-1>', self.open_selected)
         self.tree.bind('<Return>', self.open_selected)
 
+        # Thumbnail view
+        self.grid_container = tk.Frame(self.content, bg=Theme.SURFACE_LOW)
+        self.canvas = tk.Canvas(self.grid_container, bg=Theme.SURFACE_LOW,
+                                highlightthickness=0, yscrollincrement=40)
+        g_scroll = ttk.Scrollbar(self.grid_container, orient='vertical', command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=g_scroll.set)
+        self.canvas.pack(side='left', fill='both', expand=True)
+        g_scroll.pack(side='right', fill='y')
+        self.grid_inner = tk.Frame(self.canvas, bg=Theme.SURFACE_LOW)
+        self._inner_id = self.canvas.create_window((0, 0), window=self.grid_inner, anchor='nw')
+        self.grid_inner.bind('<Configure>',
+                             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+
+        # Keyboard / wheel for the thumbnail grid (the Treeview handles its own)
+        self.dialog.bind('<MouseWheel>', self._on_wheel)
+        self.dialog.bind('<Return>', lambda e: self._grid_key(self.open_selected))
+        self.dialog.bind('<Delete>', lambda e: self._grid_key(self.delete_selected))
+        for key, (dr, dc) in (('Left', (0, -1)), ('Right', (0, 1)), ('Up', (-1, 0)), ('Down', (1, 0))):
+            self.dialog.bind(f'<{key}>', lambda e, dr=dr, dc=dc: self._grid_key(self._move_selection, dr, dc))
+        self.dialog.bind('<Escape>', lambda e: self.dialog.destroy())
+        self.dialog.bind('<Destroy>', self._on_destroy)
+
         # Bottom buttons
         bottom_frame = tk.Frame(main_frame, bg=Theme.BACKGROUND)
         bottom_frame.pack(fill='x', pady=(20, 0))
 
-        ModernButton(bottom_frame, text="✏️  OPEN IN EDITOR", variant="primary", 
+        open_text = "✏️  OPEN IN EDITOR" if not pick_only else "✏️  OPEN THIS IMAGE"
+        ModernButton(bottom_frame, text=open_text, variant="primary",
                      command=self.open_selected, width=20).pack(side='left')
-        
-        ModernButton(bottom_frame, text="🗑 DELETE", variant="danger", 
+
+        ModernButton(bottom_frame, text="🗑 DELETE", variant="danger",
                      command=self.delete_selected, width=12).pack(side='right', padx=5)
-        
-        ModernButton(bottom_frame, text="CLOSE", variant="secondary", 
+
+        ModernButton(bottom_frame, text="CLOSE", variant="secondary",
                      command=self.dialog.destroy, width=12).pack(side='right', padx=5)
+
+        self._style_view_buttons()
+        self._show_view()
 
         # Load library files
         self.load_library()
+        self.dialog.after(40, self._poll_thumbs)
+        self.dialog.focus_set()
+        if pick_only:
+            try:
+                self.dialog.grab_set()
+            except tk.TclError:
+                pass
 
         # Block until dialog closes
         self.dialog.wait_window()
 
-    def load_library(self, keep_open=None):
-        """Load library files grouped by creation date, newest group first.
+    # ── View switching ─────────────────────────────────────────────
 
-        Today's group (or the newest one if nothing was captured today) is
-        expanded; `keep_open` re-expands a given set of group iids after a
-        reload so deleting inside an old group doesn't collapse it.
-        """
-        self.tree.delete(*self.tree.get_children())
-        self._item_paths = {}
-        files = LibraryManager.list_files()
+    def _style_view_buttons(self):
+        for key, btn in self.view_buttons.items():
+            active = key == self._view
+            btn._bg = Theme.PRIMARY if active else Theme.SURFACE_BRIGHT
+            btn._abg = Theme.PRIMARY_GLOW if active else Theme.OUTLINE
+            fg = "#000000" if active else Theme.ON_SURFACE
+            btn.config(bg=btn._bg, fg=fg, activebackground=btn._abg, activeforeground=fg)
 
-        if not files:
-            self.tree.insert('', 'end', text="(Library is empty — take a screenshot!)",
-                             tags=('empty',))
+    def _show_view(self):
+        self.list_container.pack_forget()
+        self.grid_container.pack_forget()
+        (self.grid_container if self._view == 'thumbnails' else self.list_container).pack(
+            fill='both', expand=True)
+
+    def _set_view(self, view):
+        if view == self._view:
             return
+        selected = self._selected_path()
+        self._view = view
+        self.settings['library_view'] = view
+        try:
+            # Re-load from disk rather than saving self.settings: the editor may
+            # hand us a partial dict and saving that would wipe other settings.
+            saved = SettingsManager.load()
+            saved['library_view'] = view
+            SettingsManager.save(saved)
+        except Exception as e:
+            print(f"Failed to remember library view: {e}")
+        self._style_view_buttons()
+        self._show_view()
+        if self._stale[view]:
+            self._render(view)
+        if selected:
+            self._select_path(selected)
 
-        # Group by creation date (st_ctime is birth time on Windows)
+    # ── Loading ────────────────────────────────────────────────────
+
+    def _scan(self):
+        """Library files grouped by creation date, newest group first."""
         groups = {}
-        for f in files:
-            st = f.stat()
+        for f in LibraryManager.list_files():
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            # st_ctime is birth time on Windows
             created = datetime.datetime.fromtimestamp(getattr(st, 'st_ctime', st.st_mtime))
-            groups.setdefault(created.date(), []).append((created, f, st.st_size))
+            groups.setdefault(created.date(), []).append(
+                (created, str(f), st.st_size, st.st_mtime_ns))
 
         today = datetime.date.today()
         days = sorted(groups, reverse=True)
+        result = []
         for day in days:
-            entries = sorted(groups[day], key=lambda e: e[0], reverse=True)
             if day == today:
                 label = "Today"
             elif day == today - datetime.timedelta(days=1):
                 label = "Yesterday"
             else:
                 label = day.strftime("%A, %B %d, %Y")
-            iid = f"day-{day.isoformat()}"
-            expand = (day == today) or (today not in groups and day == days[0])
-            if keep_open and iid in keep_open:
-                expand = True
-            self.tree.insert('', 'end', iid=iid,
-                             text=f"{label}  ({len(entries)})",
+            result.append({
+                'iid': f"day-{day.isoformat()}",
+                'label': label,
+                'entries': sorted(groups[day], key=lambda e: e[0], reverse=True),
+                # Today's group (or the newest one if nothing was captured today)
+                'open': (day == today) or (today not in groups and day == days[0]),
+            })
+        return result
+
+    def load_library(self, keep_open=None):
+        """(Re)load the library from disk and render the visible view.
+
+        `keep_open` re-expands a set of list-view group iids after a reload so
+        deleting inside an old group doesn't collapse it.
+        """
+        self._groups = self._scan()
+        self._keep_open = keep_open
+        self._stale = {'thumbnails': True, 'list': True}
+        self._render(self._view)
+
+    def _render(self, view):
+        self._stale[view] = False
+        if view == 'list':
+            self._populate_tree()
+        else:
+            self._populate_grid()
+
+    def _populate_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self._item_paths = {}
+        if not self._groups:
+            self.tree.insert('', 'end', text="(Library is empty — take a screenshot!)",
+                             tags=('empty',))
+            return
+        for group in self._groups:
+            expand = group['open'] or bool(self._keep_open and group['iid'] in self._keep_open)
+            self.tree.insert('', 'end', iid=group['iid'],
+                             text=f"{group['label']}  ({len(group['entries'])})",
                              open=expand, tags=('date_header',))
-            for created, f, size in entries:
-                display = f"{f.name}  ({size / 1024:.0f} KB, {created.strftime('%H:%M')})"
-                item = self.tree.insert(iid, 'end', text=display)
-                self._item_paths[item] = str(f)
+            for created, path, size, _mtime in group['entries']:
+                display = f"{os.path.basename(path)}  ({size / 1024:.0f} KB, {created.strftime('%H:%M')})"
+                item = self.tree.insert(group['iid'], 'end', text=display)
+                self._item_paths[item] = path
+
+    def _populate_grid(self):
+        for child in self.grid_inner.winfo_children():
+            child.destroy()
+        self._tiles = {}
+        self._tile_order = []
+        self._tile_groups = []
+        self._thumb_selected = None
+        self._thumb_gen += 1
+        gen = self._thumb_gen
+
+        if not self._groups:
+            tk.Label(self.grid_inner, text="(Library is empty — take a screenshot!)",
+                     font=("Segoe UI", 10), fg='gray', bg=Theme.SURFACE_LOW).pack(padx=20, pady=20)
+            return
+
+        todo = []
+        for group in self._groups:
+            tk.Label(self.grid_inner, text=f"{group['label']}  ({len(group['entries'])})",
+                     font=("Segoe UI Bold", 9), fg=Theme.PRIMARY,
+                     bg=Theme.SURFACE_LOW).pack(anchor='w', padx=8, pady=(12, 2))
+            tiles_frame = tk.Frame(self.grid_inner, bg=Theme.SURFACE_LOW)
+            tiles_frame.pack(anchor='w', fill='x')
+            tiles = []
+            for created, path, size, mtime in group['entries']:
+                tile = self._make_tile(tiles_frame, created, path, size)
+                tiles.append(tile)
+                self._tiles[path] = tile
+                self._tile_order.append(path)
+                photo = self._thumb_cache.get((path, mtime))
+                if photo is not None:
+                    tile.thumb_label.config(image=photo, text='')
+                else:
+                    todo.append((path, mtime))
+            self._tile_groups.append(tiles)
+        self._reflow()
+        if todo:
+            threading.Thread(target=self._thumb_worker, args=(gen, todo), daemon=True).start()
+
+    def _make_tile(self, parent, created, path, size):
+        tile = tk.Frame(parent, bg=Theme.SURFACE, width=self.TILE_W, height=self.TILE_H,
+                        highlightthickness=2, highlightbackground=Theme.SURFACE,
+                        highlightcolor=Theme.SURFACE, cursor='hand2')
+        tile.pack_propagate(False)
+        box = tk.Frame(tile, bg=Theme.SURFACE_LOW, width=ThumbnailCache.SIZE[0],
+                       height=ThumbnailCache.SIZE[1])
+        box.pack(pady=(6, 4))
+        box.pack_propagate(False)
+        tile.thumb_label = tk.Label(box, text="…", fg=Theme.ON_SURFACE_VARIANT,
+                                    bg=Theme.SURFACE_LOW, font=("Segoe UI", 9))
+        tile.thumb_label.pack(expand=True)
+        caption = tk.Label(tile, text=f"{created.strftime('%H:%M:%S')}  ·  {size / 1024:.0f} KB",
+                           font=("Segoe UI", 8), fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE)
+        caption.pack()
+        for widget in (tile, box, tile.thumb_label, caption):
+            widget.bind('<Button-1>', lambda e, p=path: self._select_tile(p))
+            widget.bind('<Double-Button-1>', lambda e, p=path: (self._select_tile(p), self.open_selected()))
+        return tile
+
+    # ── Thumbnail grid mechanics ───────────────────────────────────
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self._inner_id, width=event.width)
+        cols = max(1, (event.width - 12) // (self.TILE_W + 12))
+        if cols != self._cols:
+            self._cols = cols
+            self._reflow()
+
+    def _reflow(self):
+        for tiles in self._tile_groups:
+            for i, tile in enumerate(tiles):
+                tile.grid(row=i // self._cols, column=i % self._cols, padx=6, pady=6)
+
+    def _thumb_worker(self, gen, todo):
+        """Build thumbnails off the Tk thread, newest first."""
+        for path, mtime in todo:
+            if gen != self._thumb_gen:
+                return  # library was reloaded or the dialog closed
+            try:
+                img = ThumbnailCache.get(path)
+            except Exception:
+                img = None
+            self._thumb_queue.put((gen, path, mtime, img))
+
+    def _poll_thumbs(self):
+        """Turn finished thumbnails into PhotoImages (must happen on the Tk thread)."""
+        try:
+            for _ in range(6):
+                try:
+                    gen, path, mtime, img = self._thumb_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if gen != self._thumb_gen:
+                    continue
+                tile = self._tiles.get(path)
+                if tile is None:
+                    continue
+                if img is None:
+                    tile.thumb_label.config(text="⚠ unreadable", image='')
+                    continue
+                photo = ImageTk.PhotoImage(img)
+                self._thumb_cache[(path, mtime)] = photo
+                tile.thumb_label.config(image=photo, text='')
+        except Exception as e:
+            print(f"Thumbnail update failed: {e}")
+        try:
+            self.dialog.after(40, self._poll_thumbs)
+        except tk.TclError:
+            pass  # dialog was destroyed
+
+    def _on_destroy(self, event):
+        if event.widget is self.dialog:
+            self._thumb_gen += 1  # tells the worker to stop
+
+    def _on_wheel(self, event):
+        if self._view == 'thumbnails':
+            self.canvas.yview_scroll(-3 if event.delta > 0 else 3, 'units')
+
+    def _select_tile(self, path):
+        old = self._tiles.get(self._thumb_selected)
+        if old is not None:
+            old.config(highlightbackground=Theme.SURFACE, highlightcolor=Theme.SURFACE)
+        self._thumb_selected = path
+        tile = self._tiles.get(path)
+        if tile is not None:
+            tile.config(highlightbackground=Theme.PRIMARY, highlightcolor=Theme.PRIMARY)
+            self._ensure_visible(tile)
+        self.dialog.focus_set()
+
+    def _ensure_visible(self, tile):
+        self.dialog.update_idletasks()
+        top = tile.winfo_rooty() - self.grid_inner.winfo_rooty()
+        bottom = top + tile.winfo_height()
+        view_top = self.canvas.canvasy(0)
+        view_h = self.canvas.winfo_height()
+        total = max(1, self.grid_inner.winfo_height())
+        if top < view_top:
+            self.canvas.yview_moveto(max(0, (top - 10) / total))
+        elif bottom > view_top + view_h:
+            self.canvas.yview_moveto(min(1, (bottom - view_h + 10) / total))
+
+    def _grid_key(self, action, *args):
+        """Run a key action only while the thumbnail view is showing."""
+        if self._view == 'thumbnails':
+            action(*args)
+
+    def _move_selection(self, d_row, d_col):
+        if not self._tile_order:
+            return
+        if self._thumb_selected not in self._tiles:
+            self._select_tile(self._tile_order[0])
+            return
+        # Move within the flat display order; Up/Down jump one row of tiles.
+        step = d_col + d_row * self._cols
+        index = self._tile_order.index(self._thumb_selected) + step
+        self._select_tile(self._tile_order[max(0, min(len(self._tile_order) - 1, index))])
+
+    # ── Selection / actions ────────────────────────────────────────
 
     def _selected_path(self):
-        """Full path of the selected file item, or None (headers, empty row)."""
+        """Full path of the selected file, or None (headers, empty row)."""
+        if self._view == 'thumbnails':
+            return self._thumb_selected if self._thumb_selected in self._tiles else None
         sel = self.tree.selection()
         if not sel:
             return None
         return self._item_paths.get(sel[0])
 
+    def _select_path(self, path):
+        """Select `path` in the active view if it is present."""
+        if self._view == 'thumbnails':
+            if path in self._tiles:
+                self._select_tile(path)
+            return
+        for item, item_path in self._item_paths.items():
+            if item_path == path:
+                self.tree.selection_set(item)
+                self.tree.see(item)
+                return
+
     def open_selected(self, event=None):
-        """Open the selected file in the annotation editor."""
+        """Open the selected file in the annotation editor (or hand it back to the caller)."""
         file_path = self._selected_path()
         if not file_path:
             return  # date header — double-click toggles the group natively
+
+        if self.pick_only:
+            self.selected_path = file_path
+            self.dialog.destroy()
+            return
 
         try:
             image = Image.open(file_path)
@@ -6769,7 +7179,7 @@ class LibraryBrowser:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open image: {e}")
 
-    def delete_selected(self):
+    def delete_selected(self, event=None):
         """Delete the selected file."""
         file_path = self._selected_path()
         if not file_path:
@@ -6778,9 +7188,13 @@ class LibraryBrowser:
         if messagebox.askyesno("Confirm Delete", f"Delete this screenshot?\n\n{os.path.basename(file_path)}"):
             open_groups = {i for i in self.tree.get_children('')
                            if self.tree.item(i, 'open')}
+            scroll_pos = self.canvas.yview()[0]
             try:
+                ThumbnailCache.forget(file_path)
                 os.remove(file_path)
                 self.load_library(keep_open=open_groups)
+                if self._view == 'thumbnails':
+                    self.dialog.after_idle(lambda: self.canvas.yview_moveto(scroll_pos))
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to delete: {e}")
 

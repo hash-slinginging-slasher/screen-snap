@@ -3,6 +3,10 @@
 **Version:** 1.1  
 **Platform:** Windows 10/11 (64-bit)
 
+## Download
+
+**[⬇ ScreenSnap-Setup-1.1.0.exe](https://github.com/hash-slinginging-slasher/screen-snap/raw/main/ScreenSnap-Setup-1.1.0.exe)**: Windows installer, no Python needed. It is also attached to the [latest release](https://github.com/hash-slinginging-slasher/screen-snap/releases/latest).
+
 ## Overview
 
 ScreenSnap is a lightweight, portable screenshot and annotation utility for Windows. It runs directly from Command Prompt with no installation wizard, auto-resolves its own Python dependencies on first launch, and is designed to be dropped into any project folder, added to the Windows PATH, or used as a reusable shell skill.

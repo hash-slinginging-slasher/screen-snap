@@ -6,7 +6,7 @@ echo Building ScreenSnap executables...
 echo.
 
 echo Ensuring build dependencies are installed...
-python -m pip install --quiet pyinstaller Pillow pyperclip keyboard pystray pytesseract
+python -m pip install --quiet pyinstaller Pillow pyperclip pystray pytesseract
 if errorlevel 1 (
     echo Failed to install required Python packages.
     goto :fail

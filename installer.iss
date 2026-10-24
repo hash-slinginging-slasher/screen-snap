@@ -54,7 +54,7 @@ Name: "{userstartup}\ScreenSnap Monitor"; Filename: "{app}\{#MyMonitorExe}"; Tas
 ; Launch ScreenSnap after install
 Filename: "{app}\{#MyAppExeName}";    Description: "Launch {#MyAppName}";          Flags: nowait postinstall skipifsilent
 ; Start the monitor immediately so PrtScn works without reboot
-Filename: "{app}\{#MyMonitorExe}";    Description: "Start Print Screen monitor";  Flags: nowait postinstall skipifsilent; Tasks: startupmonitor
+Filename: "{app}\{#MyMonitorExe}";    Description: "Start Print Screen monitor";  Flags: nowait postinstall skipifsilent skipifdoesntexist; Tasks: startupmonitor
 
 [UninstallRun]
 ; Kill monitor on uninstall so the exe isn't locked

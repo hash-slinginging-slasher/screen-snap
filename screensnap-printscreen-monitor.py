@@ -204,13 +204,62 @@ def _ensure(pkg, import_name=None):
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
         return __import__(name)
 
-_ensure("keyboard")
 _ensure("pystray")
 _ensure("Pillow", "PIL")
 
-import keyboard
 import pystray
 from PIL import Image, ImageDraw
+
+
+# ── PrtScn hotkey ───────────────────────────────────────────────────
+# PrtScn is taken with RegisterHotKey, the ordinary per-app shortcut API,
+# rather than a global low-level keyboard hook (hooks are what keyloggers
+# use, and antivirus heuristics flag them). Only one process can register a
+# hotkey, so the monitor hands it over: while a ScreenSnap window has
+# claimed it (the hotkey-owner marker above) the monitor unregisters, and it
+# re-registers once that window has gone. screensnap.py retries its own
+# registration for a few seconds to give this loop time to let go.
+
+_HOTKEY_ID = 1
+_VK_SNAPSHOT = 0x2C     # Print Screen
+_MOD_NOREPEAT = 0x4000
+_WM_HOTKEY = 0x0312
+_WM_TIMER = 0x0113
+_HANDOFF_POLL_MS = 250
+
+
+def _hotkey_loop(on_press):
+    """Own PrtScn whenever no ScreenSnap window wants it. Runs on its own
+    thread: hotkey registration and its messages belong to one thread."""
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    registered = False
+    warned = False
+
+    def sync_registration():
+        nonlocal registered, warned
+        if _hotkey_owner_active():
+            if registered:
+                user32.UnregisterHotKey(None, _HOTKEY_ID)
+                registered = False
+        elif not registered:
+            registered = bool(user32.RegisterHotKey(None, _HOTKEY_ID, _MOD_NOREPEAT, _VK_SNAPSHOT))
+            if not registered and not warned:
+                print("Could not register Print Screen (another app may own it); retrying.")
+                warned = True
+
+    sync_registration()
+    user32.SetTimer(None, 0, _HANDOFF_POLL_MS, None)
+    msg = wintypes.MSG()
+    try:
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == _WM_TIMER:
+                sync_registration()
+            elif msg.message == _WM_HOTKEY and msg.wParam == _HOTKEY_ID:
+                on_press()
+    finally:
+        if registered:
+            user32.UnregisterHotKey(None, _HOTKEY_ID)
 
 
 class PrintScreenMonitor:
@@ -246,9 +295,9 @@ class PrintScreenMonitor:
                     return str(p)
         return None
     
-    def on_printscreen(self, e):
+    def on_printscreen(self):
         """Handle Print Screen key press."""
-        if e.event_type == 'down' and not self.is_capturing:
+        if not self.is_capturing:
             self.is_capturing = True
             try:
                 # If a ScreenSnap window is already open it owns the in-app
@@ -349,8 +398,9 @@ class PrintScreenMonitor:
         print("Right-click the tray icon to open ScreenSnap or quit.")
         print()
         
-        # Register Print Screen key handler
-        keyboard.hook_key('print screen', self.on_printscreen)
+        # Own Print Screen (handing it to ScreenSnap windows while they are open)
+        threading.Thread(target=_hotkey_loop, args=(self.on_printscreen,),
+                         daemon=True, name="PrtScn-Hotkey").start()
         
         # Create system tray icon
         icon = pystray.Icon(
@@ -368,32 +418,9 @@ class PrintScreenMonitor:
         icon.run()
 
 
-def _kill_previous_monitors():
-    """Kill any existing ScreenSnapMonitor processes (not this one)."""
-    my_pid = os.getpid()
-    try:
-        result = subprocess.run(
-            ['tasklist', '/FI', 'IMAGENAME eq ScreenSnapMonitor.exe', '/FO', 'CSV', '/NH'],
-            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.strip('"').split('","')
-            if len(parts) >= 2:
-                pid = int(parts[1])
-                if pid != my_pid:
-                    subprocess.run(
-                        ['taskkill', '/F', '/PID', str(pid)],
-                        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-    except Exception:
-        pass
-
-
 def main():
     """Main entry point."""
-    _kill_previous_monitors()
-    # First one wins: if a live monitor (e.g. python-run, which
-    # _kill_previous_monitors can't see) already holds the lock, defer.
+    # First one wins: if a live monitor already holds the lock, defer to it.
     if _another_monitor_alive():
         print("Another ScreenSnap monitor is already running; exiting.")
         return

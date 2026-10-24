@@ -851,14 +851,20 @@ def _hotkey_worker():
     """Background thread: register PrtScn and pump Windows messages."""
     from ctypes import wintypes
     user32 = ctypes.windll.user32
-    if not user32.RegisterHotKey(None, _HOTKEY_ID, _MOD_NOREPEAT, _VK_SNAPSHOT):
-        # Another process owns PrtScn (OneDrive, Snipping Tool, etc.)
-        print("ScreenSnap: could not register PrintScreen hotkey "
-              "(another app may own it).", file=sys.stderr)
-        return
-    # Announce that this process owns the in-app hotkey so the external
-    # monitor stays passive and PrtScn does not double-fire.
+    # Claim the hotkey first: the tray monitor also registers PrtScn, and
+    # it lets go (within ~250ms) when it sees this marker. Keep retrying
+    # for a few seconds to give it time.
     _write_hotkey_owner()
+    deadline = time.monotonic() + 3.0
+    while not user32.RegisterHotKey(None, _HOTKEY_ID, _MOD_NOREPEAT, _VK_SNAPSHOT):
+        if time.monotonic() > deadline:
+            # Another app owns PrtScn (OneDrive, Snipping Tool, etc.).
+            # Withdraw the claim so the monitor may take it back later.
+            _clear_hotkey_owner()
+            print("ScreenSnap: could not register PrintScreen hotkey "
+                  "(another app may own it).", file=sys.stderr)
+            return
+        time.sleep(0.1)
     try:
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
@@ -2247,7 +2253,7 @@ class SettingsDialog:
         # Check if monitor is currently running
         self._check_monitor_status()
 
-        tk.Label(printscreen_f, text="Requires: keyboard, pystray packages (auto-installed)",
+        tk.Label(printscreen_f, text="Requires: pystray package (auto-installed)",
                  font=("Segoe UI", 7), fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(anchor='w', pady=(10, 0))
 
         # 6. OCR Section
@@ -2330,7 +2336,6 @@ class SettingsDialog:
             
             # Check if already installed
             try:
-                import keyboard
                 import pystray
                 return True
             except ImportError:
@@ -2341,7 +2346,7 @@ class SettingsDialog:
             self.dialog.update()
             
             subprocess.check_call(
-                [sys.executable, '-m', 'pip', 'install', 'keyboard', 'pystray'],
+                [sys.executable, '-m', 'pip', 'install', 'pystray'],
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
             

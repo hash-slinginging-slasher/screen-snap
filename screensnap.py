@@ -1232,6 +1232,12 @@ class Icons:
             line((6, 7), (7, 20), (17, 20), (18, 7))
             line((10.2, 10.5), (10.2, 16.5))
             line((13.8, 10.5), (13.8, 16.5))
+        elif name in ('rotate_cw', 'rotate_ccw'):
+            # Half-turn arc over a small shape, arrowhead turning down.
+            arc(4, 5, 20, 21, 180, 345)
+            head((19.6, 15.2), (20.2, 9.6), length=5.6, half=3.2)
+            rect(9, 13, 15, 19, r=1.2)
+            mirror = name == 'rotate_ccw'
         elif name in ('reset', 'refresh'):
             arc(5, 5, 19, 19, 40, 330)
             head((19.2, 10.2), (17.4, 6.6), length=5.6, half=3.2)
@@ -3186,10 +3192,16 @@ class AnnotationEditor:
         tk.Label(self.step_props_frame, text="Rotate", font=Theme.FONT_LABEL,
                  fg=Theme.ON_SURFACE_VARIANT, bg=Theme.SURFACE).pack(side='left', padx=(0, 5))
         self.step_rotation_var = tk.IntVar(value=0)
+        IconButton(self.step_props_frame, 'rotate_ccw', tip=f"Rotate left {self.STEP_ROTATE_STEP}° ( [ )",
+                   variant="secondary",
+                   command=lambda: self.rotate_step(-self.STEP_ROTATE_STEP)).pack(side='left', padx=(0, 4))
         rotation_spin = ttk.Spinbox(self.step_props_frame, from_=0, to=360, increment=15,
                                     textvariable=self.step_rotation_var, width=5,
                                     command=self.update_step_rotation)
-        rotation_spin.pack(side='left', padx=(0, 20))
+        rotation_spin.pack(side='left', padx=(0, 4))
+        IconButton(self.step_props_frame, 'rotate_cw', tip=f"Rotate right {self.STEP_ROTATE_STEP}° ( ] )",
+                   variant="secondary",
+                   command=lambda: self.rotate_step(self.STEP_ROTATE_STEP)).pack(side='left', padx=(0, 20))
         rotation_spin.bind('<Return>', lambda e: self.update_step_rotation())
         rotation_spin.bind('<FocusOut>', lambda e: self.update_step_rotation())
 
@@ -3366,6 +3378,9 @@ class AnnotationEditor:
         self.root.bind('<Control-L>', self.open_library)
         self.root.bind('<Escape>', self.deselect_all)
         self.root.bind('<Delete>', self.delete_selected_step)
+        for key, delta in (('<bracketleft>', -1), ('<bracketright>', 1)):
+            self.root.bind(key, lambda e, d=delta: self.current_tool == 'step'
+                           and self.rotate_step(d * self.STEP_ROTATE_STEP))
 
         # Tools shortcuts
         for k, t in [('r','rectangle'), ('l','line'), ('c','circle'), ('x','crop'), ('t','text'), ('p','step')]:
@@ -5268,6 +5283,17 @@ class AnnotationEditor:
                     self._rebuild_step_canvas(elem)
                     break
         self.status_var.set(f"Step rotation: {new_rot}°")
+
+    STEP_ROTATE_STEP = 45   # degrees per rotate-button click: eight pointer directions
+
+    def rotate_step(self, delta):
+        """Turn the selected step (or the rotation for new steps) by `delta` degrees."""
+        try:
+            current = int(self.step_rotation_var.get())
+        except (tk.TclError, ValueError):
+            current = self.step_rotation
+        self.step_rotation_var.set((current + delta) % 360)
+        self.update_step_rotation()
 
     def _rebuild_step_canvas(self, elem):
         """Rebuild canvas image for a step after shape/size change."""

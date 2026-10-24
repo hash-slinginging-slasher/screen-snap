@@ -3018,6 +3018,8 @@ class AnnotationEditor:
         self._resize_start = None          # (x1, y1, x2, y2) of the box when the resize began
         self.text_create_origin = None     # canvas point where a drag-to-create text box began
         self.text_align = 'center'         # alignment for new text; ShareX defaults to centred
+        self._text_edit = None             # in-place typing state, see _begin_text_edit
+        self._text_input = None            # off-screen tk.Text that receives the typing
         self.drag_offset_x = 0
         self.drag_offset_y = 0
 
@@ -3601,6 +3603,7 @@ class AnnotationEditor:
                     pass
             self.smart_move_preview_ids = []
 
+        self._finish_text_edit()
         self.current_tool = tool
         self.status_var.set(f"MODE: {tool.upper()}")
 
@@ -4371,13 +4374,17 @@ class AnnotationEditor:
     @staticmethod
     def _wrap_text(text, font, max_width):
         """Greedy word wrap; a single word wider than the box stays on its own line."""
+        # Every break replaces exactly one space with '\n', so a character
+        # index means the same thing in the wrapped and unwrapped text (the
+        # in-place editor's caret relies on that).
         lines = []
         for paragraph in text.split('\n'):
-            line = ''
+            line = None
             for word in paragraph.split(' '):
-                trial = word if not line else line + ' ' + word
-                if not line or font.getlength(trial) <= max_width:
-                    line = trial
+                if line is None:
+                    line = word
+                elif font.getlength(line + ' ' + word) <= max_width:
+                    line += ' ' + word
                 else:
                     lines.append(line)
                     line = word
@@ -4400,7 +4407,11 @@ class AnnotationEditor:
 
     def _text_natural_size(self, elem):
         """Box size (image pixels) that hugs the text with equal padding on every side."""
-        _, _, (l, t, r, b) = self._text_layout(dict(elem, auto=True), 1.0)
+        if not elem['text']:
+            # A box that is still being typed into: one line tall, a sliver wide.
+            ascent, descent = self._load_text_font(elem['font_family'], elem['font_size']).getmetrics()
+            return elem['font_size'] / 2 + 2 * self.TEXT_PAD, ascent + descent + 2 * self.TEXT_PAD
+        _, _, (l, t, r, b) =self._text_layout(dict(elem, auto=True), 1.0)
         return (r - l) + 2 * self.TEXT_PAD, (b - t) + 2 * self.TEXT_PAD
 
     def _render_text_pil(self, elem, zoom=1.0):
@@ -4488,6 +4499,180 @@ class AnnotationEditor:
             self.canvas.create_rectangle(
                 hx - half, hy - half, hx + half, hy + half,
                 fill='white', outline=Theme.PRIMARY, width=1, tags='selection')
+        self._draw_text_caret()
+
+    # ── In-place text editing ──────────────────────────────────────
+    # Typing goes into an off-screen tk.Text, which provides the caret
+    # movement, selection, clipboard and undo for free. Every keystroke is
+    # mirrored into the element and re-rendered by _render_text_pil, and the
+    # caret/selection are drawn on the canvas over that rendering, so the
+    # text is edited exactly where (and how) it will be saved.
+
+    def _text_input_widget(self):
+        if self._text_input is None:
+            inp = tk.Text(self.root, width=1, height=1, wrap='none', undo=True,
+                          borderwidth=0, highlightthickness=0)
+            # Keep only the widget's own and the Text class bindings, so the
+            # editor's single-key tool shortcuts and Delete/Escape bindings on
+            # the window don't fire while typing.
+            inp.bindtags((str(inp), 'Text'))
+            sync = lambda e: self.root.after_idle(self._sync_text_edit)
+            inp.bind('<Key>', sync)
+            inp.bind('<ButtonRelease-1>', sync)
+            inp.bind('<Return>', self._finish_text_edit)
+            inp.bind('<KP_Enter>', self._finish_text_edit)
+            inp.bind('<Escape>', self._finish_text_edit)
+            inp.bind('<Shift-Return>', sync)   # falls through to the class binding: new line
+            inp.bind('<Tab>', lambda e: 'break')
+            inp.bind('<Control-a>', self._select_all_text_input)
+            inp.bind('<Control-A>', self._select_all_text_input)
+            inp.place(x=-200, y=-200)
+            self._text_input = inp
+        return self._text_input
+
+    def _select_all_text_input(self, event=None):
+        inp = self._text_input
+        inp.tag_add('sel', '1.0', 'end-1c')
+        inp.mark_set('insert', 'end-1c')
+        self._draw_text_caret()
+        return 'break'
+
+    def _begin_text_edit(self, elem, snapshot_taken=False):
+        """Start typing into a text box in place. The whole edit is one undo step."""
+        if self._text_edit is not None and self._text_edit['elem'] is elem:
+            self._text_input.focus_set()
+            return
+        self._finish_text_edit()
+        if not snapshot_taken:
+            self.save_state()
+        self.select_text_element(elem['id'])
+        inp = self._text_input_widget()
+        inp.delete('1.0', 'end')
+        inp.insert('1.0', elem['text'])
+        inp.edit_reset()
+        inp.mark_set('insert', 'end-1c')
+        self._text_edit = {'elem': elem, 'original': elem['text'],
+                           'history_len': len(self.history), 'blink': None}
+        inp.focus_set()
+        self._draw_text_caret()
+        self.status_var.set("Typing: Enter or Esc to finish, Shift+Enter for a new line")
+
+    def _sync_text_edit(self):
+        """Mirror the input widget into the element being edited."""
+        st = self._text_edit
+        if st is None:
+            return
+        elem = st['elem']
+        text = self._text_input.get('1.0', 'end-1c')
+        if text != elem['text']:
+            elem['text'] = text
+            self._refit_text(elem)   # redraws the selection frame, and with it the caret
+        else:
+            self._draw_text_caret()
+
+    def _finish_text_edit(self, event=None):
+        """Leave in-place editing. An emptied box is removed, and an edit that
+        changed nothing leaves no undo step behind."""
+        st = self._text_edit
+        if st is None:
+            return 'break' if event is not None else None
+        self._text_edit = None
+        if st['blink']:
+            self.root.after_cancel(st['blink'])
+        self.canvas.delete('text_caret')
+        self.canvas.focus_set()
+        elem = st['elem']
+        # Only drop our own snapshot, not one pushed by a style change mid-edit.
+        own_snapshot_on_top = len(self.history) == st['history_len']
+        if not elem['text'].strip():
+            if elem in self.text_elements:
+                if elem.get('canvas_id'):
+                    self.canvas.delete(elem['canvas_id'])
+                self.text_elements.remove(elem)
+            if self.selected_text_id == elem['id']:
+                self.selected_text_id = None
+                self.canvas.delete('selection')
+            if not st['original'] and own_snapshot_on_top:
+                self.history.pop()   # the box never had any text: no undo step
+            self.status_var.set("Text removed" if st['original'] else "MODE: TEXT")
+        elif elem['text'] == st['original'] and own_snapshot_on_top:
+            self.history.pop()
+        else:
+            self.status_var.set(f"Text: '{elem['text']}'")
+        return 'break' if event is not None else None
+
+    def _text_index_offset(self, index):
+        return len(self._text_input.get('1.0', index))
+
+    def _draw_text_caret(self):
+        """Draw the caret and selection of the box being edited onto the canvas."""
+        self.canvas.delete('text_caret')
+        st = self._text_edit
+        if st is None:
+            return
+        if st['blink']:
+            self.root.after_cancel(st['blink'])
+            st['blink'] = None
+        elem = st['elem']
+        z = self.zoom if self.zoom else 1.0
+        font, text, (l, t, r, b) = self._text_layout(elem, z)
+        ascent, descent = font.getmetrics()
+        w = max(1, int(round(elem['width'] * z)))
+        h = max(1, int(round(elem['height'] * z)))
+        align = elem.get('align', 'center')
+        # Draw origin of the text, exactly as _render_text_pil computes it.
+        if elem['text']:
+            pad = self.TEXT_PAD * z
+            if align == 'left':
+                ox = pad - l
+            elif align == 'right':
+                ox = w - pad - (r - l) - l
+            else:
+                ox = (w - (r - l)) / 2 - l
+            oy = (h - (b - t)) / 2 - t
+        else:
+            ox, oy = w / 2, (h - ascent - descent) / 2
+        ox += round(elem['x'] * z)
+        oy += round(elem['y'] * z)
+        # Per-line offsets, mirroring Pillow's multiline layout.
+        lines = text.split('\n')
+        widths = [font.getlength(line) for line in lines]
+        max_w = max(widths)
+        spacing = font.getbbox('A')[3] + 4
+
+        def point(offset):
+            row = text.count('\n', 0, offset)
+            col = offset - (text.rfind('\n', 0, offset) + 1)
+            shift = {'left': 0, 'right': max_w - widths[row]}.get(align, (max_w - widths[row]) / 2)
+            return row, ox + shift + font.getlength(lines[row][:col]), oy + row * spacing
+
+        line_h = ascent + descent
+        inp = self._text_input
+        sel = inp.tag_ranges('sel')
+        if sel:
+            start, end = (self._text_index_offset(i) for i in sel)
+            line_starts = [0]
+            for line in lines[:-1]:
+                line_starts.append(line_starts[-1] + len(line) + 1)
+            row_a, row_b = point(start)[0], point(end)[0]
+            for row in range(row_a, row_b + 1):
+                _, x1, y1 = point(max(start, line_starts[row]))
+                x2 = point(min(end, line_starts[row] + len(lines[row])))[1]
+                rect = self.canvas.create_rectangle(x1, y1, x2, y1 + line_h, fill='#9ec5ff',
+                                                    outline='', tags='text_caret')
+                if elem.get('canvas_id'):
+                    self.canvas.tag_lower(rect, elem['canvas_id'])
+        _, cx, cy = point(self._text_index_offset('insert'))
+        self.canvas.create_line(cx, cy, cx, cy + line_h, fill=elem['color'],
+                                width=max(1, round(1.5 * z)), tags=('text_caret', 'text_caret_bar'))
+        st['blink'] = self.root.after(530, self._blink_text_caret, False)
+
+    def _blink_text_caret(self, visible):
+        st = self._text_edit
+        if st is None:
+            return
+        self.canvas.itemconfigure('text_caret_bar', state='normal' if visible else 'hidden')
+        st['blink'] = self.root.after(530, self._blink_text_caret, not visible)
 
     def _style_align_buttons(self):
         for align, btn in self.text_align_btns.items():
@@ -4513,11 +4698,10 @@ class AnnotationEditor:
         that was clicked. With `box` = (x1, y1, x2, y2) the user dragged out a
         fixed-size box: the text wraps to it and stays centred inside it.
         """
-        # Prompt for text if not provided
-        if text is None:
-            text = self.prompt_text()
-            if not text:
-                return
+        # Without text the box starts empty and is typed into in place.
+        editing = text is None
+        if editing:
+            text = ''
 
         # Snapshot the pre-mutation state so undo can remove this text.
         self.save_state()
@@ -4543,7 +4727,10 @@ class AnnotationEditor:
         self.text_elements.append(elem)
         self._place_text_canvas(elem)
         self.select_text_element(elem['id'])
-        self.status_var.set(f"Text added: '{text}'")
+        if editing:
+            self._begin_text_edit(elem, snapshot_taken=True)
+        else:
+            self.status_var.set(f"Text added: '{text}'")
 
     def select_text_element(self, text_id):
         """Select a text box: show its frame and load its settings into the panel."""
@@ -4610,6 +4797,7 @@ class AnnotationEditor:
 
     def deselect_all(self, event=None):
         """Deselect all text and step elements."""
+        self._finish_text_edit()
         self.selected_text_id = None
         self.selected_step_id = None
         # Remove all selection visuals (text cursors + step borders)
@@ -5204,6 +5392,19 @@ class AnnotationEditor:
             selected = self._selected_text()
             handle = self._text_handle_at(selected, cx, cy) if selected else None
             clicked_text = None if handle else self.find_text_at_position(ix, iy)
+            editing = self._text_edit['elem'] if self._text_edit else None
+            if editing is not None and not handle:
+                if clicked_text is editing:
+                    # Clicking the box being typed into keeps typing.
+                    self._text_input.focus_set()
+                    self.drawing = False
+                    return
+                # Clicking elsewhere finishes the edit; on empty canvas that
+                # is all the click does (it doesn't start another box).
+                self._finish_text_edit()
+                if clicked_text is None:
+                    self.drawing = False
+                    return
             if handle:
                 # Grab a resize handle of the selected box (pre-resize snapshot
                 # is taken lazily on the first motion, like dragging).
@@ -5881,14 +6082,9 @@ class AnnotationEditor:
         # Find text at position
         clicked_text = self.find_text_at_position(x, y)
         if clicked_text:
-            # Prompt for new text
-            new_text = self.prompt_text(clicked_text['text'])
-            if new_text and new_text != clicked_text['text']:
-                # Snapshot before mutation so undo can restore the old text.
-                self.save_state()
-                clicked_text['text'] = new_text
-                self._refit_text(clicked_text)
-                self.status_var.set(f"Text updated: '{new_text}'")
+            if self.current_tool != 'text':
+                self.set_tool('text')
+            self._begin_text_edit(clicked_text)
 
     def refresh_display(self):
         """Refresh the canvas display with current image at current zoom.
@@ -6530,6 +6726,7 @@ class AnnotationEditor:
 
     def undo(self, event=None):
         """Undo the last action (Ctrl+Z)."""
+        self._finish_text_edit()
         if not self.history:
             self.status_var.set("Nothing to undo")
             return
@@ -6541,6 +6738,7 @@ class AnnotationEditor:
 
     def redo(self, event=None):
         """Redo the last undone action (Ctrl+Y)."""
+        self._finish_text_edit()
         if not self.redo_stack:
             self.status_var.set("Nothing to redo")
             return

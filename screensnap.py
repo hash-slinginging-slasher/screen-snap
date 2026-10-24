@@ -4113,21 +4113,29 @@ class AnnotationEditor:
             'x': bx, 'y': by,
             'width': 0, 'height': 0,  # 0 = auto-size from text
             'anchor_x': anchor_x, 'anchor_y': anchor_y,
-            'text': 'Type here...',
+            'text': '',
             'color': self.current_color,
             'font_size': font_size,
             'canvas_ids': {},
         }
         self.bubble_elements.append(elem)
         self._render_bubble_canvas(elem)
-        self._edit_bubble_text(elem)
+        self._begin_text_edit(elem, snapshot_taken=True, kind='bubble')
+
+    @staticmethod
+    def _bubble_font(px):
+        try:
+            return ImageFont.truetype("arial.ttf", px)
+        except Exception:
+            return ImageFont.load_default()
 
     def _bubble_auto_dims(self, elem):
         """Return auto-sized (w, h) based on text content."""
         font_size = elem['font_size']
         text_lines = elem['text'].split('\n')
-        char_w = font_size * 0.6
-        text_w = max(len(line) for line in text_lines) * char_w + 20
+        # Measured, not estimated, so text typed in place never spills out.
+        font = self._bubble_font(font_size)
+        text_w = max(font.getlength(line) for line in text_lines) + 20
         text_h = len(text_lines) * (font_size + 4) + 16
         return max(text_w, 80), max(text_h, 30)
 
@@ -4241,11 +4249,8 @@ class AnnotationEditor:
         )
 
     def _edit_bubble_text(self, elem):
-        """Open text editing for a bubble."""
-        new_text = self.prompt_text(elem['text'])
-        if new_text and new_text != elem['text']:
-            elem['text'] = new_text
-            self._render_bubble_canvas(elem)
+        """Type into a bubble in place."""
+        self._begin_text_edit(elem, kind='bubble')
 
     def _find_bubble_at(self, ix, iy):
         """Find bubble element at image-space position."""
@@ -4319,49 +4324,6 @@ class AnnotationEditor:
             self.stroke_width = int(self.stroke_var.get())
         except:
             self.stroke_width = 3
-    
-    def prompt_text(self, initial_text=""):
-        """Show dialog to enter text."""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Enter Text")
-        dialog.geometry("400x150")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        # Center dialog
-        dialog.update_idletasks()
-        x = self.root.winfo_rootx() + 100
-        y = self.root.winfo_rooty() + 100
-        dialog.geometry(f"400x150+{x}+{y}")
-        
-        ttk.Label(dialog, text="Enter text:", font=("Segoe UI", 10)).pack(pady=(15, 5))
-        
-        text_var = tk.StringVar(value=initial_text)
-        entry = ttk.Entry(dialog, textvariable=text_var, font=("Segoe UI", 11), width=40)
-        entry.pack(pady=5, padx=20)
-        entry.focus_set()
-        entry.select_range(0, tk.END)
-        
-        result = [None]
-        
-        def on_ok():
-            result[0] = text_var.get()
-            dialog.destroy()
-        
-        def on_cancel():
-            dialog.destroy()
-        
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=10)
-        
-        ttk.Button(btn_frame, text="OK", command=on_ok, width=10).pack(side='left', padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side='left', padx=5)
-        
-        # Bind Enter key
-        entry.bind('<Return>', lambda e: on_ok())
-        
-        dialog.wait_window()
-        return result[0]
     
     # ── Text boxes ─────────────────────────────────────────────────
     # Modelled on ShareX's image editor: a text annotation is a *box* with
@@ -4557,21 +4519,26 @@ class AnnotationEditor:
         self._draw_text_caret()
         return 'break'
 
-    def _begin_text_edit(self, elem, snapshot_taken=False):
-        """Start typing into a text box in place. The whole edit is one undo step."""
+    def _begin_text_edit(self, elem, snapshot_taken=False, kind='text'):
+        """Start typing into a text box (kind='text') or speech bubble
+        (kind='bubble') in place. The whole edit is one undo step."""
         if self._text_edit is not None and self._text_edit['elem'] is elem:
             self._text_input.focus_set()
             return
         self._finish_text_edit()
         if not snapshot_taken:
             self.save_state()
-        self.select_text_element(elem['id'])
+        if kind == 'text':
+            self.select_text_element(elem['id'])
+        else:
+            self.deselect_all()
+            self.selected_bubble_id = elem['id']
         inp = self._text_input_widget()
         inp.delete('1.0', 'end')
         inp.insert('1.0', elem['text'])
         inp.edit_reset()
         inp.mark_set('insert', 'end-1c')
-        self._text_edit = {'elem': elem, 'original': elem['text'],
+        self._text_edit = {'elem': elem, 'kind': kind, 'original': elem['text'],
                            'history_len': len(self.history), 'blink': None}
         inp.focus_set()
         self._draw_text_caret()
@@ -4586,13 +4553,15 @@ class AnnotationEditor:
         text = self._text_input.get('1.0', 'end-1c')
         if text != elem['text']:
             elem['text'] = text
-            self._refit_text(elem)   # redraws the selection frame, and with it the caret
-        else:
-            self._draw_text_caret()
+            if st['kind'] == 'text':
+                self._refit_text(elem)   # redraws the selection frame, and with it the caret
+                return
+            self._render_bubble_canvas(elem)
+        self._draw_text_caret()
 
     def _finish_text_edit(self, event=None):
-        """Leave in-place editing. An emptied box is removed, and an edit that
-        changed nothing leaves no undo step behind."""
+        """Leave in-place editing. An emptied box or bubble is removed, and an
+        edit that changed nothing leaves no undo step behind."""
         st = self._text_edit
         if st is None:
             return 'break' if event is not None else None
@@ -4605,16 +4574,25 @@ class AnnotationEditor:
         # Only drop our own snapshot, not one pushed by a style change mid-edit.
         own_snapshot_on_top = len(self.history) == st['history_len']
         if not elem['text'].strip():
-            if elem in self.text_elements:
-                if elem.get('canvas_id'):
-                    self.canvas.delete(elem['canvas_id'])
-                self.text_elements.remove(elem)
-            if self.selected_text_id == elem['id']:
-                self.selected_text_id = None
-                self.canvas.delete('selection')
+            if st['kind'] == 'text':
+                if elem in self.text_elements:
+                    if elem.get('canvas_id'):
+                        self.canvas.delete(elem['canvas_id'])
+                    self.text_elements.remove(elem)
+                if self.selected_text_id == elem['id']:
+                    self.selected_text_id = None
+                    self.canvas.delete('selection')
+            else:
+                if elem in self.bubble_elements:
+                    for cid in elem.get('canvas_ids', {}).values():
+                        self.canvas.delete(cid)
+                    self.bubble_elements.remove(elem)
+                if self.selected_bubble_id == elem['id']:
+                    self.selected_bubble_id = None
             if not st['original'] and own_snapshot_on_top:
-                self.history.pop()   # the box never had any text: no undo step
-            self.status_var.set("Text removed" if st['original'] else "MODE: TEXT")
+                self.history.pop()   # it never had any text: no undo step
+            label = "Text" if st['kind'] == 'text' else "Bubble"
+            self.status_var.set(f"{label} removed" if st['original'] else f"MODE: {self.current_tool.upper()}")
         elif elem['text'] == st['original'] and own_snapshot_on_top:
             self.history.pop()
         else:
@@ -4624,19 +4602,15 @@ class AnnotationEditor:
     def _text_index_offset(self, index):
         return len(self._text_input.get('1.0', index))
 
-    def _draw_text_caret(self):
-        """Draw the caret and selection of the box being edited onto the canvas."""
-        self.canvas.delete('text_caret')
-        st = self._text_edit
-        if st is None:
-            return
-        if st['blink']:
-            self.root.after_cancel(st['blink'])
-            st['blink'] = None
+    def _edit_layout(self, st, z):
+        """Where the text being edited is drawn: (font, text, origin_x,
+        origin_y, align) in canvas pixels, matching its PIL renderer."""
         elem = st['elem']
-        z = self.zoom if self.zoom else 1.0
+        if st['kind'] == 'bubble':
+            # _render_bubble_canvas: left-aligned at (x + 10, y + 8).
+            font = self._bubble_font(max(1, int(round(elem['font_size'] * z))))
+            return font, elem['text'], (elem['x'] + 10) * z, (elem['y'] + 8) * z, 'left'
         font, text, (l, t, r, b) = self._text_layout(elem, z)
-        ascent, descent = font.getmetrics()
         w = max(1, int(round(elem['width'] * z)))
         h = max(1, int(round(elem['height'] * z)))
         align = elem.get('align', 'center')
@@ -4651,9 +4625,24 @@ class AnnotationEditor:
                 ox = (w - (r - l)) / 2 - l
             oy = (h - (b - t)) / 2 - t
         else:
+            ascent, descent = font.getmetrics()
             ox, oy = w / 2, (h - ascent - descent) / 2
-        ox += round(elem['x'] * z)
-        oy += round(elem['y'] * z)
+        return font, text, ox + round(elem['x'] * z), oy + round(elem['y'] * z), align
+
+    def _draw_text_caret(self):
+        """Draw the caret and selection of the text being edited onto the canvas."""
+        self.canvas.delete('text_caret')
+        st = self._text_edit
+        if st is None:
+            return
+        if st['blink']:
+            self.root.after_cancel(st['blink'])
+            st['blink'] = None
+        st['photos'] = []
+        elem = st['elem']
+        z = self.zoom if self.zoom else 1.0
+        font, text, ox, oy, align = self._edit_layout(st, z)
+        ascent, descent = font.getmetrics()
         # Per-line offsets, mirroring Pillow's multiline layout.
         lines = text.split('\n')
         widths = [font.getlength(line) for line in lines]
@@ -4678,12 +4667,26 @@ class AnnotationEditor:
             for row in range(row_a, row_b + 1):
                 _, x1, y1 = point(max(start, line_starts[row]))
                 x2 = point(min(end, line_starts[row] + len(lines[row])))[1]
-                rect = self.canvas.create_rectangle(x1, y1, x2, y1 + line_h, fill='#9ec5ff',
-                                                    outline='', tags='text_caret')
-                if elem.get('canvas_id'):
-                    self.canvas.tag_lower(rect, elem['canvas_id'])
+                if st['kind'] == 'text':
+                    # Text boxes are transparent: highlight underneath the glyphs.
+                    rect = self.canvas.create_rectangle(x1, y1, x2, y1 + line_h, fill='#9ec5ff',
+                                                        outline='', tags='text_caret')
+                    if elem.get('canvas_id'):
+                        self.canvas.tag_lower(rect, elem['canvas_id'])
+                else:
+                    # A bubble's body is opaque, so the highlight goes on top:
+                    # the selected characters redrawn white on a blue band.
+                    c1 = max(start, line_starts[row]) - line_starts[row]
+                    c2 = min(end, line_starts[row] + len(lines[row])) - line_starts[row]
+                    band = Image.new('RGBA', (max(1, math.ceil(x2 - x1)), max(1, math.ceil(line_h))),
+                                     '#1f4fd1')
+                    ImageDraw.Draw(band).text((0, 0), lines[row][c1:c2], font=font, fill='white')
+                    photo = ImageTk.PhotoImage(band)
+                    st.setdefault('photos', []).append(photo)   # keep a reference
+                    self.canvas.create_image(x1, y1, image=photo, anchor='nw', tags='text_caret')
+        caret_color = elem['color'] if st['kind'] == 'text' else '#ffffff'
         _, cx, cy = point(self._text_index_offset('insert'))
-        self.canvas.create_line(cx, cy, cx, cy + line_h, fill=elem['color'],
+        self.canvas.create_line(cx, cy, cx, cy + line_h, fill=caret_color,
                                 width=max(1, round(1.5 * z)), tags=('text_caret', 'text_caret_bar'))
         st['blink'] = self.root.after(530, self._blink_text_caret, False)
 
@@ -5490,6 +5493,20 @@ class AnnotationEditor:
 
         elif self.current_tool == 'bubble':
             hit = self._bubble_hit_test(ix, iy)
+            editing = self._text_edit['elem'] if self._text_edit else None
+            if editing is not None:
+                if hit and hit[0] is editing and hit[1] == 'body':
+                    # Clicking the bubble being typed into keeps typing.
+                    self._text_input.focus_set()
+                    self.drawing = False
+                    return
+                # Clicking elsewhere finishes the edit; on empty canvas that
+                # is all the click does (it doesn't start another bubble).
+                self._finish_text_edit()
+                hit = self._bubble_hit_test(ix, iy)
+                if not hit:
+                    self.drawing = False
+                    return
             if hit:
                 elem_b, zone = hit
                 self.selected_bubble_id = elem_b['id']
@@ -6103,11 +6120,7 @@ class AnnotationEditor:
         if self.current_tool == 'bubble':
             clicked_bubble = self._find_bubble_at(x, y)
             if clicked_bubble:
-                new_text = self.prompt_text(clicked_bubble['text'])
-                if new_text and new_text != clicked_bubble['text']:
-                    self.save_state()
-                    clicked_bubble['text'] = new_text
-                    self._render_bubble_canvas(clicked_bubble)
+                self._edit_bubble_text(clicked_bubble)
                 return
 
         # Find text at position
@@ -6213,6 +6226,9 @@ class AnnotationEditor:
         # Shapes: re-render at the current zoom.
         for elem in self.shape_elements:
             self._render_shape_canvas(elem)
+
+        # Caret of any text or bubble being typed into.
+        self._draw_text_caret()
 
     def on_scroll_vertical(self, event):
         """Plain wheel pans the canvas vertically. Never zooms."""
